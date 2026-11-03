@@ -7,3 +7,10 @@ edition = "2024"
 rig-agent = "0.46.0"
 rig-core = { version = "0.46.0", features = ["reqwest"] }
 tokio = { version = "1.54.1", features = ["full"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
+opt-level = "z"
