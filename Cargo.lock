@@ -51,6 +51,7 @@ name = "agent"
 version = "0.1.0"
 dependencies = [
  "dotenvy",
+ "futures",
  "llrt_modules",
  "rig-agent",
  "rig-core",
