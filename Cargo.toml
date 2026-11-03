@@ -1,0 +1,9 @@
+[package]
+name = "agent"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rig-agent = "0.46.0"
+rig-core = { version = "0.46.0", features = ["reqwest"] }
+tokio = { version = "1.54.1", features = ["full"] }
