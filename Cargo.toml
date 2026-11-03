@@ -7,6 +7,9 @@ edition = "2024"
 rig-agent = "0.46.0"
 rig-core = { version = "0.46.0", features = ["reqwest"] }
 tokio = { version = "1.54.1", features = ["full"] }
+# Official AWS repo, pinned. The crates.io `llrt_modules` is an unofficial third-party republish.
+llrt_modules = { git = "https://github.com/awslabs/llrt", rev = "d25954463fde4b0c2f043eaec01092d510abaf01" }
+rquickjs = { version = "0.14", features = ["full-async"] }
 
 [profile.release]
 strip = true
