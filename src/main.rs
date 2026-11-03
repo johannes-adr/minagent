@@ -15,8 +15,19 @@ use rig_core::serde_json;
 use rig_core::tool::ToolExecutionError;
 use std::path::Path;
 use std::process::{Output, Stdio};
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tui::{Status, UiEvent};
+
+/// Maximum run time of a single `execute` / `execute_javascript` call.
+const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
+
+fn timed_out(timeout: Duration) -> ToolExecutionError {
+    ToolExecutionError::from_error(std::io::Error::other(format!(
+        "timed out after {}s; the process was killed",
+        timeout.as_secs()
+    )))
+}
 
 fn format_output(out: &Output) -> String {
     format!(
@@ -43,7 +54,12 @@ async fn execute(
         cmd.args(["-c", &command]);
         cmd
     };
-    let out = cmd.output().await.map_err(ToolExecutionError::from_error)?;
+    // Dropping the future on timeout kills the child.
+    cmd.kill_on_drop(true);
+    let out = tokio::time::timeout(TOOL_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| timed_out(TOOL_TIMEOUT))?
+        .map_err(ToolExecutionError::from_error)?;
     let out = format_output(&out);
     tui::emit(UiEvent::ToolOutput(out.clone()));
     Ok(out)
@@ -61,14 +77,26 @@ async fn execute_javascript(
     allow_network: Option<bool>,
 ) -> Result<String, ToolExecutionError> {
     let exe = std::env::current_exe().map_err(ToolExecutionError::from_error)?;
-    let out = run_js_code(&exe, &code, allow_network == Some(true)).await?;
+    let out = run_js_code(&exe, &code, allow_network == Some(true), TOOL_TIMEOUT).await?;
     tui::emit(UiEvent::ToolOutput(out.clone()));
     Ok(out)
 }
 
 /// Runs `code` via `<exe> --js -`, sandboxed where supported. The code goes through
 /// stdin, not a temp file, so sandboxed processes can't swap it after approval.
+/// The process is killed after `timeout`.
 async fn run_js_code(
+    exe: &Path,
+    code: &str,
+    allow_network: bool,
+    timeout: Duration,
+) -> Result<String, ToolExecutionError> {
+    tokio::time::timeout(timeout, run_js_process(exe, code, allow_network))
+        .await
+        .map_err(|_| timed_out(timeout))?
+}
+
+async fn run_js_process(
     exe: &Path,
     code: &str,
     allow_network: bool,
@@ -81,7 +109,9 @@ async fn run_js_code(
         cmd.args(args);
         cmd
     };
+    // Dropping the child (on timeout) kills it.
     let mut child = cmd
+        .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -256,9 +286,32 @@ mod tests {
     }
 
     async fn js(code: &str, allow_network: bool) -> String {
-        run_js_code(&agent_exe(), code, allow_network)
+        run_js_code(&agent_exe(), code, allow_network, Duration::from_secs(30))
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn js_tool_times_out() {
+        let started = std::time::Instant::now();
+        let result = run_js_code(
+            &agent_exe(),
+            "while (true) {}",
+            false,
+            Duration::from_millis(500),
+        )
+        .await;
+        let error = result.expect_err("an endless loop must time out").to_string();
+        assert!(error.contains("timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn js_tool_memory_is_limited() {
+        let code = "const a = []; while (true) a.push(new Array(1e6).fill(1));";
+        let out = js(code, false).await;
+        assert!(!out.contains("exit: exit status: 0"), "{out}");
+        assert!(out.to_lowercase().contains("memory"), "{out}");
     }
 
     #[tokio::test]
