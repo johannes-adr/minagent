@@ -1,10 +1,10 @@
+mod config;
 mod js;
 mod sandbox;
 
 use rig_agent::agent::{AgentHook, DispatchAction, DispatchEvent, HookContext};
 use rig_agent::{AgentBuilder, rig_tool};
 use rig_core::effect::EffectKind;
-use rig_core::providers::openai::{self, OpenAI};
 use rig_core::serde_json;
 use rig_core::tool::ToolExecutionError;
 use std::io::{self, Write};
@@ -173,9 +173,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         return js::run_js(file).await;
     }
+    // `--env-example` (re)generates `.env.example` from the config.
+    if let [_, flag] = args.as_slice()
+        && flag == "--env-example"
+    {
+        std::fs::write(".env.example", config::env_example())?;
+        println!("wrote .env.example");
+        return Ok(());
+    }
 
-    let agent = AgentBuilder::new(OpenAI::from_env()?.completion(openai::GPT_5_5))
-        .preamble("You are a helpful agent. Use the `execute` tool to run shell commands and `execute_javascript` to run JavaScript. Both run in a sandbox (writes only in the working directory and temp, no internet); set `disable_sandbox` (execute) or `allow_network` (execute_javascript) only if a call fails with \"Operation not permitted\" or needs the network.")
+    // First start: create `.env.example` so the user knows what to configure.
+    if !Path::new(".env.example").exists() {
+        std::fs::write(".env.example", config::env_example())?;
+        println!("created .env.example; copy it to .env, fill it in and start again");
+        return Ok(());
+    }
+
+    let model = config::Config::load()?.model()?;
+    let agent = AgentBuilder::new(model)
+        .preamble("You are a helpful agent. Use the `execute` tool to run shell commands and `execute_javascript` to run JavaScript. Both run in a sandbox (writes only in the working directory and temp, no internet, no access to .env files); set `disable_sandbox` (execute) or `allow_network` (execute_javascript) only if a call fails with \"Operation not permitted\" or needs the network.")
         .tool(Execute)
         .tool(ExecuteJavascript) // add more tools here
         .add_hook(Approve)

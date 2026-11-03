@@ -2,8 +2,10 @@
 //!
 //! Reads are allowed everywhere except credential stores; writes are limited to the
 //! workspace, temp and package caches. Git hooks/config stay read-only so a sandboxed
-//! command cannot plant code that later runs outside the sandbox. (Bob also protects
-//! its own `.bob` directory; this project has no such directory, so that rule is dropped.)
+//! command cannot plant code that later runs outside the sandbox. `.env` files (which
+//! hold API keys) can be neither read nor written anywhere; their metadata stays
+//! readable so `ls -l` etc. keep working. (Bob also protects its own `.bob` directory;
+//! this project has no such directory, so that rule is dropped.)
 
 use std::borrow::Cow;
 use std::ffi::OsStr;
@@ -66,6 +68,8 @@ const PROFILE: &str = r#"(version 1)
   (literal (string-append (param "WORKSPACE") "/.git/config")))
 (deny file-write-unlink file-write-create
   (literal (string-append (param "WORKSPACE") "/.git")))
+(deny file-read-data file-write*
+  (regex #"/\.env$"))
 "#;
 
 pub fn supported() -> bool {
@@ -189,6 +193,38 @@ mod tests {
         assert!(!ok);
         assert!(err.contains("Operation not permitted"), "{err}");
         assert!(!ws.0.join(".git/hooks/pre-commit").exists());
+    }
+
+    #[tokio::test]
+    async fn blocks_dotenv_access() {
+        if !supported() {
+            return;
+        }
+        let ws = Workspace::new("dotenv");
+        std::fs::write(ws.0.join(".env"), "SECRET=hunter2\n").unwrap();
+        std::fs::create_dir_all(ws.0.join("sub")).unwrap();
+        for script in [
+            "cat .env",
+            "echo X=1 >> .env",
+            "rm .env",
+            "mv .env leaked",
+            "ln .env leaked",
+            "cp .env leaked",
+            "echo X=1 > sub/.env",
+        ] {
+            let (ok, err) = run(&ws, script).await;
+            assert!(!ok, "{script} must fail");
+            assert!(err.contains("Operation not permitted"), "{script}: {err}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(ws.0.join(".env")).unwrap(),
+            "SECRET=hunter2\n"
+        );
+        assert!(!ws.0.join("leaked").exists());
+        assert!(!ws.0.join("sub/.env").exists());
+        // Metadata and look-alike files stay accessible.
+        let (ok, err) = run(&ws, "ls -la && echo A=1 > .env.example && cat .env.example").await;
+        assert!(ok, "{err}");
     }
 
     #[tokio::test]
