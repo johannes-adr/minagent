@@ -1,6 +1,7 @@
 mod config;
 mod js;
 mod sandbox;
+mod tui;
 
 use futures::StreamExt;
 use rig_agent::agent::{
@@ -12,10 +13,10 @@ use rig_agent::{AgentBuilder, rig_tool};
 use rig_core::effect::EffectKind;
 use rig_core::serde_json;
 use rig_core::tool::ToolExecutionError;
-use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Output, Stdio};
 use tokio::io::AsyncWriteExt;
+use tui::{Status, UiEvent};
 
 fn format_output(out: &Output) -> String {
     format!(
@@ -43,7 +44,9 @@ async fn execute(
         cmd
     };
     let out = cmd.output().await.map_err(ToolExecutionError::from_error)?;
-    Ok(format_output(&out))
+    let out = format_output(&out);
+    tui::emit(UiEvent::ToolOutput(out.clone()));
+    Ok(out)
 }
 
 /// Run JavaScript (ES module) with fetch, node:fs etc. and return its exit code, stdout and stderr.
@@ -59,7 +62,7 @@ async fn execute_javascript(
 ) -> Result<String, ToolExecutionError> {
     let exe = std::env::current_exe().map_err(ToolExecutionError::from_error)?;
     let out = run_js_code(&exe, &code, allow_network == Some(true)).await?;
-    println!("{out}");
+    tui::emit(UiEvent::ToolOutput(out.clone()));
     Ok(out)
 }
 
@@ -97,12 +100,12 @@ async fn run_js_code(
     Ok(format_output(&out))
 }
 
-/// Asks the user before every tool call; anything but `y` skips it.
+/// Asks the user (approval popup) before every tool call; anything but `y` skips it.
 /// Sandboxed calls without extra rights are approved automatically.
 struct Approve;
 
 enum Approval {
-    /// Run without asking; the text is printed.
+    /// Run without asking; the text is shown in the chat.
     Auto(String),
     /// Ask the user with this prompt.
     Ask(String),
@@ -151,43 +154,37 @@ impl AgentHook for Approve {
         };
         let prompt = match decide(name, args, sandbox::supported()) {
             Approval::Auto(text) => {
-                println!("{text}");
+                tui::emit(UiEvent::Info(text));
+                tui::emit(UiEvent::Status(Status::Tool));
                 return DispatchAction::proceed();
             }
             Approval::Ask(prompt) => prompt,
         };
-        match ask(&prompt) {
-            Ok(answer) if answer == "y" => DispatchAction::proceed(),
-            _ => DispatchAction::skip("the user denied this tool call"),
+        if tui::request_approval(prompt).await {
+            tui::emit(UiEvent::Info(format!("[approved] {name}")));
+            tui::emit(UiEvent::Status(Status::Tool));
+            DispatchAction::proceed()
+        } else {
+            tui::emit(UiEvent::Info(format!("[denied] {name}")));
+            DispatchAction::skip("the user denied this tool call")
         }
     }
 }
 
-/// Prints the streamed answer text (no reasoning) and returns the final response.
-async fn print_stream(
-    stream: &mut StreamingResult,
-) -> Result<PromptResponse, Box<dyn std::error::Error>> {
+/// Forwards the streamed answer text (no reasoning) to the UI and returns the final response.
+async fn forward_stream(stream: &mut StreamingResult) -> Result<PromptResponse, String> {
     while let Some(item) = stream.next().await {
-        match item? {
+        match item.map_err(|e| e.to_string())? {
             MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
-                text, ..
-            })) => {
-                print!("{text}");
-                io::stdout().flush()?;
-            }
+                text,
+                ..
+            })) => tui::emit(UiEvent::Text(text)),
+            MultiTurnStreamItem::ToolResult { .. } => tui::emit(UiEvent::Status(Status::Thinking)),
             MultiTurnStreamItem::FinalResponse(response) => return Ok(response),
             _ => {}
         }
     }
     Err("the stream ended without a final response".into())
-}
-
-fn ask(prompt: &str) -> io::Result<String> {
-    print!("{prompt}");
-    io::stdout().flush()?;
-    let mut line = String::new();
-    io::stdin().read_line(&mut line)?;
-    Ok(line.trim().to_owned())
 }
 
 #[tokio::main]
@@ -224,17 +221,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .default_max_turns(20)
         .build();
 
-    let mut history = Vec::new();
-    loop {
-        let input = ask("> ")?;
-        if input.is_empty() {
-            break;
+    // The agent runs in its own task: prompts come in from the UI, events go back via `tui::emit`.
+    let (prompts, mut inbox) = tokio::sync::mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        let mut history = Vec::new();
+        while let Some(input) = inbox.recv().await {
+            let mut stream = agent
+                .prompt(input)
+                .history(history.iter().cloned())
+                .stream();
+            match forward_stream(&mut stream).await {
+                Ok(response) => history.extend(response.messages),
+                Err(error) => tui::emit(UiEvent::Error(error)),
+            }
+            tui::emit(UiEvent::Status(Status::Idle));
         }
-        let mut stream = agent.prompt(input).history(history.iter().cloned()).stream();
-        let response = print_stream(&mut stream).await?;
-        history.extend(response.messages);
-        println!("\n");
-    }
+    });
+    tui::run(prompts).await?;
     Ok(())
 }
 
