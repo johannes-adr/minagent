@@ -2,8 +2,13 @@ use llrt_modules::module_builder::ModuleBuilder;
 use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, Module};
 
 /// Runs a JS module with LLRT's Node/WinterTC APIs (fetch, timers, fs, ...).
+/// `path` `-` reads the source from stdin.
 pub async fn run_js(path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let source = std::fs::read_to_string(path)?;
+    let source = if path == "-" {
+        std::io::read_to_string(std::io::stdin())?
+    } else {
+        std::fs::read_to_string(path)?
+    };
     let runtime = AsyncRuntime::new()?;
     let (resolver, loader, globals) = ModuleBuilder::default().build();
     runtime.set_loader((resolver,), (loader,)).await;
