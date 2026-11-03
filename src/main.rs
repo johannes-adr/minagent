@@ -2,7 +2,12 @@ mod config;
 mod js;
 mod sandbox;
 
-use rig_agent::agent::{AgentHook, DispatchAction, DispatchEvent, HookContext};
+use futures::StreamExt;
+use rig_agent::agent::{
+    AgentHook, DispatchAction, DispatchEvent, HookContext, MultiTurnStreamItem, StreamingResult,
+};
+use rig_agent::run::response::PromptResponse;
+use rig_agent::streaming::{Item, StreamEvent};
 use rig_agent::{AgentBuilder, rig_tool};
 use rig_core::effect::EffectKind;
 use rig_core::serde_json;
@@ -53,7 +58,9 @@ async fn execute_javascript(
     allow_network: Option<bool>,
 ) -> Result<String, ToolExecutionError> {
     let exe = std::env::current_exe().map_err(ToolExecutionError::from_error)?;
-    run_js_code(&exe, &code, allow_network == Some(true)).await
+    let out = run_js_code(&exe, &code, allow_network == Some(true)).await?;
+    println!("{out}");
+    Ok(out)
 }
 
 /// Runs `code` via `<exe> --js -`, sandboxed where supported. The code goes through
@@ -156,6 +163,25 @@ impl AgentHook for Approve {
     }
 }
 
+/// Prints the streamed answer text (no reasoning) and returns the final response.
+async fn print_stream(
+    stream: &mut StreamingResult,
+) -> Result<PromptResponse, Box<dyn std::error::Error>> {
+    while let Some(item) = stream.next().await {
+        match item? {
+            MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
+                text, ..
+            })) => {
+                print!("{text}");
+                io::stdout().flush()?;
+            }
+            MultiTurnStreamItem::FinalResponse(response) => return Ok(response),
+            _ => {}
+        }
+    }
+    Err("the stream ended without a final response".into())
+}
+
 fn ask(prompt: &str) -> io::Result<String> {
     print!("{prompt}");
     io::stdout().flush()?;
@@ -204,7 +230,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if input.is_empty() {
             break;
         }
-        println!("{}\n", agent.chat(input, &mut history).await?);
+        let mut stream = agent.prompt(input).history(history.iter().cloned()).stream();
+        let response = print_stream(&mut stream).await?;
+        history.extend(response.messages);
+        println!("\n");
     }
     Ok(())
 }
