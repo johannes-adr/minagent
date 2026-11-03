@@ -5,6 +5,7 @@
 //! command cannot plant code that later runs outside the sandbox. (Bob also protects
 //! its own `.bob` directory; this project has no such directory, so that rule is dropped.)
 
+use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -12,16 +13,8 @@ use tokio::process::Command;
 
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
-/// Which network access a sandboxed process gets.
-#[derive(Clone, Copy)]
-pub enum Network {
-    /// Loopback only (shell commands).
-    Localhost,
-    /// Loopback plus outbound internet, including DNS and TLS (the JS child, so `fetch` works).
-    Internet,
-}
-
-const PROFILE_HEAD: &str = r#"(version 1)
+/// Network is limited to localhost.
+const PROFILE: &str = r#"(version 1)
 (deny default)
 (allow process-exec process-fork process-info* signal)
 (allow sysctl-read)
@@ -40,17 +33,9 @@ const PROFILE_HEAD: &str = r#"(version 1)
   (global-name "com.apple.FontObjectsServer")
   (global-name "com.apple.fonts")
   (global-name "com.apple.lsd.mapdb"))
-"#;
-
-const NETWORK_LOCALHOST: &str = r#"(allow network-bind network-inbound (local ip "localhost:*"))
+(allow network-bind network-inbound (local ip "localhost:*"))
 (allow network-outbound (remote ip "localhost:*"))
-"#;
-
-const NETWORK_INTERNET: &str = r#"(allow network-bind network-inbound (local ip "localhost:*"))
-(allow network-outbound)
-"#;
-
-const PROFILE_TAIL: &str = r#"(allow file-read*)
+(allow file-read*)
 (deny file-read*
   (subpath (string-append (param "HOME") "/.ssh"))
   (subpath (string-append (param "HOME") "/.aws"))
@@ -83,33 +68,32 @@ const PROFILE_TAIL: &str = r#"(allow file-read*)
   (literal (string-append (param "WORKSPACE") "/.git")))
 "#;
 
-fn profile(network: Network) -> String {
-    let net = match network {
-        Network::Localhost => NETWORK_LOCALHOST,
-        Network::Internet => NETWORK_INTERNET,
-    };
-    format!("{PROFILE_HEAD}{net}{PROFILE_TAIL}")
-}
-
 pub fn supported() -> bool {
     cfg!(target_os = "macos") && Path::new(SANDBOX_EXEC).exists()
 }
 
 /// Wraps `program args...` in `sandbox-exec`, scoped to the current directory as workspace.
+/// With `allow_network`, outbound internet access is allowed on top of the localhost-only profile.
 pub fn command<S: AsRef<OsStr>>(
     program: impl AsRef<OsStr>,
     args: impl IntoIterator<Item = S>,
-    network: Network,
+    allow_network: bool,
 ) -> io::Result<Command> {
-    command_in(&std::env::current_dir()?, program, args, network)
+    command_in(&std::env::current_dir()?, program, args, allow_network)
 }
 
 fn command_in<S: AsRef<OsStr>>(
     workspace: &Path,
     program: impl AsRef<OsStr>,
     args: impl IntoIterator<Item = S>,
-    network: Network,
+    allow_network: bool,
 ) -> io::Result<Command> {
+    // Later SBPL rules win, so this overrides the localhost-only `network-outbound` rule.
+    let profile = if allow_network {
+        Cow::Owned(format!("{PROFILE}(allow network-outbound)\n"))
+    } else {
+        Cow::Borrowed(PROFILE)
+    };
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::other("HOME is not set"))?;
@@ -118,7 +102,7 @@ fn command_in<S: AsRef<OsStr>>(
     };
     let mut cmd = Command::new(SANDBOX_EXEC);
     cmd.arg("-p")
-        .arg(profile(network))
+        .arg(&*profile)
         .args(["-D", &param("HOME", &home)?])
         .args(["-D", &param("WORKSPACE", workspace)?])
         .args(["-D", &param("TMP", &std::env::temp_dir())?])
@@ -152,7 +136,11 @@ mod tests {
 
     /// Runs `sh -c script` sandboxed in `ws`; returns (success, stderr).
     async fn run(ws: &Workspace, script: &str) -> (bool, String) {
-        let out = command_in(&ws.0, "sh", ["-c", script], Network::Localhost)
+        run_net(ws, script, false).await
+    }
+
+    async fn run_net(ws: &Workspace, script: &str, allow_network: bool) -> (bool, String) {
+        let out = command_in(&ws.0, "sh", ["-c", script], allow_network)
             .unwrap()
             .current_dir(&ws.0)
             .output()
@@ -216,5 +204,20 @@ mod tests {
         let (ok, err) = run(&ws, &format!("ls {}", ssh.display())).await;
         assert!(!ok);
         assert!(err.contains("Operation not permitted"), "{err}");
+    }
+
+    /// Needs internet, so it is not run by default: `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "requires internet access"]
+    async fn network_only_with_allow_network() {
+        if !supported() {
+            return;
+        }
+        let ws = Workspace::new("net");
+        let curl = "curl -sS -m 10 -o /dev/null https://example.com";
+        let (ok, _) = run_net(&ws, curl, false).await;
+        assert!(!ok, "internet must be blocked by default");
+        let (ok, err) = run_net(&ws, curl, true).await;
+        assert!(ok, "{err}");
     }
 }
