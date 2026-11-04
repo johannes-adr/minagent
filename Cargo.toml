@@ -23,3 +23,7 @@ unicode-width = "0.2"
 # codegen-units = 1
 # panic = "abort"
 # opt-level = "z"
+
+[dev-dependencies]
+rig-agent = { version = "0.46.0", features = ["test-utils"] }
+rig-core = { version = "0.46.0", features = ["test-utils"] }

@@ -81,6 +81,8 @@ enum Action {
     None,
     Quit,
     Submit(String),
+    /// Switch mouse capture (wheel scrolling) on or off.
+    ToggleMouse,
 }
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -105,6 +107,8 @@ struct App {
     scroll: usize,
     chat_height: usize,
     tick: usize,
+    /// Mouse capture enables wheel scrolling but blocks text selection in the terminal.
+    mouse: bool,
 }
 
 impl App {
@@ -117,6 +121,7 @@ impl App {
             scroll: 0,
             chat_height: 10,
             tick: 0,
+            mouse: false,
         }
     }
 
@@ -152,6 +157,9 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && key.code == KeyCode::Char('c') {
             return Action::Quit;
+        }
+        if ctrl && key.code == KeyCode::Char('t') {
+            return Action::ToggleMouse;
         }
         if let Some((_, reply)) = self.approvals.pop_front() {
             let _ = reply.send(key.code == KeyCode::Char('y'));
@@ -264,7 +272,11 @@ impl App {
                     Style::new().fg(Color::Yellow),
                 )],
                 Status::Idle => vec![Span::styled(
-                    "Enter send · Alt+Enter newline · PgUp/PgDn scroll · Esc quit",
+                    if self.mouse {
+                        "Enter send · Alt+Enter newline · PgUp/PgDn scroll · Ctrl+T mouse: scroll (copy off) · Esc quit"
+                    } else {
+                        "Enter send · Alt+Enter newline · PgUp/PgDn scroll · Ctrl+T mouse: copy (wheel off) · Esc quit"
+                    },
                     Style::new().fg(Color::DarkGray),
                 )],
             }
@@ -448,6 +460,15 @@ async fn event_loop(
                     return Ok(());
                 }
             }
+            Action::ToggleMouse => {
+                app.mouse = !app.mouse;
+                let mut out = io::stdout();
+                if app.mouse {
+                    execute!(out, EnableMouseCapture)?;
+                } else {
+                    execute!(out, DisableMouseCapture)?;
+                }
+            }
             Action::None => {}
         }
     }
@@ -457,7 +478,7 @@ async fn event_loop(
 fn setup() -> io::Result<DefaultTerminal> {
     let terminal = ratatui::try_init()?;
     let mut out = io::stdout();
-    execute!(out, EnableMouseCapture, EnableBracketedPaste)?;
+    execute!(out, EnableBracketedPaste)?;
     // Lets terminals that support it report Shift+Enter separately from Enter.
     if matches!(
         crossterm::terminal::supports_keyboard_enhancement(),
