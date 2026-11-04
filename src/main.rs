@@ -1,12 +1,14 @@
 mod config;
 mod js;
 mod sandbox;
+mod skills;
 mod tui;
 
 use futures::StreamExt;
 use rig_agent::agent::{
     AgentHook, DispatchAction, DispatchEvent, HookContext, MultiTurnStreamItem, StreamingResult,
 };
+use rig_agent::run::policy::{InvalidToolCallAction, InvalidToolCallContext, InvalidToolCallReason};
 use rig_agent::run::response::PromptResponse;
 use rig_agent::streaming::{Item, StreamEvent};
 use rig_agent::{AgentBuilder, rig_tool};
@@ -18,6 +20,8 @@ use std::process::{Output, Stdio};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tui::{Status, UiEvent};
+
+const PREAMBLE: &str = "You are a helpful agent. Use the `execute` tool to run shell commands and `execute_javascript` to run JavaScript. Both run in a sandbox (writes only in the working directory and temp, no internet, no access to .env files); set `disable_sandbox` (execute) or `allow_network` (execute_javascript) only if a call fails with \"Operation not permitted\" or needs the network.";
 
 /// Maximum run time of a single `execute` / `execute_javascript` call.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -177,7 +181,37 @@ fn decide(name: &str, args: &str, sandboxed: bool) -> Approval {
     }
 }
 
+/// How often the model may retry after calling a tool that doesn't exist, per prompt.
+const INVALID_TOOL_CALL_RETRIES: usize = 3;
+
+fn unknown_tool_feedback(tool: &str, available: &[String]) -> String {
+    format!(
+        "There is no tool named `{tool}`. Available tools: {}. Retry with one of these \
+         (use `execute` for shell commands, `execute_javascript` for JavaScript). \
+         If `{tool}` is a skill, it is not a tool: load it by running the use_skill.js command \
+         from the Skills section with the `execute` tool.",
+        available.join(", ")
+    )
+}
+
 impl AgentHook for Approve {
+    async fn on_invalid_tool_call(
+        &self,
+        _: &HookContext,
+        event: &InvalidToolCallContext,
+    ) -> Option<InvalidToolCallAction> {
+        match event.reason {
+            InvalidToolCallReason::UnknownTool => {
+                tui::emit(UiEvent::Info(format!("[unknown tool] {}", event.tool_name)));
+                Some(InvalidToolCallAction::retry(unknown_tool_feedback(
+                    &event.tool_name,
+                    &event.available_tools,
+                )))
+            }
+            _ => None,
+        }
+    }
+
     async fn on_dispatch(&self, _: &HookContext, event: DispatchEvent<'_>) -> DispatchAction {
         let EffectKind::ToolCall { name, args } = event.kind else {
             return DispatchAction::proceed();
@@ -220,11 +254,12 @@ async fn forward_stream(stream: &mut StreamingResult) -> Result<PromptResponse, 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    // `--js <file|->` runs JS directly; sandboxing is up to the caller (`execute`, `execute_javascript`).
-    if let [_, flag, file] = args.as_slice()
+    // `--js <file|-> [args...]` runs JS directly (args land in `globalThis.ARGS`);
+    // sandboxing is up to the caller (`execute`, `execute_javascript`).
+    if let [_, flag, file, rest @ ..] = args.as_slice()
         && flag == "--js"
     {
-        return js::run_js(file).await;
+        return js::run_js(file, rest).await;
     }
     // `--env-example` (re)generates `.env.example` from the config.
     if let [_, flag] = args.as_slice()
@@ -243,8 +278,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let model = config::Config::load()?.model()?;
+    let skills = skills::Skills::load(Path::new(skills::DIR))?;
+    for warning in &skills.warnings {
+        eprintln!("skills: {warning}");
+    }
+    let preamble = format!("{}{}", PREAMBLE, skills.prompt(&std::env::current_exe()?));
     let agent = AgentBuilder::new(model)
-        .preamble("You are a helpful agent. Use the `execute` tool to run shell commands and `execute_javascript` to run JavaScript. Both run in a sandbox (writes only in the working directory and temp, no internet, no access to .env files); set `disable_sandbox` (execute) or `allow_network` (execute_javascript) only if a call fails with \"Operation not permitted\" or needs the network.")
+        .preamble(&preamble)
         .tool(Execute)
         .tool(ExecuteJavascript) // add more tools here
         .add_hook(Approve)
@@ -258,6 +298,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while let Some(input) = inbox.recv().await {
             let mut stream = agent
                 .prompt(input)
+                .max_invalid_tool_call_retries(INVALID_TOOL_CALL_RETRIES)
                 .history(history.iter().cloned())
                 .stream();
             match forward_stream(&mut stream).await {
@@ -380,6 +421,41 @@ mod tests {
         assert!(!auto("execute", "not json", true));
         assert!(!auto("execute_javascript", "{", true));
         assert!(!auto("unknown_tool", r#"{"code":"1"}"#, true));
+    }
+
+    /// A call to a nonexistent tool must not end the run: the model gets feedback and retries.
+    #[tokio::test]
+    async fn unknown_tool_call_is_retried() {
+        use rig_core::test_utils::{MockCompletionModel, MockStreamEvent};
+        let model = MockCompletionModel::from_stream_turns([
+            vec![
+                MockStreamEvent::tool_call("t1", "bash", serde_json::json!({"command": "ls"})),
+                MockStreamEvent::final_response_with_total_tokens(1),
+            ],
+            vec![
+                MockStreamEvent::text("done"),
+                MockStreamEvent::final_response_with_total_tokens(1),
+            ],
+        ]);
+        let recorded = model.clone();
+        let agent = AgentBuilder::new(model)
+            .tool(Execute)
+            .add_hook(Approve)
+            .default_max_turns(20)
+            .build();
+        let mut stream = agent
+            .prompt("hi")
+            .max_invalid_tool_call_retries(INVALID_TOOL_CALL_RETRIES)
+            .stream();
+        let response = forward_stream(&mut stream).await.expect("run must continue");
+        assert_eq!(response.output(), "done");
+        assert_eq!(recorded.request_count(), 2);
+    }
+
+    #[test]
+    fn unknown_tool_feedback_lists_available_tools() {
+        let text = unknown_tool_feedback("bash", &["execute".into(), "execute_javascript".into()]);
+        assert!(text.contains("`bash`") && text.contains("execute, execute_javascript"), "{text}");
     }
 
     #[test]
