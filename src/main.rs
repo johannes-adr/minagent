@@ -251,6 +251,16 @@ async fn forward_stream(stream: &mut StreamingResult) -> Result<PromptResponse, 
     Err("the stream ended without a final response".into())
 }
 
+/// Path of this executable relative to the working directory when it lies below it
+/// (e.g. `target/debug/agent`), so the model has less to write; otherwise absolute.
+fn relative_exe() -> std::io::Result<std::path::PathBuf> {
+    let exe = std::env::current_exe()?;
+    let relative = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| exe.strip_prefix(cwd).ok().map(Path::to_path_buf));
+    Ok(relative.unwrap_or(exe))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -282,7 +292,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for warning in &skills.warnings {
         eprintln!("skills: {warning}");
     }
-    let preamble = format!("{}{}", PREAMBLE, skills.prompt(&std::env::current_exe()?));
+    let preamble = format!("{}{}", PREAMBLE, skills.prompt(&relative_exe()?));
     let agent = AgentBuilder::new(model)
         .preamble(&preamble)
         .tool(Execute)
