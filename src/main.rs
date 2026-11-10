@@ -1,5 +1,6 @@
 mod config;
 mod js;
+mod llm_proxy;
 mod prompt;
 mod sandbox;
 mod skills;
@@ -227,12 +228,13 @@ async fn forward_stream(stream: &mut StreamingResult) -> Result<PromptResponse, 
 }
 
 /// Path of this executable relative to the working directory when it lies below it
-/// (e.g. `target/debug/agent`), so the model has less to write; otherwise absolute.
+/// (e.g. `./target/debug/agent`), so the model has less to write; otherwise absolute.
+/// The `./` prefix keeps the shell from looking up a bare `agent` in `PATH`.
 fn relative_exe() -> std::io::Result<std::path::PathBuf> {
     let exe = std::env::current_exe()?;
     let relative = std::env::current_dir()
         .ok()
-        .and_then(|cwd| exe.strip_prefix(cwd).ok().map(Path::to_path_buf));
+        .and_then(|cwd| exe.strip_prefix(cwd).ok().map(|p| Path::new(".").join(p)));
     Ok(relative.unwrap_or(exe))
 }
 
@@ -264,6 +266,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // `--prompt <text|->` runs one prompt without the UI (`-` reads it from stdin, which has
+    // no quoting or argument-length problems), streams the answer to stdout (notes and tool
+    // output to stderr) and exits. Tool calls that need approval are denied.
+    let headless_prompt = match args.as_slice() {
+        [_, flag, text] if flag == "--prompt" => {
+            let text = if text == "-" {
+                std::io::read_to_string(std::io::stdin())?
+            } else {
+                text.clone()
+            };
+            if text.trim().is_empty() {
+                return Err("--prompt: the prompt is empty".into());
+            }
+            Some(text)
+        }
+        [_, flag, ..] if flag == "--prompt" => return Err("usage: agent --prompt <text|->".into()),
+        _ => None,
+    };
+
     // First start: create `.env.example` so the user knows what to configure.
     if !Path::new(".env.example").exists() {
         std::fs::write(".env.example", config::env_example())?;
@@ -271,7 +292,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let model = config::Config::load()?.model()?;
+    let config = config::Config::load()?;
+    let model = config.model()?;
+    // Sandboxed commands (subagents among them) reach the model through a localhost proxy;
+    // a subagent inherits its parent's proxy.
+    if sandbox::supported() && !sandbox::inside() {
+        let (proxy, token) = llm_proxy::start(config.upstream()?).await?;
+        sandbox::set_child_env(config.child_env(&proxy, &token)?);
+    }
     skills::install_builtin(Path::new(skills::DIR))?;
     let preamble = prompt::build(&std::env::current_exe()?, &relative_exe()?).await?;
     let agent = AgentBuilder::new(model)
@@ -281,6 +309,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_hook(Approve)
         .default_max_turns(20)
         .build();
+
+    if let Some(input) = headless_prompt {
+        tui::set_headless();
+        let mut stream = agent
+            .prompt(input)
+            .max_invalid_tool_call_retries(INVALID_TOOL_CALL_RETRIES)
+            .stream();
+        let result = forward_stream(&mut stream).await;
+        println!();
+        return result.map(|_| ()).map_err(Into::into);
+    }
 
     // The agent runs in its own task: prompts come in from the UI, events go back via `tui::emit`.
     let (prompts, mut inbox) = tokio::sync::mpsc::unbounded_channel::<String>();
