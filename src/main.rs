@@ -1,5 +1,6 @@
 mod config;
 mod js;
+mod prompt;
 mod sandbox;
 mod skills;
 mod tui;
@@ -16,12 +17,9 @@ use rig_core::effect::EffectKind;
 use rig_core::serde_json;
 use rig_core::tool::ToolExecutionError;
 use std::path::Path;
-use std::process::{Output, Stdio};
+use std::process::Output;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tui::{Status, UiEvent};
-
-const PREAMBLE: &str = "You are a helpful agent. Use the `execute` tool to run shell commands and `execute_javascript` to run JavaScript. Both run in a sandbox (writes only in the working directory and temp, no internet, no access to .env files); set `disable_sandbox` (execute) or `allow_network` (execute_javascript) only if a call fails with \"Operation not permitted\" or needs the network.";
 
 /// Maximum run time of a single `execute` / `execute_javascript` call.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(120);
@@ -105,30 +103,7 @@ async fn run_js_process(
     code: &str,
     allow_network: bool,
 ) -> Result<String, ToolExecutionError> {
-    let args = ["--js", "-"];
-    let mut cmd = if sandbox::supported() {
-        sandbox::command(exe, args, allow_network).map_err(ToolExecutionError::from_error)?
-    } else {
-        let mut cmd = tokio::process::Command::new(exe);
-        cmd.args(args);
-        cmd
-    };
-    // Dropping the child (on timeout) kills it.
-    let mut child = cmd
-        .kill_on_drop(true)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(ToolExecutionError::from_error)?;
-    let mut stdin = child.stdin.take().expect("stdin is piped");
-    stdin
-        .write_all(code.as_bytes())
-        .await
-        .map_err(ToolExecutionError::from_error)?;
-    drop(stdin);
-    let out = child
-        .wait_with_output()
+    let out = js::run_sandboxed(exe, code, allow_network)
         .await
         .map_err(ToolExecutionError::from_error)?;
     Ok(format_output(&out))
@@ -280,6 +255,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    // `--system-prompt` prints the system prompt built by `system_prompt/system.js`.
+    if let [_, flag] = args.as_slice()
+        && flag == "--system-prompt"
+    {
+        skills::install_builtin(Path::new(skills::DIR))?;
+        println!("{}", prompt::build(&std::env::current_exe()?, &relative_exe()?).await?);
+        return Ok(());
+    }
+
     // First start: create `.env.example` so the user knows what to configure.
     if !Path::new(".env.example").exists() {
         std::fs::write(".env.example", config::env_example())?;
@@ -288,11 +272,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let model = config::Config::load()?.model()?;
-    let skills = skills::Skills::load(Path::new(skills::DIR))?;
-    for warning in &skills.warnings {
-        eprintln!("skills: {warning}");
-    }
-    let preamble = format!("{}{}", PREAMBLE, skills.prompt(&relative_exe()?));
+    skills::install_builtin(Path::new(skills::DIR))?;
+    let preamble = prompt::build(&std::env::current_exe()?, &relative_exe()?).await?;
     let agent = AgentBuilder::new(model)
         .preamble(&preamble)
         .tool(Execute)
