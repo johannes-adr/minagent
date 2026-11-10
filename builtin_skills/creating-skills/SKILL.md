@@ -48,5 +48,5 @@ skills/<skill-name>/
    print your instructions. The skill appears in the system prompt after the agent is restarted.
    A skill with invalid frontmatter is skipped with a warning at startup.
 
-Do not edit or delete the built-in skills `using-skills` and `creating-skills`; they are
-restored on every start.
+Do not edit or delete the built-in skills `using-skills`, `creating-skills` and `subagents`;
+they are restored on every start.

@@ -49,3 +49,57 @@ fn use_skill_script_prints_skill() {
     assert!(!run(&["nope"]).status.success());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `--prompt` needs a non-empty prompt; it is checked before any config is loaded.
+#[test]
+fn prompt_flag_rejects_missing_or_empty_prompt() {
+    let run = |args: &[&str], stdin: &str| {
+        use std::io::Write;
+        let mut child = Command::new(env!("CARGO_BIN_EXE_agent"))
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let out = run(&["--prompt"], "");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("usage: agent --prompt"));
+    let out = run(&["--prompt", "-"], " \n");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("the prompt is empty"));
+}
+
+/// `spawn_subagent.js` hands the prompt to `agent --prompt -` and passes on its failure.
+#[test]
+fn spawn_subagent_script_reports_failure() {
+    let dir = std::env::temp_dir().join(format!("agent_subagent_test_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(".env.example"), "").unwrap();
+    std::fs::write(dir.join("task.md"), "say 'hi' \"there\" $HOME `x`\n").unwrap();
+    let script = dir.join("spawn_subagent.js");
+    std::fs::write(
+        &script,
+        include_str!("../builtin_skills/subagents/scripts/spawn_subagent.js"),
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_agent"))
+        .current_dir(&dir)
+        .env("LLM_BACKEND", "nope")
+        .args(["--js", "spawn_subagent.js", "task.md"])
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("subagent failed (exit 1)"), "{stderr}");
+    assert!(stderr.contains("unknown LLM_BACKEND"), "{stderr}");
+}

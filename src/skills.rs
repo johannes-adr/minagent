@@ -26,6 +26,14 @@ const BUILTIN: &[(&str, &str)] = &[
         "creating-skills/SKILL.md",
         include_str!("../builtin_skills/creating-skills/SKILL.md"),
     ),
+    (
+        "subagents/SKILL.md",
+        include_str!("../builtin_skills/subagents/SKILL.md"),
+    ),
+    (
+        "subagents/scripts/spawn_subagent.js",
+        include_str!("../builtin_skills/subagents/scripts/spawn_subagent.js"),
+    ),
 ];
 
 /// Writes the embedded skills to `root` (the skill text refers to the agent executable

@@ -3,6 +3,10 @@
 //! [`VARS`] is the single source of truth: it drives [`Config::load`] and the
 //! generated `.env.example` ([`env_example`]). Values from `.env` are not put into the
 //! process environment, so sandboxed child processes don't inherit them.
+//!
+//! A sandboxed agent (a subagent) can't read `.env` or reach the internet. The parent
+//! passes it [`PROXY_ENV`] and [`TOKEN_ENV`] instead: the model is then reached through
+//! the parent's localhost proxy (`llm_proxy`) with the token as API key.
 
 use rig_core::DynModel;
 use rig_core::operation::Completion;
@@ -81,22 +85,104 @@ pub struct Config {
     values: HashMap<String, String>,
 }
 
+/// Base URL of the parent's LLM proxy, set for sandboxed child processes.
+pub const PROXY_ENV: &str = "AGENT_LLM_PROXY";
+/// Token the proxy accepts as API key.
+pub const TOKEN_ENV: &str = "AGENT_LLM_TOKEN";
+
+/// Where the proxy forwards to and how it authenticates there.
+pub struct Upstream {
+    pub base_url: String,
+    /// Header name and value with the real credential.
+    pub auth: Option<(&'static str, String)>,
+}
+
 impl Config {
     /// Process environment first, then `.env` in the current directory (if present).
+    /// With [`PROXY_ENV`] and [`TOKEN_ENV`] set, `.env` is skipped and the model is
+    /// reached through the proxy.
     pub fn load() -> Result<Self, Box<dyn std::error::Error>> {
+        let env = |name: &str| std::env::var(name).ok();
+        let proxied = env(PROXY_ENV).is_some() && env(TOKEN_ENV).is_some();
         let mut values = HashMap::new();
-        if Path::new(".env").exists() {
+        if !proxied && Path::new(".env").exists() {
             for item in dotenvy::from_path_iter(".env")? {
                 let (key, value) = item?;
                 values.insert(key, value);
             }
         }
+        Ok(Self::with_env(values, env))
+    }
+
+    fn with_env(mut values: HashMap<String, String>, env: impl Fn(&str) -> Option<String>) -> Self {
         for var in VARS {
-            if let Ok(value) = std::env::var(var.name) {
+            if let Some(value) = env(var.name) {
                 values.insert(var.name.to_owned(), value);
             }
         }
-        Ok(Config { values })
+        let mut config = Config { values };
+        if let (Some(url), Some(token), Ok(backend)) =
+            (env(PROXY_ENV), env(TOKEN_ENV), config.backend())
+        {
+            let (url_var, key_var) = match backend {
+                Backend::OpenAI => ("OPENAI_BASE_URL", "OPENAI_API_KEY"),
+                Backend::Anthropic => ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY"),
+                Backend::Ollama => ("OLLAMA_API_BASE_URL", "OLLAMA_API_KEY"),
+            };
+            config.values.insert(url_var.into(), url);
+            config.values.insert(key_var.into(), token);
+        }
+        config
+    }
+
+    /// Environment for a sandboxed child that reaches the model through the proxy at
+    /// `proxy` (`http://127.0.0.1:<port>`): the backend, the model and the proxy URL with
+    /// the path of the real base URL, so the child builds the same request paths.
+    pub fn child_env(&self, proxy: &str, token: &str) -> Result<Vec<(String, String)>, String> {
+        let base = self.upstream()?.base_url;
+        let path = reqwest::Url::parse(&base)
+            .map_err(|e| format!("invalid base URL {base:?}: {e}"))?
+            .path()
+            .trim_end_matches('/')
+            .to_owned();
+        let backend = match self.backend()? {
+            Backend::OpenAI => "openai",
+            Backend::Anthropic => "anthropic",
+            Backend::Ollama => "ollama",
+        };
+        let mut env = vec![
+            ("LLM_BACKEND".to_owned(), backend.to_owned()),
+            (PROXY_ENV.to_owned(), format!("{proxy}{path}")),
+            (TOKEN_ENV.to_owned(), token.to_owned()),
+        ];
+        if let Some(model) = self.get("LLM_MODEL") {
+            env.push(("LLM_MODEL".to_owned(), model.to_owned()));
+        }
+        Ok(env)
+    }
+
+    /// The real endpoint of the configured backend (what [`Config::model`] talks to).
+    pub fn upstream(&self) -> Result<Upstream, String> {
+        let url = |var: &str, default: &str| self.get(var).unwrap_or(default).to_owned();
+        Ok(match self.backend()? {
+            Backend::OpenAI => Upstream {
+                base_url: url("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+                auth: Some((
+                    "authorization",
+                    format!("Bearer {}", self.required("OPENAI_API_KEY")?),
+                )),
+            },
+            Backend::Anthropic => Upstream {
+                base_url: url("ANTHROPIC_BASE_URL", "https://api.anthropic.com"),
+                auth: Some(("x-api-key", self.required("ANTHROPIC_API_KEY")?.to_owned())),
+            },
+            Backend::Ollama => Upstream {
+                base_url: url("OLLAMA_API_BASE_URL", "http://localhost:11434"),
+                auth: self
+                    .get("OLLAMA_API_KEY")
+                    .map(|key| ("authorization", format!("Bearer {key}"))),
+            },
+        })
     }
 
     /// The value of `name`; empty counts as unset.
@@ -222,5 +308,37 @@ mod tests {
     #[test]
     fn ollama_needs_no_key() {
         assert!(config(&[("LLM_BACKEND", "ollama")]).model().is_ok());
+    }
+
+    #[test]
+    fn child_env_points_at_the_proxy() {
+        let parent = config(&[("OPENAI_API_KEY", "sk-real"), ("LLM_MODEL", "m1")]);
+        let env: HashMap<_, _> = parent
+            .child_env("http://127.0.0.1:9", "tok")
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(env[PROXY_ENV], "http://127.0.0.1:9/v1");
+        assert_eq!(env["LLM_BACKEND"], "openai");
+        assert_eq!(env["LLM_MODEL"], "m1");
+        assert!(!env.values().any(|v| v.contains("sk-real")));
+
+        // The child uses the proxy and the token instead of `.env`.
+        let child = Config::with_env(HashMap::new(), |name| env.get(name).cloned());
+        assert_eq!(child.get("OPENAI_BASE_URL"), Some("http://127.0.0.1:9/v1"));
+        assert_eq!(child.get("OPENAI_API_KEY"), Some("tok"));
+        assert_eq!(child.get("LLM_MODEL"), Some("m1"));
+        assert!(child.model().is_ok());
+    }
+
+    #[test]
+    fn upstream_has_the_real_credential() {
+        let up = config(&[("LLM_BACKEND", "anthropic"), ("ANTHROPIC_API_KEY", "k")])
+            .upstream()
+            .unwrap();
+        assert_eq!(up.base_url, "https://api.anthropic.com");
+        assert_eq!(up.auth, Some(("x-api-key", "k".to_owned())));
+        let up = config(&[("LLM_BACKEND", "ollama")]).upstream().unwrap();
+        assert_eq!(up.auth, None);
     }
 }

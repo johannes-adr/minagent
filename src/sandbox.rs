@@ -6,12 +6,27 @@
 //! hold API keys) can be neither read nor written anywhere; their metadata stays
 //! readable so `ls -l` etc. keep working. (Bob also protects its own `.bob` directory;
 //! this project has no such directory, so that rule is dropped.)
+//!
+//! Sandboxed processes get [`INSIDE_ENV`]` = 1`. An agent started inside the sandbox (a
+//! subagent) can't nest another sandbox, so it runs its commands directly; they stay in
+//! the outer sandbox. The variable alone is not trusted: the kernel must confirm it.
 
 use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tokio::process::Command;
+
+/// Marks processes started in the sandbox.
+const INSIDE_ENV: &str = "AGENT_SANDBOXED";
+
+/// Extra environment for sandboxed processes (the LLM proxy for subagents).
+static CHILD_ENV: OnceLock<Vec<(String, String)>> = OnceLock::new();
+
+pub fn set_child_env(vars: Vec<(String, String)>) {
+    let _ = CHILD_ENV.set(vars);
+}
 
 const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
@@ -72,17 +87,44 @@ const PROFILE: &str = r#"(version 1)
   (regex #"/\.env$"))
 "#;
 
+/// Whether commands run sandboxed: by wrapping them, or because this process already is.
 pub fn supported() -> bool {
-    cfg!(target_os = "macos") && Path::new(SANDBOX_EXEC).exists()
+    inside() || cfg!(target_os = "macos") && Path::new(SANDBOX_EXEC).exists()
+}
+
+/// Whether this process was started in the sandbox ([`INSIDE_ENV`], confirmed by the kernel).
+pub fn inside() -> bool {
+    static INSIDE: OnceLock<bool> = OnceLock::new();
+    *INSIDE.get_or_init(|| std::env::var(INSIDE_ENV).as_deref() == Ok("1") && is_sandboxed())
+}
+
+#[cfg(target_os = "macos")]
+fn is_sandboxed() -> bool {
+    unsafe extern "C" {
+        fn sandbox_check(pid: i32, operation: *const std::ffi::c_char, kind: i32, ...) -> i32;
+    }
+    // No operation and filter type 0 (none): non-zero when the process is sandboxed.
+    unsafe { sandbox_check(std::process::id() as i32, std::ptr::null(), 0) != 0 }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_sandboxed() -> bool {
+    false
 }
 
 /// Wraps `program args...` in `sandbox-exec`, scoped to the current directory as workspace.
 /// With `allow_network`, outbound internet access is allowed on top of the localhost-only profile.
+/// Inside the sandbox the command runs directly (`allow_network` can't be granted there).
 pub fn command<S: AsRef<OsStr>>(
     program: impl AsRef<OsStr>,
     args: impl IntoIterator<Item = S>,
     allow_network: bool,
 ) -> io::Result<Command> {
+    if inside() {
+        let mut cmd = Command::new(program);
+        cmd.args(args);
+        return Ok(cmd);
+    }
     command_in(&std::env::current_dir()?, program, args, allow_network)
 }
 
@@ -111,7 +153,9 @@ fn command_in<S: AsRef<OsStr>>(
         .args(["-D", &param("WORKSPACE", workspace)?])
         .args(["-D", &param("TMP", &std::env::temp_dir())?])
         .arg(program)
-        .args(args);
+        .args(args)
+        .env(INSIDE_ENV, "1")
+        .envs(CHILD_ENV.get().into_iter().flatten().map(|(k, v)| (k, v)));
     Ok(cmd)
 }
 
@@ -240,6 +284,16 @@ mod tests {
         let (ok, err) = run(&ws, &format!("ls {}", ssh.display())).await;
         assert!(!ok);
         assert!(err.contains("Operation not permitted"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn marks_sandboxed_processes() {
+        if !supported() {
+            return;
+        }
+        let ws = Workspace::new("marker");
+        let (ok, err) = run(&ws, r#"test "$AGENT_SANDBOXED" = 1"#).await;
+        assert!(ok, "{err}");
     }
 
     /// Needs internet, so it is not run by default: `cargo test -- --ignored`.

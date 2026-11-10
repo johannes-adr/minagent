@@ -16,13 +16,18 @@ ratatui = "0.30.2"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 ratatui-textarea = "0.9.4"
 unicode-width = "0.2"
+# Same versions as rig-core uses (TLS features come from there); for `llm_proxy`.
+reqwest = { version = "0.13", default-features = false, features = ["stream"] }
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 
-# [profile.release]
-# strip = true
-# lto = true
-# codegen-units = 1
-# panic = "abort"
-# opt-level = "z"
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
+opt-level = "z"
 
 [dev-dependencies]
 rig-agent = { version = "0.46.0", features = ["test-utils"] }

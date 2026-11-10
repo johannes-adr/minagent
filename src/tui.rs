@@ -17,7 +17,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use ratatui_textarea::{TextArea, WrapMode};
 use std::collections::VecDeque;
-use std::io;
+use std::io::{self, Write};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -53,11 +53,37 @@ pub enum UiEvent {
 
 static EVENTS: OnceLock<mpsc::UnboundedSender<UiEvent>> = OnceLock::new();
 static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
+static HEADLESS: AtomicBool = AtomicBool::new(false);
+
+/// Prints events instead of showing them (`--prompt` mode): the answer is streamed to
+/// stdout, everything else goes to stderr. Approvals are denied, there is no user to ask.
+pub fn set_headless() {
+    HEADLESS.store(true, Ordering::Relaxed);
+}
 
 /// Sends an event to the UI. Does nothing while the UI is not running (CLI modes, tests).
 pub fn emit(event: UiEvent) {
-    if let Some(tx) = EVENTS.get() {
+    if HEADLESS.load(Ordering::Relaxed) {
+        print_event(event);
+    } else if let Some(tx) = EVENTS.get() {
         let _ = tx.send(event);
+    }
+}
+
+fn print_event(event: UiEvent) {
+    match event {
+        UiEvent::Text(text) => {
+            let mut out = io::stdout();
+            let _ = out.write_all(text.as_bytes());
+            let _ = out.flush();
+        }
+        UiEvent::Info(text) | UiEvent::ToolOutput(text) => eprintln!("{text}"),
+        UiEvent::Error(text) => eprintln!("error: {text}"),
+        UiEvent::Status(_) => {}
+        // Dropping `reply` denies the request.
+        UiEvent::Approval { prompt, .. } => {
+            eprintln!("{prompt}n (no user to approve in --prompt mode)")
+        }
     }
 }
 
