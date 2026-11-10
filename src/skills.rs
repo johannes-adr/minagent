@@ -34,6 +34,22 @@ const BUILTIN: &[(&str, &str)] = &[
         "subagents/scripts/spawn_subagent.js",
         include_str!("../builtin_skills/subagents/scripts/spawn_subagent.js"),
     ),
+    (
+        "background-tasks/SKILL.md",
+        include_str!("../builtin_skills/background-tasks/SKILL.md"),
+    ),
+    (
+        "background-tasks/scripts/start_task.js",
+        include_str!("../builtin_skills/background-tasks/scripts/start_task.js"),
+    ),
+    (
+        "background-tasks/scripts/tasks.js",
+        include_str!("../builtin_skills/background-tasks/scripts/tasks.js"),
+    ),
+    (
+        "background-tasks/scripts/common.js",
+        include_str!("../builtin_skills/background-tasks/scripts/common.js"),
+    ),
 ];
 
 /// Writes the embedded skills to `root` (the skill text refers to the agent executable
