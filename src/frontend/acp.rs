@@ -3,8 +3,9 @@
 //!
 //! Supported: `initialize`, `session/new`, `session/prompt` (text, resource links and
 //! embedded resources), `session/cancel`, streamed answer text, tool call reports and
-//! `session/request_permission` for calls that need approval. A cancelled prompt is
-//! dropped from the session's history.
+//! `session/request_permission` for calls that need approval, and `usage_update` with the
+//! tokens in context after each model call (only when the context window is known, as the
+//! update requires its size). A cancelled prompt is dropped from the session's history.
 
 use crate::frontend::{Event, Frontend, ToolCall};
 use crate::harness::Session;
@@ -156,6 +157,15 @@ impl Frontend for AcpFrontend {
                 "status": if failed { "failed" } else { "completed" },
                 "content": [text_content(&output)],
             })),
+            Event::Context(usage) => {
+                if let Some(size) = usage.window {
+                    self.update(json!({
+                        "sessionUpdate": "usage_update",
+                        "used": usage.tokens,
+                        "size": size,
+                    }));
+                }
+            }
         }
     }
 
@@ -349,13 +359,20 @@ mod tests {
     impl Client {
         /// Starts an agent whose model answers with `turns`.
         fn start(turns: Vec<Vec<MockStreamEvent>>) -> Self {
+            Self::start_with_window(turns, None)
+        }
+
+        /// [`Self::start`] for a model whose context window is `window`.
+        fn start_with_window(turns: Vec<Vec<MockStreamEvent>>, window: Option<u64>) -> Self {
             let (to_agent, agent_in) = tokio::io::duplex(1 << 16);
             let (agent_out, from_agent) = tokio::io::duplex(1 << 16);
             let model = MockCompletionModel::from_stream_turns(turns);
             tokio::spawn(serve_io(
                 BufReader::new(agent_in),
                 agent_out,
-                move |frontend| Session::new(model.clone().into(), "", frontend),
+                move |frontend| {
+                    Session::new(model.clone().into(), "", frontend).with_context_window(window)
+                },
             ));
             Self {
                 to_agent,
@@ -448,6 +465,36 @@ mod tests {
         let messages = client.until_response(2).await;
         assert_eq!(updates(&messages), ["agent_message_chunk hello"]);
         assert_eq!(messages.last().unwrap()["result"]["stopReason"], "end_turn");
+    }
+
+    /// After each model call the client gets the tokens in context and the window size;
+    /// without a known window there is no size to send, so no update.
+    #[tokio::test]
+    async fn usage_is_reported_when_the_window_is_known() {
+        use rig_core::completion::Usage;
+        for (window, expected) in [(Some(200_000), 1), (None, 0)] {
+            let usage = Usage::new().input_tokens(40_000).output_tokens(2_000);
+            let answer = vec![
+                MockStreamEvent::text("hello"),
+                MockStreamEvent::final_response(usage),
+            ];
+            let mut client = Client::start_with_window(vec![answer], window);
+            let session = client.new_session().await;
+            client.prompt(&session, "hi").await;
+            let messages = client.until_response(2).await;
+            let usage: Vec<_> = messages
+                .iter()
+                .map(|m| &m["params"]["update"])
+                .filter(|u| u["sessionUpdate"] == "usage_update")
+                .collect();
+            assert_eq!(usage.len(), expected, "{messages:?}");
+            if let Some(update) = usage.first() {
+                assert_eq!(
+                    (&update["used"], &update["size"]),
+                    (&json!(42_000), &json!(200_000))
+                );
+            }
+        }
     }
 
     /// A call that needs approval is reported, the client is asked, and the result is reported.

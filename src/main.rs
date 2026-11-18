@@ -64,6 +64,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(err.into());
         }
     }
+    let context_window = match config.context_window() {
+        Ok(tokens) => tokens,
+        Err(err) => {
+            // In ACP mode stdout belongs to the protocol.
+            eprintln!("{err}");
+            return Err(err.into());
+        }
+    };
     let model = match config.model() {
         Ok(model) => model,
         Err(err) => {
@@ -89,14 +97,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let preamble = preamble_with_agents_md(Path::new("."));
+    let new_session = |frontend| {
+        Session::new(model.clone(), &preamble, frontend).with_context_window(context_window)
+    };
     if acp {
-        acp::serve(|frontend| Session::new(model.clone(), &preamble, frontend)).await?;
+        acp::serve(new_session).await?;
     } else if let Some(addr) = web_addr {
         let (frontend, inbox) = web::Web::new()?;
-        let session = Session::new(model, &preamble, frontend.clone());
+        let session = new_session(frontend.clone());
         web::run(frontend, inbox, session, addr).await?;
     } else {
-        tui::run(Session::new(model, &preamble, Arc::new(tui::Tui))).await?;
+        tui::run(new_session(Arc::new(tui::Tui))).await?;
     }
     Ok(())
 }

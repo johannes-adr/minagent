@@ -36,6 +36,11 @@ pub const VARS: &[Var] = &[
         doc: "Model name; empty uses the backend's default",
     },
     Var {
+        name: "AGENT_CONTEXT_WINDOW",
+        example: "",
+        doc: "Context window of the model in tokens, for the context display in the UIs; empty uses rig's model catalog. Set it for Ollama models to the daemon's context length (num_ctx)",
+    },
+    Var {
         name: "OPENAI_API_KEY",
         example: "",
         doc: "OpenAI API key (required for the openai backend)",
@@ -150,6 +155,19 @@ impl Config {
             .filter(|name| !name.is_empty())
             .collect();
         (!list.is_empty()).then_some(list)
+    }
+
+    /// The context window set in `AGENT_CONTEXT_WINDOW`; `None` leaves it to the model catalog.
+    pub fn context_window(&self) -> Result<Option<u64>, String> {
+        let Some(value) = self.get("AGENT_CONTEXT_WINDOW") else {
+            return Ok(None);
+        };
+        match value.trim().replace('_', "").parse::<u64>() {
+            Ok(tokens) if tokens > 0 => Ok(Some(tokens)),
+            _ => Err(format!(
+                "AGENT_CONTEXT_WINDOW must be a number of tokens, e.g. 32768, not {value:?}"
+            )),
+        }
     }
 
     /// The configuration of `execute_javascript`: allowed hosts and secrets
@@ -332,6 +350,22 @@ mod tests {
         assert!(err.contains("ANTHROPIC_API_KEY"), "{err}");
         let err = config(&[("OPENAI_API_KEY", "")]).model().err().unwrap();
         assert!(err.contains("OPENAI_API_KEY"), "{err}");
+    }
+
+    #[test]
+    fn context_window_override() {
+        assert_eq!(config(&[]).context_window(), Ok(None));
+        assert_eq!(
+            config(&[("AGENT_CONTEXT_WINDOW", " 32_768 ")]).context_window(),
+            Ok(Some(32_768))
+        );
+        for bad in ["0", "32k", "-1"] {
+            let err = config(&[("AGENT_CONTEXT_WINDOW", bad)])
+                .context_window()
+                .err()
+                .unwrap();
+            assert!(err.contains("AGENT_CONTEXT_WINDOW"), "{err}");
+        }
     }
 
     #[test]

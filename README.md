@@ -50,6 +50,12 @@ If the working directory contains an [`AGENTS.md`](https://agents.md), its conte
 - Without the script: `agent --web [addr]` (default `127.0.0.1:8080`). In a container use `agent --web 0.0.0.0:8080` with `-p 127.0.0.1:8080:8080`.
 - The page is a single file without external resources ([`src/frontend/web.html`](src/frontend/web.html)), so it works offline.
 
+## Context usage
+
+After each model call of the main agent the UIs show how full its context is, e.g. `42k / 200k tokens (21%)`: the terminal UI at the right of the status line (yellow from 80 %, red from 95 %), the browser UI in the header, and ACP clients get a `usage_update` session update (`used`, `size`). The tokens are the input and output of the latest call as the provider reports them, i.e. what the next request sends again. Subagents have their own context and are not counted.
+
+The context window comes from rig's built-in model catalog (where the provider caps input below the window, that lower limit). Models it doesn't know, which includes most Ollama models, show only the tokens, and ACP clients get no update; set `AGENT_CONTEXT_WINDOW=32768` in `.env` to give the size. For Ollama, use the context length the daemon runs the model with (`num_ctx`, `OLLAMA_CONTEXT_LENGTH`), not the model's maximum.
+
 ## Skills
 
 Skills ([Agent Skills](https://agentskills.io/specification) format) live in `skills/<name>/`. Only their names and descriptions go into the system prompt; the `use_skill` tool loads a skill's `SKILL.md` when a task needs it, and with `file` (e.g. `references/search.md`) a further document the instructions name, so long reference material is only read when needed.

@@ -5,7 +5,7 @@
 //! Adding a tool: write it in `src/tools/`, implement [`ToolPolicy`] for it and add it
 //! in [`tools`].
 
-use crate::frontend::{Event, Frontend, ToolCall};
+use crate::frontend::{ContextUsage, Event, Frontend, ToolCall};
 use crate::tools::agent::Subagent;
 use crate::tools::execute::Execute;
 #[cfg(feature = "javascript")]
@@ -348,10 +348,17 @@ impl AgentHook for Approve {
     }
 }
 
-/// Drives `stream` to its final response; answer text goes to `frontend` if given.
+/// Where the main agent's run reports its answer text and how full its context is.
+pub struct Report<'a> {
+    pub frontend: &'a dyn Frontend,
+    /// The model's context window, if known.
+    pub context_window: Option<u64>,
+}
+
+/// Drives `stream` to its final response, reporting to `report` if given.
 pub async fn run_stream(
     stream: &mut StreamingResult,
-    frontend: Option<&dyn Frontend>,
+    report: Option<Report<'_>>,
 ) -> Result<PromptResponse, String> {
     while let Some(item) = stream.next().await {
         match item.map_err(|e| e.to_string())? {
@@ -359,8 +366,20 @@ pub async fn run_stream(
                 text,
                 ..
             })) => {
-                if let Some(frontend) = frontend {
-                    frontend.emit(Event::Text(text));
+                if let Some(report) = &report {
+                    report.frontend.emit(Event::Text(text));
+                }
+            }
+            MultiTurnStreamItem::CompletionCall(call) => {
+                // The input and output of the latest call, not the sum over all calls: that
+                // is what the next request sends again.
+                if let Some(report) = &report
+                    && let Some(tokens) = call.usage.context_tokens()
+                {
+                    report.frontend.emit(Event::Context(ContextUsage {
+                        tokens,
+                        window: report.context_window,
+                    }));
                 }
             }
             MultiTurnStreamItem::FinalResponse(response) => return Ok(response),
@@ -370,20 +389,37 @@ pub async fn run_stream(
     Err("the stream ended without a final response".into())
 }
 
+/// The most tokens one request to `model` may send, from rig's model catalog
+/// (its input limit where that is below its context window).
+fn catalog_context_window(model: &DynModel<Completion>) -> Option<u64> {
+    model
+        .spec()
+        .and_then(|spec| spec.input_limit())
+        .map(u64::from)
+}
+
 /// A conversation with the main agent.
 pub struct Session {
     agent: Agent,
     history: Vec<Message>,
     frontend: Arc<dyn Frontend>,
+    context_window: Option<u64>,
 }
 
 impl Session {
     pub fn new(model: DynModel<Completion>, preamble: &str, frontend: Arc<dyn Frontend>) -> Self {
         Self {
+            context_window: catalog_context_window(&model),
             agent: main_agent(model, preamble, frontend.clone()),
             history: Vec::new(),
             frontend,
         }
+    }
+
+    /// Uses `tokens` as the model's context window instead of the catalog's, if given.
+    pub fn with_context_window(mut self, tokens: Option<u64>) -> Self {
+        self.context_window = tokens.or(self.context_window);
+        self
     }
 
     /// Runs one prompt to the end; on success it becomes part of the history.
@@ -395,7 +431,11 @@ impl Session {
             .max_invalid_tool_call_retries(INVALID_TOOL_CALL_RETRIES)
             .history(self.history.iter().cloned())
             .stream();
-        let response = run_stream(&mut stream, Some(&*self.frontend)).await?;
+        let report = Report {
+            frontend: &*self.frontend,
+            context_window: self.context_window,
+        };
+        let response = run_stream(&mut stream, Some(report)).await?;
         drop(stream);
         self.history.extend(response.messages);
         Ok(())
@@ -508,12 +548,15 @@ mod tests {
             let events = frontend.events.lock().unwrap();
             let names: Vec<_> = events
                 .iter()
-                .map(|e| match e {
-                    Event::Note(n) => n.lines().next().unwrap().to_string(),
-                    Event::ToolStarted(c) => format!("started {}", c.id),
-                    Event::ToolDenied(c) => format!("denied {}", c.id),
-                    Event::ToolFinished { id, failed, .. } => format!("finished {id} {failed}"),
-                    Event::Text(t) => t.clone(),
+                .filter_map(|e| match e {
+                    Event::Note(n) => Some(n.lines().next().unwrap().to_string()),
+                    Event::ToolStarted(c) => Some(format!("started {}", c.id)),
+                    Event::ToolDenied(c) => Some(format!("denied {}", c.id)),
+                    Event::ToolFinished { id, failed, .. } => {
+                        Some(format!("finished {id} {failed}"))
+                    }
+                    Event::Text(t) => Some(t.clone()),
+                    Event::Context(_) => None,
                 })
                 .collect();
             let ask = "ask execute: echo hi".to_string();
@@ -530,6 +573,82 @@ mod tests {
             }
         }
     }
+    /// After each model call the frontend learns how full the context is: that call's
+    /// input and output, not a sum over the calls.
+    #[tokio::test]
+    async fn context_usage_is_reported_after_each_model_call() {
+        use rig_core::completion::Usage;
+        let usage = |input, output| {
+            MockStreamEvent::final_response(Usage::new().input_tokens(input).output_tokens(output))
+        };
+        let args = serde_json::json!({"command": "echo hi"});
+        let model = MockCompletionModel::from_stream_turns([
+            vec![
+                MockStreamEvent::tool_call("t1", "execute", args),
+                usage(1_000, 50),
+            ],
+            vec![MockStreamEvent::text("done"), usage(1_100, 200)],
+        ]);
+        let frontend = Arc::new(Recorder {
+            events: Mutex::new(Vec::new()),
+            approve: false,
+        });
+        let mut session =
+            Session::new(model.into(), "", frontend.clone()).with_context_window(Some(4_000));
+        session.prompt("hi".into()).await.unwrap();
+        let reported: Vec<_> = frontend
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                Event::Context(usage) => Some(*usage),
+                _ => None,
+            })
+            .collect();
+        let at = |tokens| ContextUsage {
+            tokens,
+            window: Some(4_000),
+        };
+        assert_eq!(reported, [at(1_050), at(1_300)]);
+    }
+
+    /// The window comes from rig's model catalog; models it lists without one (most
+    /// Ollama models) have none until `AGENT_CONTEXT_WINDOW` sets it.
+    #[test]
+    fn context_window_comes_from_the_model_catalog() {
+        use rig_core::providers::anthropic::{self, AnthropicConfig};
+        use rig_core::providers::ollama::{self, OllamaConfig};
+        use rig_core::providers::openai::{self, OpenAIConfig};
+        let claude = AnthropicConfig::new("key")
+            .client()
+            .completion(anthropic::CLAUDE_SONNET_5_5)
+            .into();
+        assert_eq!(catalog_context_window(&claude), Some(1_000_000));
+        // GPT-5.5 reads less than its window.
+        let gpt = OpenAIConfig::new("key")
+            .client()
+            .completion(openai::GPT_5_5)
+            .into();
+        assert_eq!(catalog_context_window(&gpt), Some(922_000));
+        let qwen = OllamaConfig::new()
+            .client()
+            .completion(ollama::QWEN3)
+            .into();
+        assert_eq!(catalog_context_window(&qwen), None);
+        let unknown = OpenAIConfig::new("key")
+            .client()
+            .completion("my-finetune")
+            .into();
+        assert_eq!(catalog_context_window(&unknown), None);
+        let session = Session::new(qwen, "", Arc::new(Silent));
+        assert_eq!(session.context_window, None);
+        let session = session.with_context_window(Some(32_768));
+        assert_eq!(session.context_window, Some(32_768));
+        let session = Session::new(claude, "", Arc::new(Silent)).with_context_window(None);
+        assert_eq!(session.context_window, Some(1_000_000));
+    }
+
     /// Image data must not be dumped into the frontends.
     #[test]
     fn image_output_is_shown_as_a_placeholder() {

@@ -3,7 +3,7 @@
 //! The harness talks to it through the [`Tui`] frontend; the UI sends prompts back
 //! over a channel.
 
-use crate::frontend::{Event as AgentEvent, Frontend, ToolCall};
+use crate::frontend::{ContextUsage, Event as AgentEvent, Frontend, ToolCall};
 use crate::harness::Session;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
@@ -47,6 +47,8 @@ pub enum UiEvent {
     ToolOutput(String),
     Error(String),
     Status(Status),
+    /// How full the context is, shown at the right of the status line.
+    Context(ContextUsage),
     /// Ask the user; `true` is sent back on `y`, `false` on any other key.
     Approval {
         prompt: String,
@@ -96,6 +98,7 @@ impl Frontend for Tui {
                 }
                 emit(UiEvent::Status(Status::Thinking));
             }
+            AgentEvent::Context(usage) => emit(UiEvent::Context(usage)),
         }
     }
 
@@ -137,6 +140,8 @@ struct App {
     entries: Vec<Entry>,
     input: TextArea<'static>,
     status: Status,
+    /// How full the context was after the latest model call.
+    context: Option<ContextUsage>,
     /// Pending approval requests; the first one is shown.
     approvals: VecDeque<(String, oneshot::Sender<bool>)>,
     /// Chat lines hidden below the viewport (0 follows the newest output).
@@ -153,6 +158,7 @@ impl App {
             entries: Vec::new(),
             input: new_input(),
             status: Status::Idle,
+            context: None,
             approvals: VecDeque::new(),
             scroll: 0,
             chat_height: 10,
@@ -261,6 +267,7 @@ impl App {
             UiEvent::ToolOutput(text) => self.entries.push(Entry::ToolOutput(text)),
             UiEvent::Error(text) => self.entries.push(Entry::Error(text)),
             UiEvent::Status(status) => self.status = status,
+            UiEvent::Context(usage) => self.context = Some(usage),
             UiEvent::Approval { prompt, reply } => self.approvals.push_back((prompt, reply)),
         }
     }
@@ -283,7 +290,15 @@ impl App {
         let start = end.saturating_sub(self.chat_height);
         frame.render_widget(Paragraph::new(lines[start..end].to_vec()), chat);
 
+        let context = self.context_line();
+        let [status, context_area] = Layout::horizontal([
+            Constraint::Min(0),
+            Constraint::Length(context.width() as u16),
+        ])
+        .spacing(2)
+        .areas(status);
         frame.render_widget(Paragraph::new(self.status_line()), status);
+        frame.render_widget(Paragraph::new(context), context_area);
         frame.render_widget(&self.input, input);
         if let Some((prompt, _)) = self.approvals.front() {
             render_approval(frame, prompt);
@@ -324,6 +339,19 @@ impl App {
             ));
         }
         Line::from(spans)
+    }
+
+    /// The context usage, yellow from 80 % of the window and red from 95 %.
+    fn context_line(&self) -> Line<'static> {
+        let Some(usage) = self.context else {
+            return Line::default();
+        };
+        let color = match usage.percent() {
+            Some(95..) => Color::Red,
+            Some(80..) => Color::Yellow,
+            _ => Color::DarkGray,
+        };
+        Line::styled(usage.to_string(), Style::new().fg(color))
     }
 }
 
@@ -658,6 +686,24 @@ mod tests {
         let text = screen(&mut app, 60, 12);
         assert!(!text.contains("line 49"), "{text}");
         assert!(text.contains("scrolled up"), "{text}");
+    }
+
+    #[test]
+    fn status_line_shows_the_context_usage() {
+        let mut app = App::new();
+        assert!(!screen(&mut app, 120, 8).contains("tokens"));
+        let usage = |tokens| ContextUsage {
+            tokens,
+            window: Some(200_000),
+        };
+        app.handle_ui(UiEvent::Context(usage(42_000)));
+        let text = screen(&mut app, 120, 8);
+        let status = text.lines().nth(4).unwrap();
+        assert!(status.ends_with("42k / 200k tokens (21%)"), "{text}");
+        assert!(status.starts_with("Enter send"), "{text}");
+        assert_eq!(app.context_line().style.fg, Some(Color::DarkGray));
+        app.handle_ui(UiEvent::Context(usage(190_000)));
+        assert_eq!(app.context_line().style.fg, Some(Color::Red));
     }
 
     #[test]

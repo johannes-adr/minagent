@@ -29,8 +29,16 @@ header {
   display: flex; align-items: center; gap: 10px; padding: 12px 20px;
   border-bottom: 1px solid var(--border);
 }
-header h1 { margin: 0; font-size: 15px; font-weight: 600; }
-#state { margin-left: auto; display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+header h1 { margin: 0 auto 0 0; font-size: 15px; font-weight: 600; }
+#context { display: flex; align-items: center; gap: 8px; margin-right: 8px; color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+#context[hidden] { display: none; }
+.meter { width: 64px; height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+.meter > span { display: block; height: 100%; width: 0; background: var(--muted); transition: width .3s; }
+#context.nowindow .meter { display: none; }
+#context.warn { color: var(--warn); } #context.warn .meter > span { background: var(--warn); }
+#context.full { color: var(--bad); } #context.full .meter > span { background: var(--bad); }
+@media (max-width: 480px) { .meter { display: none; } }
+#state { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
 body.busy .dot { background: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
 body.offline .dot { background: var(--bad); }
@@ -100,6 +108,7 @@ body.busy #send { display: none; } body.busy #stop { display: block; }
 <body>
 <header>
   <h1>agent</h1>
+  <div id="context" hidden><span class="meter"><span></span></span><span id="context-text"></span></div>
   <div id="state"><span class="dot"></span><span id="state-text">Connecting…</span></div>
 </header>
 <div id="scroll"><div id="chat"><div id="empty"><b>How can I help?</b>Ask something, or give the agent a task.</div></div></div>
@@ -272,8 +281,22 @@ function setBusy(busy) {
   $("state-text").textContent = busy ? "Working…" : "Ready";
 }
 
+// How full the context is after the latest model call; percent is null without a known window.
+function setContext(event) {
+  const el = $("context"), percent = event.percent;
+  el.hidden = false;
+  $("context-text").textContent = event.text;
+  el.title = event.window
+    ? `${event.tokens.toLocaleString()} of ${event.window.toLocaleString()} tokens of the context window in use`
+    : `${event.tokens.toLocaleString()} tokens in the context (window size unknown: set AGENT_CONTEXT_WINDOW)`;
+  el.classList.toggle("nowindow", percent == null);
+  el.classList.toggle("warn", percent >= 80 && percent < 95);
+  el.classList.toggle("full", percent >= 95);
+  el.querySelector(".meter > span").style.width = Math.min(percent ?? 0, 100) + "%";
+}
+
 function handle(event) {
-  if (event.type !== "text") assistant = null;
+  if (event.type !== "text" && event.type !== "context") assistant = null;
   switch (event.type) {
     case "user": add("user", event.text); break;
     case "text":
@@ -286,6 +309,7 @@ function handle(event) {
     case "error": add("error", event.text); break;
     case "tool": upsertTool(event); break;
     case "status": setBusy(event.busy); break;
+    case "context": setContext(event); break;
   }
 }
 
@@ -295,7 +319,7 @@ function connect() {
   source.onopen = () => {
     document.body.classList.remove("offline");
     chat.replaceChildren(); tools = new Map(); assistant = null; pinned = true;
-    setBusy(false);
+    setBusy(false); $("context").hidden = true;
   };
   source.onmessage = (message) => handle(JSON.parse(message.data));
   source.onerror = () => {

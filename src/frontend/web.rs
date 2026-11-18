@@ -9,7 +9,7 @@
 //! token printed at startup (header `x-token`, or `?token=` for the event stream). Only the
 //! static page is served without it.
 
-use crate::frontend::{Event, Frontend, ToolCall};
+use crate::frontend::{ContextUsage, Event, Frontend, ToolCall};
 use crate::harness::Session;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -41,6 +41,8 @@ struct Inner {
     log: Vec<Value>,
     /// Tool calls waiting for the user, by call id.
     approvals: HashMap<String, oneshot::Sender<bool>>,
+    /// The latest context usage; only this one is replayed, after the log.
+    context: Option<Value>,
 }
 
 /// The web frontend's state, shared by the harness side ([`Frontend`]) and the HTTP handlers.
@@ -85,10 +87,26 @@ impl Web {
         let _ = self.live.send(event);
     }
 
+    /// Sends the context usage to the connected browsers and keeps it for later ones.
+    fn set_context(&self, usage: ContextUsage) {
+        let event = json!({
+            "type": "context",
+            "tokens": usage.tokens,
+            "window": usage.window,
+            "percent": usage.percent(),
+            "text": usage.to_string(),
+        });
+        let mut inner = self.inner.lock().unwrap();
+        inner.context = Some(event.clone());
+        let _ = self.live.send(event);
+    }
+
     /// The events so far and a receiver for all later ones.
     fn subscribe(&self) -> (Vec<Value>, broadcast::Receiver<Value>) {
         let inner = self.inner.lock().unwrap();
-        (inner.log.clone(), self.live.subscribe())
+        let mut events = inner.log.clone();
+        events.extend(inner.context.clone());
+        (events, self.live.subscribe())
     }
 
     /// Answers a pending approval; `false` if there is none with this id.
@@ -178,6 +196,7 @@ impl Frontend for Web {
                 "status": if failed { "failed" } else { "done" },
                 "output": clip(output),
             })),
+            Event::Context(usage) => self.set_context(usage),
         }
     }
 
@@ -395,6 +414,47 @@ mod tests {
         // Live browsers get the fragments as they come.
         assert_eq!(live.try_recv().unwrap()["text"], "hel");
         assert_eq!(live.try_recv().unwrap()["text"], "lo");
+    }
+
+    /// Every update goes to the open pages; a page that connects later gets only the latest.
+    #[test]
+    fn only_the_latest_context_usage_is_replayed() {
+        let (web, _inbox) = Web::new().unwrap();
+        let (_, mut live) = web.subscribe();
+        let usage = |tokens| ContextUsage {
+            tokens,
+            window: Some(200_000),
+        };
+        web.emit(Event::Context(usage(1_000)));
+        web.emit(Event::Text("hi".into()));
+        web.emit(Event::Context(usage(42_000)));
+        assert_eq!(live.try_recv().unwrap()["tokens"], 1_000);
+        assert_eq!(live.try_recv().unwrap()["text"], "hi");
+        let latest = live.try_recv().unwrap();
+        assert_eq!(
+            latest,
+            json!({
+                "type": "context",
+                "tokens": 42_000,
+                "window": 200_000,
+                "percent": 21,
+                "text": "42k / 200k tokens (21%)",
+            })
+        );
+        let (replayed, _) = web.subscribe();
+        assert_eq!(replayed, [json!({"type": "text", "text": "hi"}), latest]);
+        // Without a window the page shows only the tokens.
+        web.emit(Event::Context(ContextUsage {
+            tokens: 5,
+            window: None,
+        }));
+        let (replayed, _) = web.subscribe();
+        let last = replayed.last().unwrap();
+        assert_eq!(
+            (&last["window"], &last["percent"]),
+            (&Value::Null, &Value::Null)
+        );
+        assert_eq!(last["text"], "5 tokens");
     }
 
     #[test]
