@@ -44,7 +44,7 @@ If the working directory contains an [`AGENTS.md`](https://agents.md), its conte
 
 ## Browser UI
 
-`agent.sh --web` prints a URL like `http://localhost:8080/#token=...`; open it. The page streams the answer as markdown, shows each tool call as a card with all of its arguments (e.g. the full script of an `execute_javascript` call) and its output (open while pending, running or failed, folded once done) and asks for approval with Allow/Deny buttons where the terminal UI would ask `y/N`. Stop cancels the running prompt. Reloading the page or opening a second tab shows the same session.
+`agent.sh --web` prints a URL like `http://localhost:8080/#token=...`; open it. The page streams the answer as markdown, shows each tool call as a card with all of its arguments (e.g. the full script of an `execute_javascript` call) and its output (open while pending, running or failed, folded once done) and asks for approval with Allow/Deny buttons where the terminal UI would ask `y/N`. Stop cancels the running prompt. Reloading the page or opening a second tab shows the same session. With the Ollama backend a "Thinking" slider appears in the header if the model lists thinking levels in `/api/show` (e.g. `qwen3.8`: off, low, medium, xhigh; on/off models get a two-step switch); until you move it the model's default applies, and the choice is kept until the server restarts.
 - Sessions are saved after every prompt as `sessions/<id>.json` (history plus transcript; git-ignored). The ☰ Sessions button lists them to open, delete or start a new one (not while the agent is working). The agent starts with a new session.
 
 - The agent can run commands, so the API requires the random token printed at startup (the page keeps it in `sessionStorage` and removes it from the address bar). The script publishes the port on `127.0.0.1` only; `AGENT_WEB_PORT=9000` changes it.
@@ -64,7 +64,7 @@ Skills ([Agent Skills](https://agentskills.io/specification) format) live in `sk
 Built-in skills are embedded in the binary from [`builtin_skills/`](builtin_skills) and reinstalled into `skills/` on every start (edit them in `builtin_skills/`):
 
 - `creating-skills`: how to write a new skill.
-- `paperless`: works with a [Paperless-ngx](https://docs.paperless-ngx.com) archive (search and answer from documents, inbox triage, custom fields, bulk edits, upload/download, reports, cleanup) through a JavaScript client for `execute_javascript`. Setup in `.env`: `AGENT_SECRET_PAPERLESS=<host> Token <api token>` and, to skip approvals, the host in `AGENT_JS_ALLOWED_HOSTS`; the agent asks for the URL once and saves it in `work/paperless.json`. Written for Paperless-ngx 3.x (API version 10).
+- `paperless`: works with a [Paperless-ngx](https://docs.paperless-ngx.com) archive (search and answer from documents, inbox triage, custom fields, bulk edits, upload/download, reports, cleanup) through a JavaScript client for `execute_javascript`. Setup in `.env`: `AGENT_SECRET_PAPERLESS=<host> Token <api token>` (token from "My Profile" in the Paperless web UI; host without scheme and port) and, to skip approvals, the host in `AGENT_JS_ALLOWED_HOSTS`. The agent asks for the URL once and saves it in `work/paperless.json` after a successful connection; it does not change it on its own. Written for Paperless-ngx 3.x (API version 10).
 
 ## `view_image` tool
 
@@ -83,7 +83,7 @@ cargo build --no-default-features
 The script is an ES module (top-level `await` works) and gets only this API: no `require`/`import`, no npm, no timers, no process or environment access.
 
 - `console.log/info/warn/error`: captured and returned, together with the error if the script throws.
-- `fetch(url, {method, headers, body, secret, form, saveTo})`: resolves to `{status, ok, headers, text(), json()}`. Only `https://` (and `http://` for `localhost`, `127.0.0.1`, `host.docker.internal` and `host.containers.internal`) URLs to hosts in the call's `hosts` argument work; redirects are not followed. For binary files: `form: {title: "x", document: {file: "in/scan.pdf"}}` sends multipart/form-data with the bytes of files in `work/`, and `saveTo: "out/doc.pdf"` writes a successful response body to a file in `work/` instead of returning it (up to 100 MB each).
+- `fetch(url, {method, headers, body, secret, form, saveTo})`: resolves to `{status, ok, headers, text(), json()}`. Only `https://` and `http://` URLs to hosts in the call's `hosts` argument work (with `http://`, requests and secrets are unencrypted); redirects are not followed. For binary files: `form: {title: "x", document: {file: "in/scan.pdf"}}` sends multipart/form-data with the bytes of files in `work/`, and `saveTo: "out/doc.pdf"` writes a successful response body to a file in `work/` instead of returning it (up to 100 MB each).
 - `fs.readText(path)`, `fs.writeText(path, text)`, `fs.list(path)`, `fs.exists(path)`: paths relative to the `work/` directory (a subdirectory of the harness's directory, created on first use); anything outside it (absolute paths, `..`, symlinks) and `.env*` files are rejected.
 
 A script cannot start a process, but it can save another script with `fs.writeText` and run it in-process with arguments using `runScript(path, args)`:

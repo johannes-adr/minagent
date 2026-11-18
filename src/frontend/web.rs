@@ -12,6 +12,7 @@
 use crate::frontend::{ContextUsage, Event, Frontend, ToolCall};
 use crate::harness::Session;
 use crate::sessions::{self, Store};
+use crate::thinking::{self, Thinking};
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
@@ -49,6 +50,8 @@ struct Inner {
     context: Option<Value>,
     /// The stored session being shown; assigned when its first prompt runs.
     session_id: Option<String>,
+    /// The thinking level the user picked; `None` leaves it to the model's default.
+    think: Option<String>,
 }
 
 /// What the worker does, one at a time.
@@ -68,12 +71,14 @@ pub struct Web {
     commands: mpsc::UnboundedSender<Command>,
     store: Store,
     cancel: Notify,
+    /// The thinking levels the model offers, if it offers any.
+    thinking: Option<Thinking>,
 }
 
 impl Web {
     /// Returns the frontend and the receiving end of the prompts the browser submits,
     /// which [`run`] feeds to the session.
-    pub fn new(store: Store) -> io::Result<(Arc<Self>, Inbox)> {
+    pub fn new(store: Store, thinking: Option<Thinking>) -> io::Result<(Arc<Self>, Inbox)> {
         let (commands, inbox) = mpsc::unbounded_channel();
         let web = Self {
             token: random_token()?,
@@ -83,6 +88,7 @@ impl Web {
             commands,
             store,
             cancel: Notify::new(),
+            thinking,
         };
         Ok((Arc::new(web), inbox))
     }
@@ -117,10 +123,28 @@ impl Web {
         let _ = self.live.send(event);
     }
 
+    /// The thinking slider's state, if the model has levels.
+    fn thinking_event(&self, inner: &Inner) -> Option<Value> {
+        let thinking = self.thinking.as_ref()?;
+        Some(json!({
+            "type": "thinking",
+            "levels": thinking.levels,
+            "default": thinking.default,
+            "current": inner.think.as_deref().unwrap_or(&thinking.default),
+        }))
+    }
+
+    /// The `think` value for the next prompt; `None` while the user hasn't chosen.
+    fn think_param(&self) -> Option<Value> {
+        let level = self.inner.lock().unwrap().think.clone()?;
+        Some(thinking::param(&level))
+    }
+
     /// The events so far and a receiver for all later ones.
     fn subscribe(&self) -> (Vec<Value>, broadcast::Receiver<Value>) {
         let inner = self.inner.lock().unwrap();
         let mut events = vec![session_event(&inner.session_id)];
+        events.extend(self.thinking_event(&inner));
         events.extend(inner.log.clone());
         events.extend(inner.context.clone());
         (events, self.live.subscribe())
@@ -194,7 +218,8 @@ fn session_event(id: &Option<String>) -> Value {
 /// Calls that were still waiting or running when a session was saved never finished.
 fn settle(log: &mut [Value]) {
     for event in log {
-        if event["type"] == "tool" && matches!(event["status"].as_str(), Some("pending" | "running"))
+        if event["type"] == "tool"
+            && matches!(event["status"].as_str(), Some("pending" | "running"))
         {
             event["status"] = json!("cancelled");
         }
@@ -357,6 +382,24 @@ async fn approve(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> Status
     }
 }
 
+/// `{"level": "xhigh"}` picks the thinking level for the next prompts.
+async fn set_thinking(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> StatusCode {
+    let Some(thinking) = &web.thinking else {
+        return StatusCode::NOT_FOUND;
+    };
+    let level = body["level"].as_str().unwrap_or_default();
+    if !thinking.levels.iter().any(|l| l == level) {
+        return StatusCode::BAD_REQUEST;
+    }
+    let mut inner = web.inner.lock().unwrap();
+    inner.think = Some(level.to_owned());
+    // Sent under the lock like the other state events.
+    if let Some(event) = web.thinking_event(&inner) {
+        let _ = web.live.send(event);
+    }
+    StatusCode::NO_CONTENT
+}
+
 async fn list_sessions(State(web): State<Arc<Web>>) -> Json<Value> {
     let current = web.inner.lock().unwrap().session_id.clone();
     Json(json!({"current": current, "sessions": web.store.list()}))
@@ -405,6 +448,7 @@ fn router(web: Arc<Web>) -> Router {
         .route("/prompt", post(prompt))
         .route("/approve", post(approve))
         .route("/cancel", post(cancel))
+        .route("/thinking", post(set_thinking))
         .route("/sessions", get(list_sessions))
         .route("/session", post(open_session))
         .route("/session/delete", post(delete_session))
@@ -419,6 +463,7 @@ async fn worker(web: Arc<Web>, mut session: Session, mut inbox: Inbox) {
     while let Some(command) = inbox.recv().await {
         match command {
             Command::Prompt(input) => {
+                session.set_thinking(web.think_param());
                 tokio::select! {
                     result = session.prompt(input) => {
                         if let Err(error) = result {
@@ -474,12 +519,7 @@ fn switch(web: &Web, session: &mut Session, id: Option<String>) {
 
 /// Serves the page on `addr` until Ctrl-C. `session` must have been created with `web`
 /// as its frontend and `inbox` is the receiver from [`Web::new`].
-pub async fn run(
-    web: Arc<Web>,
-    inbox: Inbox,
-    session: Session,
-    addr: &str,
-) -> io::Result<()> {
+pub async fn run(web: Arc<Web>, inbox: Inbox, session: Session, addr: &str) -> io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     let port = listener.local_addr()?.port();
     println!("web UI: http://localhost:{port}/#token={}", web.token);
@@ -515,7 +555,7 @@ mod tests {
 
     /// A server whose model answers with `turns`.
     async fn start(turns: Vec<Vec<MockStreamEvent>>) -> (Arc<Web>, SocketAddr) {
-        let (web, inbox) = Web::new(temp_store()).unwrap();
+        let (web, inbox) = Web::new(temp_store(), None).unwrap();
         let model = MockCompletionModel::from_stream_turns(turns);
         let session = Session::new(model.into(), "", web.clone());
         tokio::spawn(worker(web.clone(), session, inbox));
@@ -559,7 +599,7 @@ mod tests {
 
     #[test]
     fn adjacent_text_is_merged_in_the_log_only() {
-        let (web, _inbox) = Web::new(temp_store()).unwrap();
+        let (web, _inbox) = Web::new(temp_store(), None).unwrap();
         let (_, mut live) = web.subscribe();
         web.emit(Event::Text("hel".into()));
         web.emit(Event::Text("lo".into()));
@@ -575,7 +615,7 @@ mod tests {
     /// Every update goes to the open pages; a page that connects later gets only the latest.
     #[test]
     fn only_the_latest_context_usage_is_replayed() {
-        let (web, _inbox) = Web::new(temp_store()).unwrap();
+        let (web, _inbox) = Web::new(temp_store(), None).unwrap();
         let (_, mut live) = web.subscribe();
         let usage = |tokens| ContextUsage {
             tokens,
@@ -674,6 +714,70 @@ mod tests {
         let empty = request(addr, "POST /prompt", Some(&web.token), r#"{"text":"  "}"#).await;
         assert!(empty.starts_with("HTTP/1.1 400"), "{empty}");
         assert!(log(&web).is_empty());
+    }
+
+    /// The slider only exists for models that list levels, and only those can be picked.
+    #[tokio::test]
+    async fn thinking_level_is_chosen_from_the_models_levels() {
+        let thinking = Thinking {
+            levels: vec!["off".into(), "low".into(), "xhigh".into()],
+            default: "low".into(),
+        };
+        let (web, _inbox) = Web::new(temp_store(), Some(thinking)).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(axum::serve(listener, router(web.clone())).into_future());
+
+        let (events, _) = web.subscribe();
+        assert_eq!(events[1]["type"], "thinking");
+        assert_eq!(events[1]["current"], "low");
+        assert_eq!(
+            web.think_param(),
+            None,
+            "nothing is sent until the user picks"
+        );
+
+        let unknown = request(
+            addr,
+            "POST /thinking",
+            Some(&web.token),
+            r#"{"level":"max"}"#,
+        )
+        .await;
+        assert!(unknown.starts_with("HTTP/1.1 400"), "{unknown}");
+        let ok = request(
+            addr,
+            "POST /thinking",
+            Some(&web.token),
+            r#"{"level":"xhigh"}"#,
+        )
+        .await;
+        assert!(ok.starts_with("HTTP/1.1 204"), "{ok}");
+        assert_eq!(web.think_param(), Some(json!("xhigh")));
+        let off = request(
+            addr,
+            "POST /thinking",
+            Some(&web.token),
+            r#"{"level":"off"}"#,
+        )
+        .await;
+        assert!(off.starts_with("HTTP/1.1 204"), "{off}");
+        assert_eq!(web.think_param(), Some(json!(false)));
+        assert_eq!(web.subscribe().0[1]["current"], "off");
+    }
+
+    #[tokio::test]
+    async fn no_levels_no_thinking_endpoint() {
+        let (web, addr) = start(vec![]).await;
+        assert!(web.subscribe().0.iter().all(|e| e["type"] != "thinking"));
+        let denied = request(
+            addr,
+            "POST /thinking",
+            Some(&web.token),
+            r#"{"level":"low"}"#,
+        )
+        .await;
+        assert!(denied.starts_with("HTTP/1.1 404"), "{denied}");
     }
 
     /// A browser that connects late gets the transcript first, then live events.

@@ -2,6 +2,7 @@ mod config;
 mod frontend;
 mod harness;
 mod sessions;
+mod thinking;
 mod tools;
 
 use frontend::{acp, tui, web};
@@ -104,7 +105,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if acp {
         acp::serve(new_session).await?;
     } else if let Some(addr) = web_addr {
-        let (frontend, inbox) = web::Web::new(sessions::Store::new(sessions::DIR))?;
+        // The slider offers the levels Ollama lists for the model; other backends tell none.
+        let thinking = match config.ollama() {
+            Some((url, key, model)) => {
+                thinking::Thinking::discover(&url, key.as_deref(), &model).await
+            }
+            None => None,
+        };
+        let (frontend, inbox) = web::Web::new(sessions::Store::new(sessions::DIR), thinking)?;
         let session = new_session(frontend.clone());
         web::run(frontend, inbox, session, addr).await?;
     } else {

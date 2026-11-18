@@ -404,6 +404,8 @@ pub struct Session {
     history: Vec<Message>,
     frontend: Arc<dyn Frontend>,
     context_window: Option<u64>,
+    /// The `think` value sent with every request, if one was chosen.
+    think: Option<Value>,
 }
 
 impl Session {
@@ -413,7 +415,14 @@ impl Session {
             agent: main_agent(model, preamble, frontend.clone()),
             history: Vec::new(),
             frontend,
+            think: None,
         }
+    }
+
+    /// Sends `think` (Ollama's thinking level) with the following prompts; `None` leaves
+    /// it to the model's default.
+    pub fn set_thinking(&mut self, think: Option<Value>) {
+        self.think = think;
     }
 
     /// Uses `tokens` as the model's context window instead of the catalog's, if given.
@@ -435,9 +444,13 @@ impl Session {
     /// Runs one prompt to the end; on success it becomes part of the history.
     /// Dropping the future cancels the prompt and leaves the history unchanged.
     pub async fn prompt(&mut self, input: String) -> Result<(), String> {
-        let mut stream = self
-            .agent
-            .prompt(input)
+        let mut request = self.agent.prompt(input);
+        if let Some(think) = &self.think {
+            let mut params = serde_json::Map::new();
+            params.insert("think".into(), think.clone());
+            request = request.merge_additional_params(params);
+        }
+        let mut stream = request
             .max_invalid_tool_call_retries(INVALID_TOOL_CALL_RETRIES)
             .history(self.history.iter().cloned())
             .stream();

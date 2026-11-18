@@ -170,17 +170,21 @@ impl Config {
         }
     }
 
-    /// The configuration of `execute_javascript`: allowed hosts and secrets
-    /// (`AGENT_SECRET_<NAME>=<host> <header value>`).
+    /// A comma-separated list of hosts, trimmed and lowercase.
     #[cfg(feature = "javascript")]
-    pub fn javascript(&self) -> Result<Settings, String> {
-        let allowed_hosts = self
-            .get("AGENT_JS_ALLOWED_HOSTS")
+    fn hosts(&self, name: &str) -> Vec<String> {
+        self.get(name)
             .unwrap_or_default()
             .split(',')
             .map(|host| host.trim().to_ascii_lowercase())
             .filter(|host| !host.is_empty())
-            .collect();
+            .collect()
+    }
+
+    /// The configuration of `execute_javascript`: allowed hosts and secrets
+    /// (`AGENT_SECRET_<NAME>=<host> <header value>`).
+    #[cfg(feature = "javascript")]
+    pub fn javascript(&self) -> Result<Settings, String> {
         let mut secrets = HashMap::new();
         for (var, value) in &self.values {
             let Some(name) = var.strip_prefix(SECRET_PREFIX).filter(|n| !n.is_empty()) else {
@@ -200,7 +204,7 @@ impl Config {
             secrets.insert(name.to_owned(), secret);
         }
         Ok(Settings {
-            allowed_hosts,
+            allowed_hosts: self.hosts("AGENT_JS_ALLOWED_HOSTS"),
             secrets,
         })
     }
@@ -214,6 +218,20 @@ impl Config {
                 "unknown LLM_BACKEND {other:?}; use ollama, anthropic or openai"
             )),
         }
+    }
+
+    /// Address, token and model name of the Ollama daemon, if that is the backend.
+    pub fn ollama(&self) -> Option<(String, Option<String>, String)> {
+        if self.backend() != Ok(Backend::Ollama) {
+            return None;
+        }
+        Some((
+            self.get("OLLAMA_API_BASE_URL")
+                .unwrap_or("http://localhost:11434")
+                .to_owned(),
+            self.get("OLLAMA_API_KEY").map(str::to_owned),
+            self.get("LLM_MODEL").unwrap_or(ollama::QWEN3).to_owned(),
+        ))
     }
 
     /// The completion model for the configured backend.
