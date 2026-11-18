@@ -13,6 +13,7 @@ pub fn workdir() -> std::path::PathBuf {
 }
 
 pub mod agent;
+pub mod ask_user;
 pub mod execute;
 #[cfg(feature = "javascript")]
 pub mod execute_javascript;

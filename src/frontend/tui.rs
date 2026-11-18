@@ -3,7 +3,7 @@
 //! The harness talks to it through the [`Tui`] frontend; the UI sends prompts back
 //! over a channel.
 
-use crate::frontend::{ContextUsage, Event as AgentEvent, Frontend, ToolCall};
+use crate::frontend::{ContextUsage, Event as AgentEvent, Frontend, Question, ToolCall};
 use crate::harness::Session;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
@@ -49,6 +49,11 @@ pub enum UiEvent {
     Status(Status),
     /// How full the context is, shown at the right of the status line.
     Context(ContextUsage),
+    /// The agent asks a question; the next message the user sends is the answer.
+    Question {
+        text: String,
+        reply: oneshot::Sender<String>,
+    },
     /// Ask the user; `true` is sent back on `y`, `false` on any other key.
     Approval {
         prompt: String,
@@ -71,6 +76,13 @@ async fn request_approval(prompt: String) -> bool {
     let (reply, answer) = oneshot::channel();
     emit(UiEvent::Approval { prompt, reply });
     answer.await == Ok(true)
+}
+
+/// Shows `question` in the chat; the user's next message answers it. A closed UI is no answer.
+async fn request_answer(text: String) -> Option<String> {
+    let (reply, answer) = oneshot::channel();
+    emit(UiEvent::Question { text, reply });
+    answer.await.ok()
 }
 
 /// The terminal UI as the harness's frontend.
@@ -113,6 +125,27 @@ impl Frontend for Tui {
     fn approve(&self, call: &ToolCall) -> BoxFuture<'static, bool> {
         Box::pin(request_approval(format!("{}\napprove? [y/N] ", call.title)))
     }
+
+    fn ask(&self, question: &Question) -> BoxFuture<'static, Option<String>> {
+        let mut text = format!("? {}", question.question);
+        for (i, option) in question.options.iter().enumerate() {
+            text.push_str(&format!("\n  {}) {option}", i + 1));
+        }
+        if !question.options.is_empty() {
+            text.push_str("\n(type a number or your own answer)");
+        }
+        let options = question.options.clone();
+        Box::pin(async move {
+            let answer = request_answer(text).await?;
+            // A number picks the matching option.
+            let picked = answer
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| options.get(n.checked_sub(1)?));
+            Some(picked.cloned().unwrap_or(answer))
+        })
+    }
 }
 
 enum Entry {
@@ -150,6 +183,8 @@ struct App {
     status: Status,
     /// How full the context was after the latest model call.
     context: Option<ContextUsage>,
+    /// Questions of the agent; the next message answers the first one.
+    questions: VecDeque<oneshot::Sender<String>>,
     /// Pending approval requests; the first one is shown.
     approvals: VecDeque<(String, oneshot::Sender<bool>)>,
     /// Chat lines hidden below the viewport (0 follows the newest output).
@@ -167,6 +202,7 @@ impl App {
             input: new_input(),
             status: Status::Idle,
             context: None,
+            questions: VecDeque::new(),
             approvals: VecDeque::new(),
             scroll: 0,
             chat_height: 10,
@@ -250,7 +286,19 @@ impl App {
 
     fn submit(&mut self) -> Action {
         let text = self.input.lines().join("\n").trim().to_owned();
-        if text.is_empty() || self.status != Status::Idle {
+        if text.is_empty() {
+            return Action::None;
+        }
+        // While the agent waits for an answer, the message is that answer.
+        if let Some(reply) = self.questions.pop_front() {
+            self.input = new_input();
+            self.entries.push(Entry::User(text.clone()));
+            self.status = Status::Thinking;
+            self.scroll = 0;
+            let _ = reply.send(text);
+            return Action::None;
+        }
+        if self.status != Status::Idle {
             return Action::None;
         }
         self.input = new_input();
@@ -276,6 +324,10 @@ impl App {
             UiEvent::Error(text) => self.entries.push(Entry::Error(text)),
             UiEvent::Status(status) => self.status = status,
             UiEvent::Context(usage) => self.context = Some(usage),
+            UiEvent::Question { text, reply } => {
+                self.entries.push(Entry::Assistant(text));
+                self.questions.push_back(reply);
+            }
             UiEvent::Approval { prompt, reply } => self.approvals.push_back((prompt, reply)),
         }
     }
@@ -657,6 +709,22 @@ mod tests {
         app.handle_ui(UiEvent::Text("again".into()));
         assert_eq!(app.entries.len(), 3);
         assert!(matches!(&app.entries[0], Entry::Assistant(t) if t == "hello"));
+    }
+
+    #[test]
+    fn the_next_message_answers_a_question() {
+        let mut app = App::new();
+        let (reply, mut answer) = oneshot::channel();
+        app.status = Status::Tool;
+        app.handle_ui(UiEvent::Question {
+            text: "? Which?".into(),
+            reply,
+        });
+        type_text(&mut app, "blue");
+        // The prompt is not busy-blocked: it becomes the answer, not a new prompt.
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+        assert_eq!(answer.try_recv(), Ok("blue".to_string()));
+        assert!(app.questions.is_empty());
     }
 
     #[test]

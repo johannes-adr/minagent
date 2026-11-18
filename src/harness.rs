@@ -7,6 +7,7 @@
 
 use crate::frontend::{ContextUsage, Event, Frontend, ToolCall};
 use crate::tools::agent::Subagent;
+use crate::tools::ask_user::AskUser;
 use crate::tools::execute::Execute;
 #[cfg(feature = "javascript")]
 use crate::tools::execute_javascript::ExecuteJavascript;
@@ -75,6 +76,7 @@ pub fn enable_only(names: Vec<String>) -> Result<(), String> {
         Execute::NAME,
         UseSkill::NAME,
         Subagent::NAME,
+        AskUser::NAME,
         #[cfg(feature = "javascript")]
         ExecuteJavascript::NAME,
         #[cfg(feature = "image")]
@@ -196,7 +198,7 @@ fn tools(model: &DynModel<Completion>, preamble: &str) -> Tools {
     tools
 }
 
-/// The main agent: all tools plus `agent` to start subagents.
+/// The main agent: all tools plus `agent` to start subagents and `ask_user`.
 pub fn main_agent(
     model: DynModel<Completion>,
     preamble: &str,
@@ -204,6 +206,7 @@ pub fn main_agent(
 ) -> Agent {
     tools(&model, preamble)
         .add(Subagent::new(model.clone(), preamble, frontend.clone()))
+        .add(AskUser::new(frontend.clone()))
         .build(frontend, MAX_TURNS)
 }
 

@@ -33,6 +33,16 @@ pub struct ToolCall {
     pub agent: Option<String>,
 }
 
+/// A question the agent asks the user (the `ask_user` tool).
+#[derive(Clone, Debug)]
+pub struct Question {
+    /// Unique within the session.
+    pub id: String,
+    pub question: String,
+    /// Suggested answers; the user may answer freely anyway. May be empty.
+    pub options: Vec<String>,
+}
+
 /// How full the main agent's context is after its latest model call.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ContextUsage {
@@ -121,6 +131,10 @@ pub trait Frontend: Send + Sync + 'static {
     fn emit(&self, event: Event);
     /// Asks the user whether `call` may run; anything but an explicit yes is `false`.
     fn approve(&self, call: &ToolCall) -> BoxFuture<'static, bool>;
+    /// Asks the user `question`; `None` if they cannot or do not answer (the default).
+    fn ask(&self, _question: &Question) -> BoxFuture<'static, Option<String>> {
+        Box::pin(async { None })
+    }
 }
 
 /// The frontend of one subagent: tags what the subagent reports with its id, so frontends
@@ -174,6 +188,10 @@ impl Frontend for Scoped {
 
     fn approve(&self, call: &ToolCall) -> BoxFuture<'static, bool> {
         self.inner.approve(&self.call(call))
+    }
+
+    fn ask(&self, question: &Question) -> BoxFuture<'static, Option<String>> {
+        self.inner.ask(question)
     }
 }
 

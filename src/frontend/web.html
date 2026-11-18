@@ -148,7 +148,13 @@ body.hassub:not(.sidehidden) #side { display: flex; }
 .body { padding: 0 12px 12px; display: flex; flex-direction: column; gap: 8px; }
 .body pre { max-height: 520px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 .body .label { color: var(--muted); font-size: 12px; margin-bottom: -4px; }
-.actions { display: flex; gap: 8px; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.question { border: 1px solid var(--accent); border-radius: 10px; background: var(--surface); padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; font-size: 14px; }
+.question[data-status=answered], .question[data-status=cancelled] { border-color: var(--border); }
+.question .q { font-weight: 600; white-space: pre-wrap; overflow-wrap: anywhere; }
+.question .answer { color: var(--muted); }
+.question form { display: flex; gap: 8px; }
+.question input { flex: 1; min-width: 0; padding: 5px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font: inherit; }
 
 button { font: inherit; cursor: pointer; }
 .btn { padding: 5px 14px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
@@ -488,6 +494,63 @@ function renderTool(tool) {
   if (!tool.touched) el.open = ["pending", "running", "failed"].includes(data.status);
 }
 
+// A question of the agent: suggested answers as buttons plus a free-text field.
+function upsertQuestion(event) {
+  const key = "q:" + event.id;
+  let tool = tools.get(key);
+  if (!tool) {
+    $("empty")?.remove();
+    const el = document.createElement("div");
+    el.className = "question";
+    mainPane.chat.append(el);
+    tool = {el, data: {}};
+    tools.set(key, tool);
+  }
+  Object.assign(tool.data, event);
+  const {el, data} = tool;
+  el.dataset.status = data.status;
+  el.replaceChildren();
+  const q = document.createElement("div");
+  q.className = "q"; q.textContent = data.question || "";
+  el.append(q);
+  if (data.status === "answered") {
+    const a = document.createElement("div");
+    a.className = "answer"; a.textContent = "→ " + data.answer;
+    el.append(a);
+  } else if (data.status === "cancelled") {
+    const a = document.createElement("div");
+    a.className = "answer"; a.textContent = "not answered";
+    el.append(a);
+  } else {
+    const send = (answer) => {
+      if (!answer.trim()) return;
+      el.querySelectorAll("button, input").forEach((x) => (x.disabled = true));
+      post("/answer", {id: data.id, answer});
+    };
+    if ((data.options || []).length) {
+      const actions = document.createElement("div");
+      actions.className = "actions";
+      for (const option of data.options) {
+        const b = document.createElement("button");
+        b.className = "btn"; b.textContent = option;
+        b.onclick = () => send(option);
+        actions.append(b);
+      }
+      el.append(actions);
+    }
+    const form = document.createElement("form");
+    const input = document.createElement("input");
+    input.placeholder = "Your answer…";
+    const b = document.createElement("button");
+    b.className = "btn primary"; b.textContent = "Send";
+    form.append(input, b);
+    form.onsubmit = (e) => { e.preventDefault(); send(input.value); };
+    el.append(form);
+    input.focus();
+  }
+  follow(mainPane);
+}
+
 function upsertTool(event) {
   let tool = tools.get(event.id);
   if (!tool) {
@@ -589,6 +652,7 @@ function handle(event) {
     case "error": add("error", event.text); break;
     case "subagent": setSubagent(event); break;
     case "tool": upsertTool(event); break;
+    case "question": upsertQuestion(event); break;
     case "status": setBusy(event.busy); if (!event.busy) settleSubagents(); break;
     case "context": setContext(event); break;
     case "thinking": setThinking(event); break;

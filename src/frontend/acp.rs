@@ -5,9 +5,11 @@
 //! embedded resources), `session/cancel`, streamed answer text, tool call reports and
 //! `session/request_permission` for calls that need approval, and `usage_update` with the
 //! tokens in context after each model call (only when the context window is known, as the
-//! update requires its size). A cancelled prompt is dropped from the session's history.
+//! update requires its size). `ask_user` questions are put to the client as a permission
+//! request with the suggested answers as options (ACP has no free-text question, so a
+//! question without options goes unanswered). A cancelled prompt is dropped from the session's history.
 
-use crate::frontend::{Event, Frontend, ToolCall};
+use crate::frontend::{Event, Frontend, Question, ToolCall};
 use crate::harness::Session;
 use futures::future::BoxFuture;
 use rig_core::serde_json::{self, Value, json};
@@ -197,6 +199,38 @@ impl Frontend for AcpFrontend {
             };
             let outcome = &result["outcome"];
             outcome["outcome"] == "selected" && outcome["optionId"] == "allow"
+        })
+    }
+
+    fn ask(&self, question: &Question) -> BoxFuture<'static, Option<String>> {
+        if question.options.is_empty() {
+            return Box::pin(async { None });
+        }
+        let options: Vec<Value> = question
+            .options
+            .iter()
+            .enumerate()
+            .map(|(i, name)| json!({"optionId": i.to_string(), "name": name, "kind": "allow_once"}))
+            .collect();
+        let params = json!({
+            "sessionId": self.session_id,
+            "toolCall": {
+                "toolCallId": question.id,
+                "title": question.question,
+                "kind": "other",
+            },
+            "options": options,
+        });
+        let answers = question.options.clone();
+        let conn = self.conn.clone();
+        Box::pin(async move {
+            let result = conn.request("session/request_permission", params).await?;
+            let outcome = &result["outcome"];
+            if outcome["outcome"] != "selected" {
+                return None;
+            }
+            let index: usize = outcome["optionId"].as_str()?.parse().ok()?;
+            answers.get(index).cloned()
         })
     }
 }

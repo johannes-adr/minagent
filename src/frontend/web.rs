@@ -2,14 +2,14 @@
 //!
 //! The page ([`web.html`](web.html)) is one self-contained file. It gets the session as a
 //! stream of JSON events over server-sent events (`GET /events`) and talks back with
-//! `POST /prompt`, `POST /approve` and `POST /cancel`. Like the terminal UI there is one
+//! `POST /prompt`, `POST /approve`, `POST /answer` and `POST /cancel`. Like the terminal UI there is one
 //! session; every browser tab shows it, and a reloaded tab gets the whole transcript replayed.
 //!
 //! Whoever can call the API can make the agent run commands, so all of it needs the random
 //! token printed at startup (header `x-token`, or `?token=` for the event stream). Only the
 //! static page is served without it.
 
-use crate::frontend::{ContextUsage, Event, Frontend, ToolCall};
+use crate::frontend::{ContextUsage, Event, Frontend, Question, ToolCall};
 use crate::harness::Session;
 use crate::sessions::{self, Store};
 use crate::thinking::{self, Thinking};
@@ -46,6 +46,8 @@ struct Inner {
     log: Vec<Value>,
     /// Tool calls waiting for the user, by call id.
     approvals: HashMap<String, oneshot::Sender<bool>>,
+    /// Questions of the agent waiting for the user, by question id.
+    questions: HashMap<String, oneshot::Sender<String>>,
     /// The latest context usage; only this one is replayed, after the log.
     context: Option<Value>,
     /// The stored session being shown; assigned when its first prompt runs.
@@ -195,14 +197,30 @@ impl Web {
         reply.is_some_and(|reply| reply.send(allow).is_ok())
     }
 
-    /// Marks every unanswered approval as cancelled (the prompt that asked is gone).
+    /// Answers a pending question; `false` if there is none with this id.
+    fn answer_question(&self, id: &str, answer: &str) -> bool {
+        let reply = self.inner.lock().unwrap().questions.remove(id);
+        let sent = reply.is_some_and(|reply| reply.send(answer.to_owned()).is_ok());
+        if sent {
+            self.push(json!({"type": "question", "id": id, "status": "answered", "answer": answer}));
+        }
+        sent
+    }
+
+    /// Marks every unanswered approval and question as cancelled (the prompt that asked is gone).
     fn cancel_approvals(&self) {
-        let ids: Vec<String> = {
+        let (ids, questions): (Vec<String>, Vec<String>) = {
             let mut inner = self.inner.lock().unwrap();
-            inner.approvals.drain().map(|(id, _)| id).collect()
+            (
+                inner.approvals.drain().map(|(id, _)| id).collect(),
+                inner.questions.drain().map(|(id, _)| id).collect(),
+            )
         };
         for id in ids {
             self.push(json!({"type": "tool", "id": id, "status": "cancelled"}));
+        }
+        for id in questions {
+            self.push(json!({"type": "question", "id": id, "status": "cancelled"}));
         }
     }
 
@@ -219,7 +237,7 @@ fn session_event(id: &Option<String>) -> Value {
 /// Calls that were still waiting or running when a session was saved never finished.
 fn settle(log: &mut [Value]) {
     for event in log {
-        if event["type"] == "tool"
+        if matches!(event["type"].as_str(), Some("tool" | "question"))
             && matches!(event["status"].as_str(), Some("pending" | "running"))
         {
             event["status"] = json!("cancelled");
@@ -337,6 +355,23 @@ impl Frontend for Web {
         self.push(tool_event(call, "pending"));
         Box::pin(async move { answer.await == Ok(true) })
     }
+
+    fn ask(&self, question: &Question) -> BoxFuture<'static, Option<String>> {
+        let (reply, answer) = oneshot::channel();
+        self.inner
+            .lock()
+            .unwrap()
+            .questions
+            .insert(question.id.clone(), reply);
+        self.push(json!({
+            "type": "question",
+            "id": question.id,
+            "question": question.question,
+            "options": question.options,
+            "status": "pending",
+        }));
+        Box::pin(async move { answer.await.ok() })
+    }
 }
 
 /// Constant-time comparison, so the token can't be guessed byte by byte.
@@ -415,6 +450,17 @@ async fn approve(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> Status
     }
 }
 
+/// `{"id": "q0", "answer": "..."}` answers a question of the agent.
+async fn answer(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> StatusCode {
+    let id = body["id"].as_str().unwrap_or_default();
+    let answer = body["answer"].as_str().unwrap_or_default();
+    if !answer.trim().is_empty() && web.answer_question(id, answer.trim()) {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::NOT_FOUND
+    }
+}
+
 /// `{"level": "xhigh"}` picks the thinking level for the next prompts.
 async fn set_thinking(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> StatusCode {
     let Some(thinking) = &web.thinking else {
@@ -480,6 +526,7 @@ fn router(web: Arc<Web>) -> Router {
         .route("/events", get(events))
         .route("/prompt", post(prompt))
         .route("/approve", post(approve))
+        .route("/answer", post(answer))
         .route("/cancel", post(cancel))
         .route("/thinking", post(set_thinking))
         .route("/sessions", get(list_sessions))
@@ -588,8 +635,11 @@ mod tests {
 
     /// A server whose model answers with `turns`.
     async fn start(turns: Vec<Vec<MockStreamEvent>>) -> (Arc<Web>, SocketAddr) {
+        start_with(MockCompletionModel::from_stream_turns(turns)).await
+    }
+
+    async fn start_with(model: MockCompletionModel) -> (Arc<Web>, SocketAddr) {
         let (web, inbox) = Web::new(temp_store(), None).unwrap();
-        let model = MockCompletionModel::from_stream_turns(turns);
         let session = Session::new(model.into(), "", web.clone());
         tokio::spawn(worker(web.clone(), session, inbox));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -855,6 +905,28 @@ mod tests {
     }
 
     /// A call that needs approval waits for the browser's answer, then runs.
+    /// `ask_user` waits for the browser's answer, which becomes the tool result.
+    #[tokio::test]
+    async fn question_is_asked_and_answered() {
+        let args = json!({"question": "Which color?", "options": ["red", "blue"]});
+        let model = MockCompletionModel::from_stream_turns([
+            turn(MockStreamEvent::tool_call("t1", "ask_user", args)),
+            turn(MockStreamEvent::text("done")),
+        ]);
+        let recorded = model.clone();
+        let (web, addr) = start_with(model).await;
+        request(addr, "POST /prompt", Some(&web.token), r#"{"text":"go"}"#).await;
+        wait_for(&web, |e| e["type"] == "question" && e["status"] == "pending").await;
+        let body = r#"{"id":"q0","answer":"blue"}"#;
+        let ok = request(addr, "POST /answer", Some(&web.token), body).await;
+        assert!(ok.starts_with("HTTP/1.1 204"), "{ok}");
+        let again = request(addr, "POST /answer", Some(&web.token), body).await;
+        assert!(again.starts_with("HTTP/1.1 404"), "{again}");
+        wait_for(&web, |e| e["type"] == "text" && e["text"] == "done").await;
+        let followup = format!("{:?}", recorded.requests()[1].chat_history);
+        assert!(followup.contains("The user answered: blue"), "{followup}");
+    }
+
     #[tokio::test]
     async fn approval_is_asked_and_the_tool_runs() {
         let args = json!({"command": "echo web-approved"});
