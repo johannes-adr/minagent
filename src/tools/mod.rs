@@ -7,3 +7,5 @@ pub mod execute;
 pub mod execute_javascript;
 mod process;
 pub mod skills;
+#[cfg(feature = "image")]
+pub mod view_image;

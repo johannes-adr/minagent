@@ -37,6 +37,12 @@ Notes:
 - Podman: add `--userns=keep-id` so files keep your user (the script does). Docker on Linux: add `--user "$(id -u):$(id -g)"`.
 - The container has full network access, and commands in it can read `.env`. Use keys with minimal scope.
 
+## `view_image` tool
+
+`view_image(path)` shows a PNG, JPEG, GIF or WebP file (max 5 MiB) to the model, e.g. a screenshot or chart made with `execute`. The type is detected from the file's content, so other files (such as `.env`) are rejected. It is built by default (Cargo feature `image`; opt out with `cargo build --no-default-features --features javascript`). Outside a container each call needs approval, as the file is sent to the model provider.
+
+The model must accept images: Anthropic and OpenAI models do; with Ollama use a vision model (e.g. `LLM_MODEL=llama3.2-vision`), as the default `qwen3` is text-only. Ollama cannot carry images inside tool results, so rig attaches them to a following user message instead.
+
 ## `execute_javascript` tool
 
 For workflow automation (scripts that call APIs and transform data) there is a tool that runs JavaScript in-process with [QuickJS (rquickjs)](https://crates.io/crates/rquickjs). It is built by default (Cargo feature `javascript`). To opt out:

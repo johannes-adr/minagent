@@ -1,0 +1,144 @@
+//! The `view_image` tool (feature `image`): shows an image file to the model.
+
+use crate::harness::{Approval, Context, ToolPolicy};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use rig_agent::rig_tool;
+use rig_core::message::{ImageMediaType, ToolResultContent};
+use rig_core::tool::{ToolExecutionError, ToolOutput};
+
+/// Largest image file the tool sends (the per-image limit of the strictest provider).
+const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Show an image file to yourself: it is returned as an image you can look at. Use it for
+/// screenshots, charts, diagrams and photos, e.g. after creating one with `execute`.
+/// Only PNG, JPEG, GIF and WebP files up to 5 MiB work (the type is read from the file's
+/// content, not its name); anything else is rejected. The file's content is sent to the
+/// model provider.
+#[rig_tool(params(path = "Path of the image file, relative to the workspace root or absolute."))]
+pub(crate) async fn view_image(path: String) -> Result<ToolOutput, ToolExecutionError> {
+    load(&path).await
+}
+
+/// Reads the file at `path` and returns it as an image result.
+async fn load(path: &str) -> Result<ToolOutput, ToolExecutionError> {
+    let fail = |e: std::io::Error| ToolExecutionError::other(format!("cannot read {path}: {e}"));
+    let size = tokio::fs::metadata(path).await.map_err(fail)?.len();
+    if size > MAX_IMAGE_BYTES {
+        return Err(ToolExecutionError::other(format!(
+            "{path} is {size} bytes; the limit is {MAX_IMAGE_BYTES}. Downscale it first, e.g. with `execute`."
+        )));
+    }
+    let bytes = tokio::fs::read(path).await.map_err(fail)?;
+    image_output(path, &bytes)
+}
+
+/// The file is read and sent to the model provider, so outside a container the user
+/// must approve it, like `execute`.
+impl ToolPolicy for ViewImage {
+    const KIND: &'static str = "read";
+
+    fn prompt(_context: &Context) -> String {
+        "Use the `view_image` tool to look at an image file (PNG, JPEG, GIF, WebP); \
+         `execute` and `cat` cannot show images. The model must support image input."
+            .to_owned()
+    }
+
+    fn approval(args: &ViewImageParameters, context: &Context) -> Approval {
+        if context.isolated {
+            Approval::auto(format!("[isolated] view_image: {}", args.path))
+        } else {
+            Approval::ask(format!("view_image: {}", args.path))
+        }
+    }
+}
+
+/// `bytes` as an image result, or an error if they are not a supported image.
+fn image_output(path: &str, bytes: &[u8]) -> Result<ToolOutput, ToolExecutionError> {
+    let Some(media_type) = ImageMediaType::sniff(bytes) else {
+        return Err(ToolExecutionError::other(format!(
+            "{path} is not a PNG, JPEG, GIF or WebP image"
+        )));
+    };
+    ToolOutput::content(vec![
+        ToolResultContent::text(format!(
+            "{path} ({}, {} bytes)",
+            media_type.extension(),
+            bytes.len()
+        )),
+        ToolResultContent::image_base64(STANDARD.encode(bytes), Some(media_type), None),
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rig_core::message::DocumentSourceKind;
+
+    const PNG_1X1: &[u8] = b"\x89PNG\r\n\x1a\n rest of the file";
+
+    #[test]
+    fn an_image_becomes_text_plus_base64_image() {
+        let out = image_output("a.png", PNG_1X1).unwrap();
+        let [
+            ToolResultContent::Text(text),
+            ToolResultContent::Image(image),
+        ] = out.as_content()
+        else {
+            panic!("{out:?}");
+        };
+        assert_eq!(text.text, format!("a.png (png, {} bytes)", PNG_1X1.len()));
+        assert_eq!(image.media_type, Some(ImageMediaType::PNG));
+        assert_eq!(
+            image.data,
+            DocumentSourceKind::Base64(STANDARD.encode(PNG_1X1))
+        );
+    }
+
+    #[test]
+    fn other_files_are_rejected_by_content_not_name() {
+        for bytes in [&b"SECRET=1\n"[..], b""] {
+            let err = image_output("photo.png", bytes).unwrap_err();
+            assert!(err.message().contains("not a PNG"), "{}", err.message());
+        }
+        assert!(image_output("x.txt", PNG_1X1).is_ok());
+    }
+
+    #[test]
+    fn outside_a_container_the_user_must_approve() {
+        let args = ViewImageParameters {
+            path: "a.png".into(),
+        };
+        assert_eq!(
+            ViewImage::approval(&args, &Context { isolated: false }),
+            Approval::ask("view_image: a.png")
+        );
+        assert!(!ViewImage::approval(&args, &Context { isolated: true }).ask);
+    }
+
+    async fn load_owned(path: String) -> Result<ToolOutput, ToolExecutionError> {
+        load(&path).await
+    }
+
+    #[tokio::test]
+    async fn missing_and_oversized_files_are_errors() {
+        let dir = std::env::temp_dir().join(format!("agent_view_image_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("big.png");
+        std::fs::write(&big, vec![0u8; MAX_IMAGE_BYTES as usize + 1]).unwrap();
+        let small = dir.join("small.png");
+        std::fs::write(&small, PNG_1X1).unwrap();
+
+        let call = |p: &std::path::Path| load_owned(p.to_string_lossy().into_owned());
+        let missing = call(&dir.join("nope.png")).await.unwrap_err();
+        assert!(
+            missing.message().contains("cannot read"),
+            "{}",
+            missing.message()
+        );
+        let too_big = call(&big).await.unwrap_err();
+        assert!(too_big.message().contains("limit"), "{}", too_big.message());
+        assert!(call(&small).await.is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

@@ -68,7 +68,7 @@ pub const VARS: &[Var] = &[
     Var {
         name: "AGENT_TOOLS",
         example: "",
-        doc: "Comma-separated tools to enable (execute, use_skill, agent, execute_javascript); empty enables all",
+        doc: "Comma-separated tools to enable (execute, use_skill, agent, execute_javascript, view_image); empty enables all",
     },
     Var {
         name: "AGENT_JS_ALLOWED_HOSTS",

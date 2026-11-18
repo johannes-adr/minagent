@@ -16,10 +16,14 @@ unicode-width = "0.2"
 # Only for the optional `execute_javascript` tool (feature `javascript`).
 rquickjs = { version = "0.14", optional = true }
 reqwest = { version = "0.13", optional = true, default-features = false, features = ["rustls"] }
+# Only for the optional `view_image` tool (feature `image`).
+base64 = { version = "0.22", optional = true }
 
 [features]
 # Opt out with `--no-default-features`.
-default = ["javascript"]
+default = ["javascript", "image"]
+# The `view_image` tool: shows an image file to the model.
+image = ["dep:base64"]
 # The `execute_javascript` tool: scripts in an in-process QuickJS with a small host API.
 javascript = ["dep:rquickjs", "dep:reqwest"]
 

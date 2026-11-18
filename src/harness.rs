@@ -11,6 +11,8 @@ use crate::tools::execute::Execute;
 #[cfg(feature = "javascript")]
 use crate::tools::execute_javascript::ExecuteJavascript;
 use crate::tools::skills::{self, use_skill::UseSkill};
+#[cfg(feature = "image")]
+use crate::tools::view_image::ViewImage;
 use futures::StreamExt;
 use rig_agent::AgentBuilder;
 use rig_agent::agent::{
@@ -24,7 +26,7 @@ use rig_agent::run::response::PromptResponse;
 use rig_agent::streaming::{Item, StreamEvent};
 use rig_core::DynModel;
 use rig_core::effect::{Answered, EffectKind};
-use rig_core::message::Message;
+use rig_core::message::{Message, ToolResultContent};
 use rig_core::operation::Completion;
 use rig_core::serde_json::{self, Value};
 use rig_core::tool::{Tool, ToolOutput};
@@ -75,6 +77,8 @@ pub fn enable_only(names: Vec<String>) -> Result<(), String> {
         Subagent::NAME,
         #[cfg(feature = "javascript")]
         ExecuteJavascript::NAME,
+        #[cfg(feature = "image")]
+        ViewImage::NAME,
     ];
     if let Some(unknown) = names.iter().find(|n| !known.contains(&n.as_str())) {
         return Err(format!(
@@ -187,6 +191,8 @@ fn tools(model: &DynModel<Completion>, preamble: &str) -> Tools {
     .add(UseSkill);
     #[cfg(feature = "javascript")]
     let tools = tools.add(ExecuteJavascript);
+    #[cfg(feature = "image")]
+    let tools = tools.add(ViewImage);
     tools
 }
 
@@ -228,12 +234,29 @@ fn unknown_tool_feedback(tool: &str, available: &[String], is_skill: bool) -> St
     text
 }
 
-/// The text of a tool's output as the model sees it.
+/// The text of a tool's output as the model sees it. Images are shown as a placeholder,
+/// not as their base64 data.
 fn output_text(output: &ToolOutput) -> String {
-    match output.as_text() {
-        Some(text) => text.to_owned(),
-        None => serde_json::to_string(output).unwrap_or_default(),
+    if let Some(text) = output.as_text() {
+        return text.to_owned();
     }
+    if !output
+        .as_content()
+        .iter()
+        .any(|part| matches!(part, ToolResultContent::Image(_)))
+    {
+        return serde_json::to_string(output).unwrap_or_default();
+    }
+    let parts: Vec<String> = output
+        .as_content()
+        .iter()
+        .map(|part| match part {
+            ToolResultContent::Text(text) => text.text.clone(),
+            ToolResultContent::Image(_) => "[image]".to_owned(),
+            ToolResultContent::Json { value } => value.to_string(),
+        })
+        .collect();
+    parts.join("\n")
 }
 
 impl Approve {
@@ -506,6 +529,17 @@ mod tests {
                 assert_eq!(names, [ask, "denied t1".into(), "done".into()]);
             }
         }
+    }
+    /// Image data must not be dumped into the frontends.
+    #[test]
+    fn image_output_is_shown_as_a_placeholder() {
+        let output = ToolOutput::content(vec![
+            ToolResultContent::text("a.png (png, 9 bytes)"),
+            ToolResultContent::image_base64("AAAA", None, None),
+        ])
+        .unwrap();
+        assert_eq!(output_text(&output), "a.png (png, 9 bytes)\n[image]");
+        assert_eq!(output_text(&ToolOutput::text("hi")), "hi");
     }
 
     #[test]
