@@ -1,8 +1,10 @@
 //! Full-screen terminal UI: scrolling chat, multi-line input, status line and approval popup.
 //!
-//! Everything that happens outside the UI (the agent task, the tool functions, the
-//! approval hook) talks to it through [`emit`]; the UI sends prompts back over a channel.
+//! The harness talks to it through the [`Tui`] frontend; the UI sends prompts back
+//! over a channel.
 
+use crate::frontend::{Event as AgentEvent, Frontend, ToolCall};
+use crate::harness::Session;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
     EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
@@ -10,6 +12,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -55,17 +58,50 @@ static EVENTS: OnceLock<mpsc::UnboundedSender<UiEvent>> = OnceLock::new();
 static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
 
 /// Sends an event to the UI. Does nothing while the UI is not running (CLI modes, tests).
-pub fn emit(event: UiEvent) {
+fn emit(event: UiEvent) {
     if let Some(tx) = EVENTS.get() {
         let _ = tx.send(event);
     }
 }
 
 /// Asks the user via the approval popup; anything but `y` (or a closed UI) is `false`.
-pub async fn request_approval(prompt: String) -> bool {
+async fn request_approval(prompt: String) -> bool {
     let (reply, answer) = oneshot::channel();
     emit(UiEvent::Approval { prompt, reply });
     answer.await == Ok(true)
+}
+
+/// The terminal UI as the harness's frontend.
+pub struct Tui;
+
+impl Frontend for Tui {
+    fn emit(&self, event: AgentEvent) {
+        match event {
+            AgentEvent::Text(text) => emit(UiEvent::Text(text)),
+            AgentEvent::Note(text) => emit(UiEvent::Info(text)),
+            AgentEvent::ToolStarted(call) => {
+                let text = if call.ask {
+                    format!("[approved] {}", call.name)
+                } else {
+                    call.title
+                };
+                emit(UiEvent::Info(text));
+                emit(UiEvent::Status(Status::Tool));
+            }
+            AgentEvent::ToolDenied(call) => emit(UiEvent::Info(format!("[denied] {}", call.name))),
+            AgentEvent::ToolFinished { kind, output, .. } => {
+                // Skill texts and subagent reports are for the model; command output is shown.
+                if kind == "execute" {
+                    emit(UiEvent::ToolOutput(output));
+                }
+                emit(UiEvent::Status(Status::Thinking));
+            }
+        }
+    }
+
+    fn approve(&self, call: &ToolCall) -> BoxFuture<'static, bool> {
+        Box::pin(request_approval(format!("{}\napprove? [y/N] ", call.title)))
+    }
 }
 
 enum Entry {
@@ -422,8 +458,19 @@ fn render_approval(frame: &mut Frame, prompt: &str) {
     );
 }
 
-/// Runs the UI until the user quits; every submitted prompt is sent to `prompts`.
-pub async fn run(prompts: mpsc::UnboundedSender<String>) -> io::Result<()> {
+/// Runs the UI until the user quits; every submitted prompt goes to `session`, which
+/// must have been created with the [`Tui`] frontend.
+pub async fn run(mut session: Session) -> io::Result<()> {
+    // The agent runs in its own task, so the UI stays responsive while it works.
+    let (prompts, mut inbox) = mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        while let Some(input) = inbox.recv().await {
+            if let Err(error) = session.prompt(input).await {
+                emit(UiEvent::Error(error));
+            }
+            emit(UiEvent::Status(Status::Idle));
+        }
+    });
     let (tx, mut rx) = mpsc::unbounded_channel();
     let _ = EVENTS.set(tx);
     let mut terminal = setup()?;

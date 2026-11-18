@@ -44,9 +44,8 @@ skills/<skill-name>/
    (`See [details](references/REFERENCE.md)`), one level deep. Put runnable code in `scripts/`
    and tell in the body how to run it, e.g. `AGENT --js skills/<skill-name>/scripts/run.js [args]`
    (`AGENT` is the agent executable from the system prompt; script arguments are in `globalThis.ARGS`).
-5. Check it: run `AGENT --js skills/using-skills/scripts/use_skill.js <skill-name>`. It must
-   print your instructions. The skill appears in the system prompt after the agent is restarted.
+5. Check it: call the `use_skill` tool with `name` set to `<skill-name>`. It must return your
+   instructions. The skill appears in the system prompt after the agent is restarted.
    A skill with invalid frontmatter is skipped with a warning at startup.
 
-Do not edit or delete the built-in skills `using-skills` and `creating-skills`; they are
-restored on every start.
+Do not edit or delete the built-in skill `creating-skills`; it is restored on every start.

@@ -1,3 +1,6 @@
+//! The JavaScript runtime behind `agent --js`: used by the `execute_javascript` tool
+//! (in a sandboxed child process) and for skill scripts.
+
 use llrt_modules::module_builder::ModuleBuilder;
 use rquickjs::{AsyncContext, AsyncRuntime, CatchResultExt, Module};
 
