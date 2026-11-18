@@ -4,6 +4,8 @@
 //! generated `.env.example` ([`env_example`]). Values from `.env` are not put into the
 //! process environment, so child processes don't inherit them.
 
+#[cfg(feature = "javascript")]
+use crate::tools::execute_javascript::{Secret, Settings};
 use rig_core::DynModel;
 use rig_core::operation::Completion;
 use rig_core::providers::anthropic::{self, AnthropicConfig};
@@ -11,6 +13,10 @@ use rig_core::providers::ollama::{self, OllamaConfig};
 use rig_core::providers::openai::{self, OpenAIConfig};
 use std::collections::HashMap;
 use std::path::Path;
+
+/// Prefix of the variables that define `execute_javascript` secrets.
+#[cfg(feature = "javascript")]
+const SECRET_PREFIX: &str = "AGENT_SECRET_";
 
 pub struct Var {
     pub name: &'static str,
@@ -62,7 +68,17 @@ pub const VARS: &[Var] = &[
     Var {
         name: "AGENT_TOOLS",
         example: "",
-        doc: "Comma-separated tools to enable (execute, use_skill, agent); empty enables all",
+        doc: "Comma-separated tools to enable (execute, use_skill, agent, execute_javascript); empty enables all",
+    },
+    Var {
+        name: "AGENT_JS_ALLOWED_HOSTS",
+        example: "",
+        doc: "execute_javascript (build with --features javascript): comma-separated hosts its scripts may contact without asking",
+    },
+    Var {
+        name: "AGENT_SECRET_GITHUB",
+        example: "",
+        doc: "execute_javascript: a secret named GITHUB as `<host> <Authorization header value>`, e.g. `api.github.com Bearer ghp_xxx`; scripts use it with fetch(..., {secret: \"GITHUB\"}) and never see the value. Add more as AGENT_SECRET_<NAME>",
     },
 ];
 
@@ -101,6 +117,9 @@ impl Config {
                 values.insert(var.name.to_owned(), value);
             }
         }
+        // Secrets have free names, so they are not in `VARS`.
+        #[cfg(feature = "javascript")]
+        values.extend(std::env::vars().filter(|(name, _)| name.starts_with(SECRET_PREFIX)));
         Ok(Config { values })
     }
 
@@ -126,6 +145,41 @@ impl Config {
             .filter(|name| !name.is_empty())
             .collect();
         (!list.is_empty()).then_some(list)
+    }
+
+    /// The configuration of `execute_javascript`: allowed hosts and secrets
+    /// (`AGENT_SECRET_<NAME>=<host> <header value>`).
+    #[cfg(feature = "javascript")]
+    pub fn javascript(&self) -> Result<Settings, String> {
+        let allowed_hosts = self
+            .get("AGENT_JS_ALLOWED_HOSTS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|host| host.trim().to_ascii_lowercase())
+            .filter(|host| !host.is_empty())
+            .collect();
+        let mut secrets = HashMap::new();
+        for (var, value) in &self.values {
+            let Some(name) = var.strip_prefix(SECRET_PREFIX).filter(|n| !n.is_empty()) else {
+                continue;
+            };
+            if value.is_empty() {
+                continue;
+            }
+            let (host, header) = value
+                .split_once(char::is_whitespace)
+                .filter(|(_, header)| !header.trim().is_empty())
+                .ok_or_else(|| format!("{var} must be `<host> <header value>`"))?;
+            let secret = Secret {
+                host: host.to_ascii_lowercase(),
+                value: header.trim().to_owned(),
+            };
+            secrets.insert(name.to_owned(), secret);
+        }
+        Ok(Settings {
+            allowed_hosts,
+            secrets,
+        })
     }
 
     pub fn backend(&self) -> Result<Backend, String> {
@@ -214,6 +268,36 @@ mod tests {
             config(&[("AGENT_TOOLS", "execute, agent")]).tools(),
             Some(vec!["execute".to_owned(), "agent".to_owned()])
         );
+    }
+
+    #[cfg(feature = "javascript")]
+    #[test]
+    fn javascript_settings() {
+        let settings = config(&[
+            ("AGENT_JS_ALLOWED_HOSTS", " API.github.com, ,example.com "),
+            ("AGENT_SECRET_GITHUB", "api.github.com Bearer ghp_x"),
+            ("AGENT_SECRET_EMPTY", ""),
+            ("AGENT_SECRET_", "ignored"),
+        ])
+        .javascript()
+        .unwrap();
+        assert_eq!(settings.allowed_hosts, ["api.github.com", "example.com"]);
+        assert_eq!(settings.secrets.len(), 1);
+        assert_eq!(settings.secrets["GITHUB"].host, "api.github.com");
+        assert_eq!(settings.secrets["GITHUB"].value, "Bearer ghp_x");
+        assert!(config(&[]).javascript().unwrap().allowed_hosts.is_empty());
+    }
+
+    #[cfg(feature = "javascript")]
+    #[test]
+    fn malformed_secret_is_an_error_without_the_value() {
+        for value in ["api.github.com", "api.github.com   "] {
+            let err = config(&[("AGENT_SECRET_X", value)])
+                .javascript()
+                .err()
+                .unwrap();
+            assert_eq!(err, "AGENT_SECRET_X must be `<host> <header value>`");
+        }
     }
 
     #[test]

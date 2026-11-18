@@ -1,0 +1,404 @@
+//! The `execute_javascript` tool (feature `javascript`): runs a script in an in-process
+//! QuickJS runtime. The script can only use the host API of [`runtime`]: `console`, `fetch`
+//! (to declared hosts, with secrets the script never sees) and `fs` (working directory
+//! only). The sandbox is this capability set itself, so it needs no container.
+
+mod fetch;
+mod fs;
+mod runtime;
+
+use crate::harness::{Approval, Context, ToolPolicy};
+use crate::tools::process::format_output;
+use rig_agent::rig_tool;
+use rig_core::tool::ToolExecutionError;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use tokio::runtime::Handle;
+
+/// Default and maximum `timeout_seconds` of `execute_javascript`.
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+const MAX_TIMEOUT_SECS: u64 = 300;
+
+/// A credential bound to one host (`AGENT_SECRET_<NAME>=<host> <header value>`).
+pub struct Secret {
+    pub host: String,
+    /// The `Authorization` header value, e.g. `Bearer ghp_xxx`.
+    pub value: String,
+}
+
+/// What the configuration gives the tool.
+#[derive(Default)]
+pub struct Settings {
+    /// Hosts whose calls run without asking (`AGENT_JS_ALLOWED_HOSTS`), lowercase.
+    pub allowed_hosts: Vec<String>,
+    /// Secrets by name (the `<NAME>` of `AGENT_SECRET_<NAME>`).
+    pub secrets: HashMap<String, Secret>,
+}
+
+static SETTINGS: OnceLock<Arc<Settings>> = OnceLock::new();
+
+/// Sets the tool's configuration. Call once at startup, before creating a session.
+pub fn configure(settings: Settings) {
+    let _ = SETTINGS.set(Arc::new(settings));
+}
+
+fn settings() -> Arc<Settings> {
+    SETTINGS.get_or_init(Default::default).clone()
+}
+
+/// Trimmed, lowercase, non-empty hostnames.
+fn normalize(hosts: Option<&[String]>) -> Vec<String> {
+    hosts
+        .unwrap_or_default()
+        .iter()
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect()
+}
+
+/// Calls that only contact allowed hosts (or none) run without asking; the rest needs
+/// approval. The container is irrelevant: the script's capabilities are what is checked.
+impl ToolPolicy for ExecuteJavascript {
+    const KIND: &'static str = "execute";
+
+    fn prompt(_context: &Context) -> String {
+        let mut secrets: Vec<_> = settings()
+            .secrets
+            .iter()
+            .map(|(name, s)| format!("`{name}` (only for {})", s.host))
+            .collect();
+        secrets.sort();
+        let secrets = if secrets.is_empty() {
+            "No secrets are configured.".to_owned()
+        } else {
+            format!("Available secrets: {}.", secrets.join(", "))
+        };
+        format!(
+            "Use `execute_javascript` for workflow automation: calling APIs and transforming data. \
+The script is an ES module (top-level `await` works) and has only these globals: \
+`console.log/info/warn/error`; `fetch(url, {{method, headers, body, secret}})` returning a promise of \
+`{{status, ok, headers, text(), json()}}` (`body` is a string, use `JSON.stringify`); and the synchronous \
+`fs.readText(path)`, `fs.writeText(path, text)`, `fs.list(path)`, `fs.exists(path)`, whose paths are relative \
+to the working directory (`.env*` files are not accessible). There are no timers, no `require`/`import`, \
+no npm packages and no process or environment access. `fetch` only reaches `https://` hosts you list in \
+the `hosts` argument (the user must approve hosts that are not pre-approved). \
+`secret: \"NAME\"` makes `fetch` add the `Authorization` header from the configured secret; the script never \
+sees its value, and it only works for the host the secret is bound to. {secrets} \
+Print results with `console.log`; thrown errors are returned as output."
+        )
+    }
+
+    fn approval(args: &ExecuteJavascriptParameters, _context: &Context) -> Approval {
+        approval(args, &settings().allowed_hosts)
+    }
+}
+
+fn approval(args: &ExecuteJavascriptParameters, allowed: &[String]) -> Approval {
+    let hosts = normalize(args.hosts.as_deref());
+    if hosts.iter().all(|h| allowed.contains(h)) {
+        let mut lines = args.code.lines();
+        let first = lines.next().unwrap_or_default();
+        let more = if lines.next().is_some() { " ..." } else { "" };
+        return Approval::auto(format!("[javascript] {first}{more}"));
+    }
+    Approval::ask(format!(
+        "execute_javascript with network access to {}:\n{}",
+        hosts.join(", "),
+        args.code
+    ))
+}
+
+/// Run a JavaScript (ES module) script in a sandboxed in-process runtime and return its
+/// console output and, if it threw, the error. For workflow automation: calling APIs
+/// with `fetch` and transforming data. Only `console`, `fetch` and `fs` exist; there is
+/// no `require`, no npm and no process access.
+#[rig_tool(params(
+    code = "The script (ES module; top-level await works). Print results with console.log.",
+    hosts = "Hostnames the script will contact with fetch, e.g. [\"api.github.com\"]. fetch to any other host fails; omit when the script does no network access.",
+    timeout_seconds = "Stop the script after this many seconds (default 30, max 300)."
+))]
+pub(crate) async fn execute_javascript(
+    code: String,
+    hosts: Option<Vec<String>>,
+    timeout_seconds: Option<u64>,
+) -> Result<String, ToolExecutionError> {
+    let timeout = Duration::from_secs(
+        timeout_seconds
+            .unwrap_or(DEFAULT_TIMEOUT_SECS)
+            .clamp(1, MAX_TIMEOUT_SECS),
+    );
+    run(code, normalize(hosts.as_deref()), timeout, settings())
+        .await
+        .map_err(ToolExecutionError::from_error)
+}
+
+/// Runs the script on a blocking thread and formats its outcome like `execute`'s output.
+async fn run(
+    code: String,
+    hosts: Vec<String>,
+    timeout: Duration,
+    settings: Arc<Settings>,
+) -> Result<String, tokio::task::JoinError> {
+    let handle = Handle::current();
+    let outcome =
+        tokio::task::spawn_blocking(move || runtime::run(&code, hosts, timeout, settings, handle))
+            .await?;
+    Ok(format_output(
+        &outcome.exit,
+        outcome.stdout.as_bytes(),
+        outcome.stderr.as_bytes(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn approval_of(args: &str, allowed: &[&str]) -> Approval {
+        let args = rig_core::serde_json::from_str(args).unwrap();
+        let allowed: Vec<String> = allowed.iter().map(|h| h.to_string()).collect();
+        approval(&args, &allowed)
+    }
+
+    #[test]
+    fn only_calls_to_allowed_hosts_run_without_asking() {
+        let allowed = ["api.github.com"];
+        assert!(!approval_of(r#"{"code":"1"}"#, &[]).ask);
+        assert!(!approval_of(r#"{"code":"1","hosts":[]}"#, &[]).ask);
+        let github = r#"{"code":"1","hosts":["API.github.com "]}"#;
+        assert!(!approval_of(github, &allowed).ask);
+        assert!(approval_of(github, &[]).ask);
+        let both = r#"{"code":"1","hosts":["api.github.com","evil.com"]}"#;
+        assert!(approval_of(both, &allowed).ask);
+    }
+
+    #[test]
+    fn approval_titles() {
+        assert_eq!(
+            approval_of(r#"{"code":"let a = 1;\nconsole.log(a)"}"#, &[]),
+            Approval::auto("[javascript] let a = 1; ...")
+        );
+        assert_eq!(
+            approval_of(r#"{"code":"one line"}"#, &[]),
+            Approval::auto("[javascript] one line")
+        );
+        assert_eq!(
+            approval_of(r#"{"code":"await f();\nx","hosts":["a.com","b.com"]}"#, &[]),
+            Approval::ask("execute_javascript with network access to a.com, b.com:\nawait f();\nx")
+        );
+    }
+
+    #[test]
+    fn approval_does_not_depend_on_the_container() {
+        let args = rig_core::serde_json::from_str(r#"{"code":"1","hosts":["x.com"]}"#).unwrap();
+        for isolated in [true, false] {
+            assert!(ExecuteJavascript::approval(&args, &Context { isolated }).ask);
+        }
+    }
+
+    fn secret(host: &str, value: &str) -> Secret {
+        Secret {
+            host: host.to_owned(),
+            value: value.to_owned(),
+        }
+    }
+
+    async fn js_with(code: &str, hosts: &[&str], secrets: &[(&str, Secret)], secs: u64) -> String {
+        let settings = Settings {
+            allowed_hosts: Vec::new(),
+            secrets: secrets
+                .iter()
+                .map(|(name, s)| (name.to_string(), secret(&s.host, &s.value)))
+                .collect(),
+        };
+        let hosts = hosts.iter().map(|h| h.to_string()).collect();
+        run(
+            code.to_owned(),
+            hosts,
+            Duration::from_secs(secs),
+            Arc::new(settings),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn js(code: &str) -> String {
+        js_with(code, &[], &[], 10).await
+    }
+
+    #[tokio::test]
+    async fn console_output_is_captured() {
+        let out = js(r#"
+            console.log("hello", 1 + 1, {a: [1, 2]}, [null], undefined);
+            console.info("info");
+            console.warn("careful");
+            console.error(new Error("bad").message);
+            const v = await Promise.resolve(42);
+            console.log("awaited", v);
+        "#)
+        .await;
+        assert_eq!(
+            out,
+            "ok\nstdout:\nhello 2 {\"a\":[1,2]} [null] undefined\ninfo\nawaited 42\nstderr:\ncareful\nbad"
+        );
+        assert_eq!(js("").await, "ok\n(no output)");
+    }
+
+    #[tokio::test]
+    async fn a_thrown_error_is_reported_with_the_output_so_far() {
+        let out = js("console.log('before'); throw new Error('boom');").await;
+        assert!(
+            out.starts_with("error\nstdout:\nbefore\nstderr:\nUncaught Error: boom"),
+            "{out}"
+        );
+        let out = js("await Promise.reject(new TypeError('late'))").await;
+        assert!(out.contains("Uncaught TypeError: late"), "{out}");
+        let out = js("let = ;").await;
+        assert!(out.contains("SyntaxError"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn only_the_documented_globals_exist() {
+        let out = js(r#"
+            for (const name of ["require", "process", "Deno", "Bun", "native", "setTimeout", "XMLHttpRequest"]) {
+                if (typeof globalThis[name] !== "undefined") console.log("leaked", name);
+            }
+            console.log(typeof fetch, typeof fs.readText, typeof console.log);
+        "#)
+        .await;
+        assert_eq!(out, "ok\nstdout:\nfunction function function");
+        let out = js("import fs from 'node:fs';").await;
+        assert!(out.starts_with("error"), "{out}");
+        let out = js("await new Promise(() => {});").await;
+        assert!(out.contains("never settles"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn an_endless_loop_times_out() {
+        let started = Instant::now();
+        let out = js_with("console.log('start'); while (true) {}", &[], &[], 1).await;
+        assert!(out.starts_with("timed out after 1s"), "{out}");
+        assert!(out.contains("start"), "{out}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[tokio::test]
+    async fn memory_is_limited() {
+        let out = js("const a = []; while (true) a.push(new Array(1e6).fill(1));").await;
+        assert!(out.starts_with("error"), "{out}");
+        assert!(out.to_lowercase().contains("out of memory"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn fs_is_confined_to_the_working_directory() {
+        let out = js(r#"
+            for (const path of ["../x", "/etc/passwd", "a/../../x", ".env", "sub/.env.local"]) {
+                for (const op of [() => fs.readText(path), () => fs.writeText(path, "x"), () => fs.exists(path)]) {
+                    try { op(); console.log("allowed", path); } catch (e) { console.log("blocked", path); }
+                }
+            }
+            try { fs.readText("../x"); } catch (e) { console.log(e.message); }
+        "#)
+        .await;
+        assert!(!out.contains("allowed"), "{out}");
+        assert_eq!(out.matches("blocked").count(), 15, "{out}");
+        assert!(out.contains("stay inside it"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn fs_reads_writes_and_lists() {
+        let dir = format!("target/js_fs_test_{}", std::process::id());
+        let out = js(&format!(r#"
+            fs.writeText("{dir}/sub/a.txt", "héllo");
+            console.log(fs.readText("{dir}/sub/a.txt"), fs.exists("{dir}/sub/a.txt"), fs.exists("{dir}/nope"));
+            console.log(JSON.stringify(fs.list("{dir}")), JSON.stringify(fs.list("{dir}/sub")));
+        "#))
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(out, "ok\nstdout:\nhéllo true false\n[\"sub/\"] [\"a.txt\"]");
+    }
+
+    #[tokio::test]
+    async fn fetch_to_an_undeclared_host_is_rejected() {
+        let code = r#"
+            try { await fetch("https://example.com/"); console.log("fetched"); }
+            catch (e) { console.log("rejected:", e.message); }
+        "#;
+        let out = js(code).await;
+        assert!(
+            out.contains("rejected: host example.com was not declared"),
+            "{out}"
+        );
+        let out = js_with(code, &["other.com"], &[], 10).await;
+        assert!(
+            out.contains("rejected: host example.com was not declared"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_secret_is_not_sent_to_another_host() {
+        let secrets = [("GITHUB", secret("api.github.com", "Bearer ghp_x"))];
+        let code = r#"
+            try { await fetch("https://other.com/", { secret: "GITHUB" }); console.log("sent"); }
+            catch (e) { console.log("rejected:", e.message); }
+        "#;
+        let out = js_with(code, &["other.com"], &secrets, 10).await;
+        assert!(out.contains("may only be sent to api.github.com"), "{out}");
+        assert!(!out.contains("ghp_x"), "{out}");
+    }
+
+    /// Answers one request with `{"ok":true}` and returns the request it received.
+    async fn serve_once() -> (u16, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).await.unwrap();
+                request.extend_from_slice(&buf[..n]);
+            }
+            let body = r#"{"ok":true}"#;
+            let response = format!(
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nX-Reply: yes\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        (port, task)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fetch_adds_the_secret_without_showing_it_to_the_script() {
+        let (port, server) = serve_once().await;
+        let secrets = [("TEST", secret("127.0.0.1", "Bearer s3cret"))];
+        let code = format!(
+            r#"
+            const r = await fetch("http://127.0.0.1:{port}/v1/items", {{
+                method: "post",
+                headers: {{ "Authorization": "Bearer fake", "X-Custom": "1" }},
+                body: JSON.stringify({{ name: "a" }}),
+                secret: "TEST",
+            }});
+            console.log(r.status, r.ok, r.headers["x-reply"], JSON.stringify(await r.json()));
+        "#
+        );
+        let out = js_with(&code, &["127.0.0.1"], &secrets, 10).await;
+        let request = server.await.unwrap().to_lowercase();
+        assert_eq!(out, "ok\nstdout:\n201 true yes {\"ok\":true}");
+        assert!(!out.contains("s3cret"), "{out}");
+        assert!(request.starts_with("post /v1/items http/1.1"), "{request}");
+        assert!(
+            request.contains("authorization: bearer s3cret\r\n"),
+            "{request}"
+        );
+        assert!(!request.contains("bearer fake"), "{request}");
+        assert!(request.contains("x-custom: 1\r\n"), "{request}");
+    }
+}

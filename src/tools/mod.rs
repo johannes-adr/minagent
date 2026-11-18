@@ -3,5 +3,7 @@
 
 pub mod agent;
 pub mod execute;
+#[cfg(feature = "javascript")]
+pub mod execute_javascript;
 mod process;
 pub mod skills;

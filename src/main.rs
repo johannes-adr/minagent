@@ -34,6 +34,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("{err}");
         return Err(err.into());
     }
+    #[cfg(feature = "javascript")]
+    match config.javascript() {
+        Ok(settings) => tools::execute_javascript::configure(settings),
+        Err(err) => {
+            // In ACP mode stdout belongs to the protocol.
+            eprintln!("{err}");
+            return Err(err.into());
+        }
+    }
     let model = match config.model() {
         Ok(model) => model,
         Err(err) => {

@@ -8,6 +8,8 @@
 use crate::frontend::{Event, Frontend, ToolCall};
 use crate::tools::agent::Subagent;
 use crate::tools::execute::Execute;
+#[cfg(feature = "javascript")]
+use crate::tools::execute_javascript::ExecuteJavascript;
 use crate::tools::skills::{self, use_skill::UseSkill};
 use futures::StreamExt;
 use rig_agent::AgentBuilder;
@@ -67,7 +69,13 @@ static ENABLED_TOOLS: OnceLock<Vec<String>> = OnceLock::new();
 /// Restricts agents to the tools in `names`. Call once at startup, before creating a
 /// [`Session`]. Fails on a name that is not a tool.
 pub fn enable_only(names: Vec<String>) -> Result<(), String> {
-    let known = [Execute::NAME, UseSkill::NAME, Subagent::NAME];
+    let known = [
+        Execute::NAME,
+        UseSkill::NAME,
+        Subagent::NAME,
+        #[cfg(feature = "javascript")]
+        ExecuteJavascript::NAME,
+    ];
     if let Some(unknown) = names.iter().find(|n| !known.contains(&n.as_str())) {
         return Err(format!(
             "unknown tool {unknown:?} in AGENT_TOOLS; use {}",
@@ -169,14 +177,17 @@ impl Tools {
 
 /// The tools every agent (main agent and subagents) has. Add new tools here.
 fn tools(model: &DynModel<Completion>, preamble: &str) -> Tools {
-    Tools {
+    let tools = Tools {
         builder: AgentBuilder::new(model.clone()),
         context: Context::from_env(),
         preamble: preamble.to_owned(),
         policies: HashMap::new(),
     }
     .add(Execute)
-    .add(UseSkill)
+    .add(UseSkill);
+    #[cfg(feature = "javascript")]
+    let tools = tools.add(ExecuteJavascript);
+    tools
 }
 
 /// The main agent: all tools plus `agent` to start subagents.

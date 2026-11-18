@@ -13,6 +13,13 @@ ratatui = "0.30.2"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 ratatui-textarea = "0.9.4"
 unicode-width = "0.2"
+# Only for the optional `execute_javascript` tool (feature `javascript`).
+rquickjs = { version = "0.14", optional = true }
+reqwest = { version = "0.13", optional = true, default-features = false, features = ["rustls"] }
+
+[features]
+# The `execute_javascript` tool: scripts in an in-process QuickJS with a small host API.
+javascript = ["dep:rquickjs", "dep:reqwest"]
 
 # [profile.release]
 # strip = true
