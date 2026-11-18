@@ -81,6 +81,7 @@ impl Frontend for Tui {
         match event {
             AgentEvent::Text(text) => emit(UiEvent::Text(text)),
             AgentEvent::Note(text) => emit(UiEvent::Info(text)),
+            AgentEvent::Reasoning(_) => {}
             AgentEvent::ToolStarted(call) => {
                 let text = if call.ask {
                     format!("[approved] {}", call.name)
@@ -99,6 +100,13 @@ impl Frontend for Tui {
                 emit(UiEvent::Status(Status::Thinking));
             }
             AgentEvent::Context(usage) => emit(UiEvent::Context(usage)),
+            // A subagent's answer is for the main agent; only its notes are shown.
+            AgentEvent::Sub { event, .. } => {
+                if let AgentEvent::Note(text) = *event {
+                    emit(UiEvent::Info(text));
+                }
+            }
+            AgentEvent::SubagentStarted { .. } | AgentEvent::SubagentFinished { .. } => {}
         }
     }
 

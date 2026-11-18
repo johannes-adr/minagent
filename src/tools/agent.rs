@@ -1,13 +1,14 @@
 //! The `agent` tool: runs a task in a subagent with its own fresh context and returns
 //! only the subagent's final report. Blocking: the call waits until the subagent is done.
 
-use crate::frontend::Frontend;
+use crate::frontend::{Event, Frontend, Scoped};
 use crate::harness::{self, Approval, Context, INVALID_TOOL_CALL_RETRIES, ToolPolicy};
 use rig_core::DynModel;
 use rig_core::operation::Completion;
 use rig_core::tool::{Tool, ToolContext};
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Added to the system prompt of every subagent.
 const SUBAGENT_NOTE: &str = "\n\n# Subagent\n\nYou are a subagent. Complete the task autonomously and end with a concise final report of what you found or did; the report is all the caller sees. You cannot start further subagents (there is no `agent` tool for you) and you cannot ask the caller questions.";
@@ -27,6 +28,15 @@ pub(crate) struct AgentArgs {
     description: String,
     /// The complete, self-contained task. The subagent does not see the conversation, so include all context it needs and say what the final report must contain.
     prompt: String,
+}
+
+/// A subagent id that is unique across restarts too, as sessions are saved with theirs.
+fn new_id() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    format!("sub{millis:x}{}", COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Starts a subagent on the same model. It cannot be a `#[rig_tool]` function because it
@@ -52,14 +62,20 @@ impl Subagent {
     }
 
     /// Runs `prompt` in a fresh agent (no `agent` tool, so no nesting) and returns its final text.
-    async fn run(&self, prompt: &str) -> Result<String, String> {
-        let agent = harness::subagent(self.model.clone(), &self.preamble, self.frontend.clone());
+    /// What the subagent does is reported to the frontend under `id`.
+    async fn run(&self, id: &str, prompt: &str) -> Result<String, String> {
+        let frontend: Arc<dyn Frontend> =
+            Arc::new(Scoped::new(self.frontend.clone(), id.to_owned()));
+        let agent = harness::subagent(self.model.clone(), &self.preamble, frontend.clone());
         let mut stream = agent
             .prompt(prompt)
             .max_invalid_tool_call_retries(INVALID_TOOL_CALL_RETRIES)
             .stream();
-        // The subagent's text is not shown, only its tool calls.
-        let response = harness::run_stream(&mut stream, None).await?;
+        let report = harness::Report {
+            frontend: &*frontend,
+            context_window: None,
+        };
+        let response = harness::run_stream(&mut stream, Some(report)).await?;
         Ok(response.output())
     }
 }
@@ -95,7 +111,18 @@ impl Tool for Subagent {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<String, Infallible> {
-        Ok(match self.run(&args.prompt).await {
+        let id = new_id();
+        self.frontend.emit(Event::SubagentStarted {
+            agent: id.clone(),
+            description: args.description.clone(),
+            prompt: args.prompt.clone(),
+        });
+        let result = self.run(&id, &args.prompt).await;
+        self.frontend.emit(Event::SubagentFinished {
+            agent: id,
+            failed: result.is_err(),
+        });
+        Ok(match result {
             Ok(text) if text.trim().is_empty() => {
                 "The subagent finished without writing a report.".to_string()
             }

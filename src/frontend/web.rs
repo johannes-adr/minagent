@@ -96,9 +96,10 @@ impl Web {
     /// Records `event` and sends it to the connected browsers.
     fn push(&self, event: Value) {
         let mut inner = self.inner.lock().unwrap();
-        if event["type"] == "text"
+        if matches!(event["type"].as_str(), Some("text" | "reasoning"))
             && let Some(last) = inner.log.last_mut()
-            && last["type"] == "text"
+            && last["type"] == event["type"]
+            && last["agent"] == event["agent"]
             && let Some(Value::String(text)) = last.get_mut("text")
         {
             text.push_str(event["text"].as_str().unwrap_or_default());
@@ -272,6 +273,8 @@ fn tool_event(call: &ToolCall, status: &str) -> Value {
         "title": call.title,
         "args": clip_args(&call.args),
         "status": status,
+        // Which subagent's panel shows the call; none means the main transcript.
+        "agent": call.agent,
     })
 }
 
@@ -279,6 +282,7 @@ impl Frontend for Web {
     fn emit(&self, event: Event) {
         match event {
             Event::Text(text) => self.push(json!({"type": "text", "text": text})),
+            Event::Reasoning(text) => self.push(json!({"type": "reasoning", "text": text})),
             Event::Note(text) => self.push(json!({"type": "note", "text": text})),
             Event::ToolStarted(call) => self.push(tool_event(&call, "running")),
             Event::ToolDenied(call) => self.push(tool_event(&call, "denied")),
@@ -291,6 +295,35 @@ impl Frontend for Web {
                 "output": clip(output),
             })),
             Event::Context(usage) => self.set_context(usage),
+            Event::SubagentStarted {
+                agent,
+                description,
+                prompt,
+            } => self.push(json!({
+                "type": "subagent",
+                "agent": agent,
+                "description": description,
+                "prompt": clip(prompt),
+                "status": "running",
+            })),
+            Event::SubagentFinished { agent, failed } => self.push(json!({
+                "type": "subagent",
+                "agent": agent,
+                "status": if failed { "failed" } else { "done" },
+            })),
+            // The subagent's context is not the one the header shows.
+            Event::Sub { agent, event } => match *event {
+                Event::Text(text) => {
+                    self.push(json!({"type": "text", "agent": agent, "text": text}))
+                }
+                Event::Reasoning(text) => {
+                    self.push(json!({"type": "reasoning", "agent": agent, "text": text}))
+                }
+                Event::Note(text) => {
+                    self.push(json!({"type": "note", "agent": agent, "text": text}))
+                }
+                _ => {}
+            },
         }
     }
 
@@ -680,6 +713,7 @@ mod tests {
             title: "[javascript] const a = 1; ...".into(),
             ask: false,
             args: json!({"code": code, "hosts": ["a.com"]}),
+            agent: None,
         };
         let event = tool_event(&call, "running");
         assert_eq!(event["args"]["code"], code);
@@ -853,6 +887,54 @@ mod tests {
         })
         .await;
         wait_for(&web, |e| e["type"] == "text" && e["text"] == "done").await;
+    }
+
+    /// A subagent's text and tool calls are tagged with its id, so the page can show
+    /// them in a panel of their own; its tool call ids can't clash with the main agent's.
+    #[tokio::test]
+    async fn subagent_events_carry_the_agent_id() {
+        let task = json!({"description": "say hi", "prompt": "Say hi."});
+        let run = json!({"command": "echo from-sub"});
+        let (web, addr) = start(vec![
+            turn(MockStreamEvent::tool_call("t1", "agent", task)),
+            turn(MockStreamEvent::tool_call("t1", "execute", run)),
+            turn(MockStreamEvent::text("report")),
+            turn(MockStreamEvent::text("done")),
+        ])
+        .await;
+        request(addr, "POST /prompt", Some(&web.token), r#"{"text":"go"}"#).await;
+        wait_for(&web, |e| {
+            e["type"] == "subagent" && e["status"] == "running"
+        })
+        .await;
+        wait_for(&web, |e| e["type"] == "tool" && e["status"] == "pending").await;
+        let call = log(&web)
+            .into_iter()
+            .find(|e| e["status"] == "pending")
+            .unwrap();
+        let (id, agent) = (
+            call["id"].as_str().unwrap(),
+            call["agent"].as_str().unwrap(),
+        );
+        assert_eq!(id, format!("{agent}/t1"));
+        let body = json!({"id": id, "allow": true}).to_string();
+        request(addr, "POST /approve", Some(&web.token), &body).await;
+        wait_for(&web, |e| e["id"] == id && e["status"] == "done").await;
+        wait_for(&web, |e| {
+            e["type"] == "text" && e["agent"] == agent && e["text"] == "report"
+        })
+        .await;
+        wait_for(&web, |e| e["type"] == "subagent" && e["status"] == "done").await;
+        wait_for(&web, |e| {
+            e["type"] == "text" && e["agent"].is_null() && e["text"] == "done"
+        })
+        .await;
+        let started = log(&web)
+            .into_iter()
+            .find(|e| e["type"] == "subagent")
+            .unwrap();
+        assert_eq!(started["description"], "say hi");
+        assert_eq!(started["agent"], agent);
     }
 
     #[tokio::test]

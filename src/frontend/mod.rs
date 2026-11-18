@@ -12,6 +12,7 @@ pub mod web;
 use futures::future::BoxFuture;
 use rig_core::serde_json::Value;
 use std::fmt;
+use std::sync::Arc;
 
 /// A tool call the model made, as shown to the user.
 #[derive(Clone, Debug)]
@@ -28,6 +29,8 @@ pub struct ToolCall {
     pub ask: bool,
     /// The arguments as the model sent them.
     pub args: Value,
+    /// The subagent that made the call; `None` for the main agent.
+    pub agent: Option<String>,
 }
 
 /// How full the main agent's context is after its latest model call.
@@ -82,6 +85,8 @@ fn compact(n: u64) -> String {
 pub enum Event {
     /// A streamed fragment of the assistant's answer.
     Text(String),
+    /// A streamed fragment of the model's reasoning, if it reports any.
+    Reasoning(String),
     /// A one-line note, e.g. a call to a tool that doesn't exist.
     Note(String),
     /// The call was approved (or needed no approval) and runs now.
@@ -97,6 +102,17 @@ pub enum Event {
     },
     /// A model call of the main agent finished (subagents have their own context).
     Context(ContextUsage),
+    /// The main agent started a subagent; its own events follow, tagged with `agent`.
+    SubagentStarted {
+        agent: String,
+        description: String,
+        prompt: String,
+    },
+    /// The subagent is done (or failed) and handed its report to the main agent.
+    SubagentFinished { agent: String, failed: bool },
+    /// An answer fragment, note or context usage of a subagent. Its tool calls are
+    /// reported like the main agent's, with [`ToolCall::agent`] set.
+    Sub { agent: String, event: Box<Event> },
 }
 
 /// A frontend the harness reports to. One frontend may serve several agents
@@ -105,6 +121,60 @@ pub trait Frontend: Send + Sync + 'static {
     fn emit(&self, event: Event);
     /// Asks the user whether `call` may run; anything but an explicit yes is `false`.
     fn approve(&self, call: &ToolCall) -> BoxFuture<'static, bool>;
+}
+
+/// The frontend of one subagent: tags what the subagent reports with its id, so frontends
+/// can show it apart from the main agent. Tool call ids get the subagent's id as prefix, as
+/// the model chooses them and two agents may pick the same.
+pub struct Scoped {
+    inner: Arc<dyn Frontend>,
+    agent: String,
+}
+
+impl Scoped {
+    pub fn new(inner: Arc<dyn Frontend>, agent: String) -> Self {
+        Self { inner, agent }
+    }
+
+    fn id(&self, id: &str) -> String {
+        format!("{}/{id}", self.agent)
+    }
+
+    fn call(&self, call: &ToolCall) -> ToolCall {
+        ToolCall {
+            id: self.id(&call.id),
+            agent: Some(self.agent.clone()),
+            ..call.clone()
+        }
+    }
+}
+
+impl Frontend for Scoped {
+    fn emit(&self, event: Event) {
+        self.inner.emit(match event {
+            Event::ToolStarted(call) => Event::ToolStarted(self.call(&call)),
+            Event::ToolDenied(call) => Event::ToolDenied(self.call(&call)),
+            Event::ToolFinished {
+                id,
+                kind,
+                output,
+                failed,
+            } => Event::ToolFinished {
+                id: self.id(&id),
+                kind,
+                output,
+                failed,
+            },
+            other => Event::Sub {
+                agent: self.agent.clone(),
+                event: Box::new(other),
+            },
+        });
+    }
+
+    fn approve(&self, call: &ToolCall) -> BoxFuture<'static, bool> {
+        self.inner.approve(&self.call(call))
+    }
 }
 
 /// Ignores events and denies every approval (tests).

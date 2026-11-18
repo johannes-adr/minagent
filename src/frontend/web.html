@@ -64,7 +64,8 @@ body.busy .dot { background: var(--accent); animation: pulse 1.1s ease-in-out in
 body.offline .dot { background: var(--bad); }
 @keyframes pulse { 50% { opacity: .25; } }
 
-#scroll { flex: 1; overflow-y: auto; }
+#row { flex: 1; min-height: 0; display: flex; }
+#scroll { flex: 1; min-width: 0; overflow-y: auto; }
 #chat { max-width: 800px; margin: 0 auto; padding: 24px 20px 12px; display: flex; flex-direction: column; gap: 16px; }
 #empty { color: var(--muted); text-align: center; margin-top: 18vh; }
 #empty b { display: block; font-size: 18px; color: var(--text); margin-bottom: 4px; }
@@ -72,9 +73,19 @@ body.offline .dot { background: var(--bad); }
 .user { align-self: flex-end; max-width: 85%; background: var(--user); padding: 8px 14px; border-radius: 14px 14px 4px 14px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .assistant { overflow-wrap: anywhere; }
 .assistant > :first-child { margin-top: 0; } .assistant > :last-child { margin-bottom: 0; }
-.assistant h1, .assistant h2, .assistant h3, .assistant h4 { margin: 1.1em 0 .4em; line-height: 1.3; }
-.assistant h1 { font-size: 1.35em; } .assistant h2 { font-size: 1.2em; } .assistant h3, .assistant h4 { font-size: 1.05em; }
+.assistant h1, .assistant h2, .assistant h3, .assistant h4, .assistant h5, .assistant h6 { margin: 1.1em 0 .4em; line-height: 1.3; }
+.assistant h1 { font-size: 1.35em; } .assistant h2 { font-size: 1.2em; } .assistant h3, .assistant h4 { font-size: 1.05em; } .assistant h5, .assistant h6 { font-size: 1em; }
+.assistant h6 { color: var(--muted); }
 .assistant p { margin: .6em 0; } .assistant ul, .assistant ol { margin: .6em 0; padding-left: 1.5em; }
+.assistant li > ul, .assistant li > ol, .assistant li > .code, .assistant li > p { margin: .25em 0; }
+.assistant li.task { list-style: none; margin-left: -1.2em; } .assistant li.task input { margin-right: 6px; }
+.assistant del { color: var(--muted); }
+.table-wrap { overflow-x: auto; margin: .7em 0; }
+.assistant table { border-collapse: collapse; font-size: 14px; }
+.assistant th, .assistant td { border: 1px solid var(--border); padding: 5px 10px; vertical-align: top; }
+.assistant th { background: var(--surface); text-align: left; }
+.lang { position: absolute; top: 6px; left: 12px; font: 11px var(--mono); color: var(--muted); }
+.code:has(.lang) pre { padding-top: 26px; }
 .assistant blockquote { margin: .6em 0; padding: 0 12px; border-left: 3px solid var(--border); color: var(--muted); }
 .assistant hr { border: 0; border-top: 1px solid var(--border); }
 .assistant a { color: var(--accent); }
@@ -85,6 +96,37 @@ pre { margin: 0; padding: 10px 12px; background: var(--code); border: 1px solid 
 pre code { background: none; padding: 0; font: inherit; }
 .copy { position: absolute; top: 6px; right: 6px; font: 12px inherit; padding: 2px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--muted); cursor: pointer; opacity: 0; transition: opacity .15s; }
 .code:hover .copy { opacity: 1; }
+
+#side { display: none; flex-direction: column; width: min(460px, 45vw); border-left: 1px solid var(--border); background: var(--surface); min-height: 0; }
+body.hassub:not(.sidehidden) #side { display: flex; }
+#side-head { display: flex; align-items: center; justify-content: space-between; padding: 8px 12px; border-bottom: 1px solid var(--border); font-weight: 600; font-size: 13px; }
+#side-head button { border: 0; background: none; color: var(--muted); padding: 2px 6px; }
+#side-tabs { display: flex; gap: 4px; padding: 6px 8px 0; overflow-x: auto; border-bottom: 1px solid var(--border); }
+.subtab { display: flex; align-items: center; gap: 6px; max-width: 180px; padding: 5px 10px; border: 1px solid transparent; border-bottom: 0; border-radius: 8px 8px 0 0; background: none; color: var(--muted); font-size: 12px; }
+.subtab span.t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.subtab.active { background: var(--bg); border-color: var(--border); color: var(--text); margin-bottom: -1px; }
+.subtab i { flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
+.subtab[data-status=done] i { background: var(--ok); animation: none; }
+.subtab[data-status=failed] i, .subtab[data-status=cancelled] i { background: var(--bad); animation: none; }
+#side-panes { flex: 1; min-height: 0; position: relative; background: var(--bg); }
+.subpane { display: none; position: absolute; inset: 0; overflow-y: auto; padding: 14px 14px 20px; }
+.subpane.active { display: block; }
+.subchat { display: flex; flex-direction: column; gap: 12px; margin-top: 12px; }
+.subtask { font-size: 13px; color: var(--muted); }
+.subtask summary { cursor: pointer; color: var(--text); font-weight: 600; }
+.subtask pre { margin-top: 6px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; max-height: 240px; overflow: auto; }
+@media (max-width: 800px) {
+  #row { flex-direction: column; }
+  #side { width: auto; height: 50%; border-left: 0; border-top: 1px solid var(--border); }
+}
+
+.reasoning { border: 1px solid var(--border); border-radius: 10px; font-size: 13px; color: var(--muted); }
+.reasoning > summary { cursor: pointer; padding: 6px 12px; list-style: none; }
+.reasoning > summary::-webkit-details-marker { display: none; }
+.reasoning > summary::before { content: "▸ "; font-size: 11px; }
+.reasoning[open] > summary::before { content: "▾ "; }
+.reasoning[data-live] > summary::after { content: " …"; }
+.reasoning > div { padding: 0 12px 10px; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 360px; overflow-y: auto; font-style: italic; }
 
 .note { color: var(--muted); font-size: 13px; font-style: italic; }
 .error { border: 1px solid var(--bad); color: var(--bad); border-radius: 8px; padding: 8px 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -138,7 +180,14 @@ body.busy #send { display: none; } body.busy #stop { display: block; }
   <div id="context" hidden><span class="meter"><span></span></span><span id="context-text"></span></div>
   <div id="state"><span class="dot"></span><span id="state-text">Connecting…</span></div>
 </header>
-<div id="scroll"><div id="chat"><div id="empty"><b>How can I help?</b>Ask something, or give the agent a task.</div></div></div>
+<div id="row">
+  <div id="scroll"><div id="chat"><div id="empty"><b>How can I help?</b>Ask something, or give the agent a task.</div></div></div>
+  <aside id="side">
+    <div id="side-head"><span>Subagents</span><button id="side-close" title="Hide">✕</button></div>
+    <div id="side-tabs"></div>
+    <div id="side-panes"></div>
+  </aside>
+</div>
 <footer>
   <div id="composer">
     <textarea id="input" rows="1" placeholder="Message the agent…" autofocus></textarea>
@@ -162,67 +211,220 @@ const post = (path, body) => fetch(path, {
   method: "POST", headers: {"content-type": "application/json", "x-token": token}, body: JSON.stringify(body || {}),
 });
 
-// ---- Markdown (small subset; everything is escaped first) ----
+// ---- Markdown (CommonMark/GFM subset; all text is escaped first, links are limited to http(s)/mailto) ----
 const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
-function inline(text) {
-  const codes = [];
-  let s = esc(text).replace(/`([^`]+)`/g, (_, c) => { codes.push(c); return `\u0001${codes.length - 1}\u0001`; });
-  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-       .replace(/(^|[^*\w])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>")
-       .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-  return s.replace(/\u0001(\d+)\u0001/g, (_, i) => `<code>${codes[i]}</code>`);
-}
-function markdown(source) {
-  const fences = [];
-  // An unfinished fence (still streaming) counts as closed at the end of the text.
-  source = source.replace(/^```[^\n]*\n([\s\S]*?)(?:^```|$(?![\s\S]))/gm, (_, code) => {
-    fences.push(`<div class="code"><button class="copy">Copy</button><pre><code>${esc(code.replace(/\n$/, ""))}</code></pre></div>`);
-    return `\u0000${fences.length - 1}\u0000`;
-  });
-  const out = [];
-  let list = null, para = [];
-  const endPara = () => { if (para.length) { out.push(`<p>${inline(para.join("\n"))}</p>`); para = []; } };
-  const endList = () => { if (list) { out.push(`<${list.tag}>${list.items.map((i) => `<li>${inline(i)}</li>`).join("")}</${list.tag}>`); list = null; } };
-  for (const line of source.split("\n")) {
-    let m;
-    if ((m = line.match(/^\u0000(\d+)\u0000$/))) { endPara(); endList(); out.push(fences[m[1]]); }
-    else if ((m = line.match(/^(#{1,4})\s+(.*)/))) { endPara(); endList(); out.push(`<h${m[1].length}>${inline(m[2])}</h${m[1].length}>`); }
-    else if ((m = line.match(/^\s*([-*]|\d+\.)\s+(.*)/))) {
-      endPara();
-      const tag = /\d/.test(m[1]) ? "ol" : "ul";
-      if (list && list.tag !== tag) endList();
-      (list ??= {tag, items: []}).items.push(m[2]);
-    }
-    else if ((m = line.match(/^>\s?(.*)/))) { endPara(); endList(); out.push(`<blockquote>${inline(m[1])}</blockquote>`); }
-    else if (/^\s*(---|\*\*\*)\s*$/.test(line)) { endPara(); endList(); out.push("<hr>"); }
-    else if (!line.trim()) { endPara(); endList(); }
-    else { endList(); para.push(line); }
-  }
-  endPara(); endList();
-  return out.join("");
+const SAFE_URL = /^(https?:\/\/|mailto:)/i;
+const link = (url, html) => `<a href="${url}" target="_blank" rel="noopener noreferrer">${html}</a>`;
+function inline(src) {
+  const slots = [];
+  const hold = (html) => `\u0001${slots.push(html) - 1}\u0001`;
+  let s = src.replace(/\u0001/g, "");
+  // Code spans and escapes first: nothing inside them is formatted.
+  s = s.replace(/(`+)(?!`)([\s\S]*?[^`])\1(?!`)/g, (_, __, code) => hold(`<code>${esc(code.replace(/^ (.*[^ ].*) $/s, "$1"))}</code>`));
+  s = s.replace(/\\([\\`*_{}\[\]()#+\-.!~|<>])/g, (_, c) => hold(esc(c)));
+  // Links. Images are shown as links: loading a URL the model wrote would let it phone home.
+  s = s.replace(/<((?:https?:\/\/|mailto:)[^\s<>]+)>/gi, (_, url) => hold(link(esc(url), esc(url))));
+  const target = String.raw`\(\s*<?((?:[^\s()<>]|\([^\s()]*\))*)>?(?:\s+"[^"]*")?\s*\)`;
+  s = s.replace(new RegExp(String.raw`!\[([^\]]*)\]` + target, "g"), (_, alt, url) =>
+    SAFE_URL.test(url) ? hold(link(esc(url), esc(alt || url))) : hold(esc(alt)));
+  s = s.replace(new RegExp(String.raw`\[((?:[^\[\]]|\[[^\]]*\])+)\]` + target, "g"), (_, text, url) =>
+    SAFE_URL.test(url) ? hold(link(esc(url), inline(text))) : hold(inline(text)));
+  s = esc(s);
+  s = s.replace(/(^|[\s(])(https?:\/\/[^\s<]*[^\s<.,;:!?)\]'"])/g, (_, before, url) => before + hold(link(url, url)));
+  s = s.replace(/\*\*\*(?=\S)([\s\S]*?\S)\*\*\*/g, "<strong><em>$1</em></strong>")
+       .replace(/\*\*(?=\S)([\s\S]*?\S)\*\*/g, "<strong>$1</strong>")
+       .replace(/(^|[^\w])__(?=\S)([\s\S]*?\S)__(?!\w)/g, "$1<strong>$2</strong>")
+       .replace(/(^|[^\w*])\*(?=[^\s*])([^*]*?[^\s*])\*(?![\w*])/g, "$1<em>$2</em>")
+       .replace(/(^|[^\w])_(?=[^\s_])([^_]*?[^\s_])_(?![\w])/g, "$1<em>$2</em>")
+       .replace(/~~(?=\S)([\s\S]*?\S)~~/g, "<del>$1</del>")
+       .replace(/( {2,}|\\)\n/g, "<br>");
+  while (/\u0001\d+\u0001/.test(s)) s = s.replace(/\u0001(\d+)\u0001/g, (_, i) => slots[i]);
+  return s;
 }
 
-// ---- Transcript ----
-let assistant = null;   // the answer block text is currently streaming into
-let tools = new Map();  // tool call id -> {el, data}
-let pinned = true;      // follow new output while the user is at the bottom
-scroller.addEventListener("scroll", () => {
-  pinned = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
-});
-let scrollQueued = false;
-function follow() {
-  if (!pinned || scrollQueued) return;
-  scrollQueued = true;
-  requestAnimationFrame(() => { scrollQueued = false; scroller.scrollTop = scroller.scrollHeight; });
+const FENCE = /^(\s*)(`{3,}|~{3,})\s*([^\s`]*)[^`]*$/;
+const HEADING = /^ {0,3}(#{1,6})\s+(.*?)(?:\s+#+)?\s*$/;
+const RULE = /^ {0,3}([-*_])(?:\s*\1){2,}\s*$/;
+const QUOTE = /^ {0,3}>/;
+const ITEM = /^(\s*)([-*+]|\d{1,9}[.)])(?:\s+(.*)|$)/;
+const TABLE_SEP = /^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?\s*$/;
+const blank = (line) => !line.trim();
+const startsBlock = (line) => FENCE.test(line) || HEADING.test(line) || RULE.test(line) || QUOTE.test(line) || ITEM.test(line);
+
+function codeBlock(code, lang) {
+  return `<div class="code"><button class="copy">Copy</button>${lang ? `<span class="lang">${esc(lang)}</span>` : ""}<pre><code>${esc(code)}</code></pre></div>`;
 }
-function add(className, text) {
-  $("empty")?.remove();
-  const el = document.createElement("div");
+const cells = (line) => line.trim().replace(/^\||\|$/g, "").split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, "|"));
+
+function table(lines, i) {
+  const head = cells(lines[i]);
+  const align = cells(lines[i + 1]).map((c) => (/^:-+:$/.test(c) ? "center" : /-:$/.test(c) ? "right" : /^:-/.test(c) ? "left" : ""));
+  const cell = (tag, text, n) => `<${tag}${align[n] ? ` style="text-align:${align[n]}"` : ""}>${inline(text)}</${tag}>`;
+  let html = `<div class="table-wrap"><table><thead><tr>${head.map((c, n) => cell("th", c, n)).join("")}</tr></thead>`;
+  const rows = [];
+  for (i += 2; i < lines.length && !blank(lines[i]) && lines[i].includes("|") && !startsBlock(lines[i]); i++) {
+    const row = cells(lines[i]);
+    rows.push(`<tr>${head.map((_, n) => cell("td", row[n] ?? "", n)).join("")}</tr>`);
+  }
+  return [html + (rows.length ? `<tbody>${rows.join("")}</tbody>` : "") + "</table></div>", i];
+}
+
+function list(lines, i) {
+  const first = lines[i].match(ITEM);
+  const base = first[1].length, ordered = /\d/.test(first[2]);
+  const start = ordered ? parseInt(first[2], 10) : 1;
+  const items = [];
+  let loose = false;
+  while (i < lines.length) {
+    const m = lines[i].match(ITEM);
+    // A sibling is a marker of the same kind that is not indented into the current item.
+    if (!m || m[1].length > base + 1 || /\d/.test(m[2]) !== ordered) break;
+    const content = m[1].length + m[2].length + 1;
+    const body = [m[3] ?? ""];
+    i++;
+    for (; i < lines.length; i++) {
+      const line = lines[i];
+      if (blank(line)) {
+        let j = i;
+        while (j < lines.length && blank(lines[j])) j++;
+        if (j < lines.length && lines[j].match(/^\s*/)[0].length > base + 1) { body.push(""); continue; }
+        // A blank line before the next item of this list makes the list loose.
+        const next = j < lines.length && lines[j].match(ITEM);
+        if (next && next[1].length <= base + 1 && /\d/.test(next[2]) === ordered) loose = true;
+        i = j; break;
+      }
+      const indent = line.match(/^\s*/)[0].length;
+      if (indent > base + 1) body.push(line.slice(Math.min(indent, content)));
+      else if (!startsBlock(line) && !blank(body[body.length - 1])) body.push(line.trim()); // lazy continuation
+      else break;
+    }
+    while (body.length && blank(body[body.length - 1])) body.pop();
+    items.push(body);
+    if (i < lines.length && !ITEM.test(lines[i])) break;
+  }
+  const html = items.map((body) => {
+    let task = "";
+    const t = body[0].match(/^\[([ xX])\]\s+(.*)/);
+    if (t) { task = `<input type="checkbox" disabled${t[1] === " " ? "" : " checked"}> `; body[0] = t[2]; }
+    let inner = blocks(body);
+    if (!loose) inner = inner.replace(/^<p>([\s\S]*?)<\/p>/, "$1");
+    else if (task) inner = inner.replace(/^<p>/, "<p>" + task), task = "";
+    return `<li${t ? ' class="task"' : ""}>${task}${inner}</li>`;
+  }).join("");
+  const tag = ordered ? "ol" : "ul";
+  return [`<${tag}${ordered && start !== 1 ? ` start="${start}"` : ""}>${html}</${tag}>`, i];
+}
+
+function blocks(lines) {
+  const out = [];
+  let i = 0, m;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (blank(line)) { i++; continue; }
+    if ((m = line.match(FENCE))) {
+      const [, indent, fence, lang] = m;
+      const close = new RegExp(`^\\s*${fence[0]}{${fence.length},}\\s*$`);
+      const body = [];
+      for (i++; i < lines.length && !close.test(lines[i]); i++) body.push(lines[i].startsWith(indent) ? lines[i].slice(indent.length) : lines[i].trimStart());
+      i++; // the closing fence; a block still streaming has none and runs to the end
+      out.push(codeBlock(body.join("\n"), lang));
+    } else if ((m = line.match(HEADING))) {
+      out.push(`<h${m[1].length}>${inline(m[2])}</h${m[1].length}>`); i++;
+    } else if (RULE.test(line)) {
+      out.push("<hr>"); i++;
+    } else if (QUOTE.test(line)) {
+      const body = [];
+      for (; i < lines.length && !blank(lines[i]) && (QUOTE.test(lines[i]) || body.length); i++) body.push(lines[i].replace(/^ {0,3}>\s?/, ""));
+      out.push(`<blockquote>${blocks(body)}</blockquote>`);
+    } else if (line.includes("|") && i + 1 < lines.length && TABLE_SEP.test(lines[i + 1]) && lines[i + 1].includes("-") && cells(line).length === cells(lines[i + 1]).length) {
+      const [html, next] = table(lines, i); out.push(html); i = next;
+    } else if (ITEM.test(line)) {
+      const [html, next] = list(lines, i); out.push(html); i = next;
+    } else {
+      const para = [line];
+      for (i++; i < lines.length && !blank(lines[i]) && !startsBlock(lines[i]); i++) para.push(lines[i]);
+      out.push(`<p>${inline(para.join("\n").trim())}</p>`);
+    }
+  }
+  return out.join("");
+}
+function markdown(source) { return blocks(source.replace(/\r\n?/g, "\n").split("\n")); }
+
+// ---- Transcript ----
+// A pane is one transcript: the main chat, or the panel of one subagent.
+const mainPane = {chat, scroller, assistant: null, reasoning: null, pinned: true};
+const panes = new Map();   // subagent id -> pane
+let tools = new Map();     // tool call id -> {el, data}, for all panes
+const watchScroll = (pane) => pane.scroller.addEventListener("scroll", () => {
+  pane.pinned = pane.scroller.scrollHeight - pane.scroller.scrollTop - pane.scroller.clientHeight < 80;
+});
+watchScroll(mainPane);
+const queued = new Set();
+function follow(pane = mainPane) {
+  if (!pane.pinned || queued.has(pane)) return;
+  queued.add(pane);
+  requestAnimationFrame(() => { queued.delete(pane); pane.scroller.scrollTop = pane.scroller.scrollHeight; });
+}
+function add(className, text, pane = mainPane) {
+  if (pane === mainPane) $("empty")?.remove();
+  const el = document.createElement(className === "reasoning" ? "details" : "div");
   el.className = className;
   if (text !== undefined) el.textContent = text;
-  chat.append(el);
-  follow();
+  pane.chat.append(el);
+  follow(pane);
   return el;
+}
+
+// ---- Subagents: one tab and transcript each, in the side panel ----
+function selectSub(id) {
+  for (const [other, pane] of panes) {
+    pane.tab.classList.toggle("active", other === id);
+    pane.scroller.classList.toggle("active", other === id);
+  }
+}
+function subPane(id) {
+  let pane = panes.get(id);
+  if (pane) return pane;
+  const tab = document.createElement("button");
+  tab.className = "subtab";
+  tab.dataset.status = "running";
+  tab.innerHTML = "<i></i><span class=\"t\"></span>";
+  tab.onclick = () => selectSub(id);
+  const root = document.createElement("div");
+  root.className = "subpane";
+  root.innerHTML = '<details class="subtask"><summary></summary><pre></pre></details><div class="subchat"></div>';
+  $("side-tabs").append(tab);
+  $("side-panes").append(root);
+  pane = {chat: root.querySelector(".subchat"), scroller: root, assistant: null, reasoning: null, pinned: true, tab, root};
+  watchScroll(pane);
+  panes.set(id, pane);
+  return pane;
+}
+function setSubagent(event) {
+  const pane = subPane(event.agent);
+  const fresh = event.description !== undefined;
+  if (fresh) {
+    pane.tab.querySelector(".t").textContent = event.description;
+    pane.tab.title = event.description;
+    pane.root.querySelector("summary").textContent = event.description;
+    pane.root.querySelector("pre").textContent = event.prompt || "";
+    document.body.classList.add("hassub");
+    document.body.classList.remove("sidehidden");
+    selectSub(event.agent);
+  } else if (!pane.tab.classList.contains("active") && ![...panes.values()].some((p) => p.tab.classList.contains("active"))) {
+    selectSub(event.agent);
+  }
+  pane.tab.dataset.status = event.status;
+}
+function resetSubagents() {
+  panes.clear();
+  $("side-tabs").replaceChildren(); $("side-panes").replaceChildren();
+  document.body.classList.remove("hassub", "sidehidden");
+}
+$("side-close").onclick = () => document.body.classList.add("sidehidden");
+// A stopped prompt never reports its subagents as finished.
+function settleSubagents() {
+  for (const pane of panes.values()) if (pane.tab.dataset.status === "running") pane.tab.dataset.status = "cancelled";
 }
 
 let renderQueued = false;
@@ -231,11 +433,11 @@ function renderAssistant() {
   renderQueued = true;
   requestAnimationFrame(() => {
     renderQueued = false;
-    for (const el of chat.querySelectorAll(".assistant[data-dirty]")) {
+    for (const el of document.querySelectorAll(".assistant[data-dirty]")) {
       el.innerHTML = markdown(el.dataset.raw);
       delete el.dataset.dirty;
     }
-    follow();
+    for (const pane of [mainPane, ...panes.values()]) follow(pane);
   });
 }
 
@@ -293,14 +495,14 @@ function upsertTool(event) {
     const el = document.createElement("details");
     el.className = "tool";
     el.innerHTML = '<summary><span class="kind"></span><span class="title"></span><span class="chip"><span></span></span></summary><div class="body"></div>';
-    chat.append(el);
+    paneOf(event.agent).chat.append(el);
     tool = {el, data: {}, touched: false};
     el.querySelector("summary").addEventListener("click", () => { tool.touched = true; });
     tools.set(event.id, tool);
   }
   Object.assign(tool.data, event);
   renderTool(tool);
-  follow();
+  follow(paneOf(event.agent));
 }
 
 function setBusy(busy) {
@@ -323,40 +525,77 @@ function setContext(event) {
 }
 
 // The levels the model offers for thinking (from Ollama); the slider is hidden if there are none.
-let thinkingLevels = [];
+let thinkingLevels = [], thinkingState = null;
 function setThinking(event) {
-  thinkingLevels = event.levels;
+  thinkingLevels = event.levels; thinkingState = event;
   const slider = $("thinking-slider");
   slider.max = thinkingLevels.length - 1;
-  slider.value = Math.max(0, thinkingLevels.indexOf(event.current));
-  $("thinking-level").textContent = event.current + (event.current === event.default ? " (default)" : "");
+  if (!dragging) {
+    slider.value = Math.max(0, thinkingLevels.indexOf(event.current));
+    $("thinking-level").textContent = event.current + (event.current === event.default ? " (default)" : "");
+  }
   $("thinking").hidden = false;
 }
+// While dragging only the label follows; the level is sent on release. Each level sent
+// while dragging came back from the server and moved the slider under the finger.
+let dragging = false;
 $("thinking-slider").addEventListener("input", (e) => {
-  const level = thinkingLevels[e.target.value];
-  $("thinking-level").textContent = level;
-  post("/thinking", {level});
+  dragging = true;
+  $("thinking-level").textContent = thinkingLevels[e.target.value];
+});
+$("thinking-slider").addEventListener("change", async (e) => {
+  await post("/thinking", {level: thinkingLevels[e.target.value]});
+  dragging = false;
+  if (thinkingState) setThinking(thinkingState); // the server's answer may have come while dragging
 });
 
+function endReasoning(pane) {
+  const el = pane.reasoning;
+  pane.reasoning = null;
+  delete el.dataset.live;
+  if (!el.touched) el.open = false;
+}
+
+// The pane an event belongs to: events of a subagent carry its id.
+const paneOf = (agent) => (agent ? subPane(agent) : mainPane);
+
 function handle(event) {
-  if (event.type !== "text" && event.type !== "context" && event.type !== "thinking") assistant = null;
+  const pane = paneOf(event.agent);
+  if (!["text", "context", "thinking", "subagent", "reasoning"].includes(event.type)) pane.assistant = null;
+  // The reasoning block folds away once the model moves on to its answer or a tool call.
+  if (pane.reasoning && !["reasoning", "context", "thinking", "subagent"].includes(event.type)) endReasoning(pane);
   switch (event.type) {
     case "user": add("user", event.text); break;
     case "text":
-      if (!assistant) assistant = add("assistant");
-      assistant.dataset.raw = (assistant.dataset.raw || "") + event.text;
-      assistant.dataset.dirty = "1";
+      if (!pane.assistant) pane.assistant = add("assistant", undefined, pane);
+      pane.assistant.dataset.raw = (pane.assistant.dataset.raw || "") + event.text;
+      pane.assistant.dataset.dirty = "1";
       renderAssistant();
       break;
-    case "note": add("note", event.text); break;
+    case "reasoning": {
+      if (!pane.reasoning) {
+        pane.reasoning = add("reasoning", undefined, pane);
+        pane.reasoning.dataset.live = "1"; pane.reasoning.open = true; pane.reasoning.touched = false;
+        pane.reasoning.innerHTML = "<summary>Thinking</summary><div></div>";
+        pane.reasoning.querySelector("summary").addEventListener("click", () => { pane.reasoning && (pane.reasoning.touched = true); });
+      }
+      const body = pane.reasoning.querySelector("div");
+      body.textContent += event.text;
+      body.scrollTop = body.scrollHeight;
+      follow(pane);
+      break;
+    }
+    case "note": add("note", event.text, pane); break;
     case "error": add("error", event.text); break;
+    case "subagent": setSubagent(event); break;
     case "tool": upsertTool(event); break;
-    case "status": setBusy(event.busy); break;
+    case "status": setBusy(event.busy); if (!event.busy) settleSubagents(); break;
     case "context": setContext(event); break;
     case "thinking": setThinking(event); break;
     case "session":
       // Another session is shown: start its transcript over.
-      chat.replaceChildren(); tools = new Map(); pinned = true;
+      chat.replaceChildren(); tools = new Map(); mainPane.pinned = true; mainPane.assistant = null; mainPane.reasoning = null;
+      resetSubagents();
       $("context").hidden = true; currentSession = event.id;
       loadSessions();
       break;
@@ -412,7 +651,8 @@ function connect() {
   const source = new EventSource(`/events?token=${encodeURIComponent(token)}`);
   source.onopen = () => {
     document.body.classList.remove("offline");
-    chat.replaceChildren(); tools = new Map(); assistant = null; pinned = true;
+    chat.replaceChildren(); tools = new Map(); mainPane.assistant = null; mainPane.reasoning = null; mainPane.pinned = true;
+    resetSubagents();
     setBusy(false); $("context").hidden = true;
   };
   source.onmessage = (message) => handle(JSON.parse(message.data));
@@ -430,7 +670,7 @@ async function send() {
   const text = input.value.trim();
   if (!text || document.body.classList.contains("busy")) return;
   const response = await post("/prompt", {text});
-  if (response.status === 202) { input.value = ""; fit(); sendState(); pinned = true; }
+  if (response.status === 202) { input.value = ""; fit(); sendState(); mainPane.pinned = true; }
   else if (response.status === 409) add("note", "The agent is still working on the previous message.");
   else add("error", `Could not send (HTTP ${response.status})`);
 }
@@ -442,7 +682,7 @@ input.addEventListener("keydown", (e) => {
 });
 $("send").onclick = send;
 $("stop").onclick = () => post("/cancel");
-chat.addEventListener("click", (e) => {
+document.addEventListener("click", (e) => {
   if (!e.target.classList.contains("copy")) return;
   navigator.clipboard?.writeText(e.target.parentElement.querySelector("pre").innerText);
   e.target.textContent = "Copied";

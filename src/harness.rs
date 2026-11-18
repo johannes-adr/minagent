@@ -277,6 +277,7 @@ impl Approve {
             title: approval.title,
             ask: approval.ask,
             args: serde_json::from_str(args).unwrap_or_else(|_| Value::String(args.to_owned())),
+            agent: None,
         }
     }
 }
@@ -368,6 +369,14 @@ pub async fn run_stream(
             })) => {
                 if let Some(report) = &report {
                     report.frontend.emit(Event::Text(text));
+                }
+            }
+            MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Reasoning {
+                text,
+                ..
+            })) => {
+                if let Some(report) = &report {
+                    report.frontend.emit(Event::Reasoning(text));
                 }
             }
             MultiTurnStreamItem::CompletionCall(call) => {
@@ -579,7 +588,11 @@ mod tests {
                         Some(format!("finished {id} {failed}"))
                     }
                     Event::Text(t) => Some(t.clone()),
-                    Event::Context(_) => None,
+                    Event::Reasoning(_) => None,
+                    Event::Context(_)
+                    | Event::SubagentStarted { .. }
+                    | Event::SubagentFinished { .. }
+                    | Event::Sub { .. } => None,
                 })
                 .collect();
             let ask = "ask execute: echo hi".to_string();

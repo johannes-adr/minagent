@@ -125,6 +125,10 @@ impl Frontend for AcpFrontend {
                 "sessionUpdate": "agent_message_chunk",
                 "content": {"type": "text", "text": text},
             })),
+            Event::Reasoning(text) => self.update(json!({
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": text},
+            })),
             Event::Note(text) => self.update(json!({
                 "sessionUpdate": "agent_thought_chunk",
                 "content": {"type": "text", "text": format!("{text}\n")},
@@ -157,6 +161,12 @@ impl Frontend for AcpFrontend {
                 "status": if failed { "failed" } else { "completed" },
                 "content": [text_content(&output)],
             })),
+            Event::Sub { event, .. } => {
+                if let Event::Note(text) = *event {
+                    self.emit(Event::Note(text));
+                }
+            }
+            Event::SubagentStarted { .. } | Event::SubagentFinished { .. } => {}
             Event::Context(usage) => {
                 if let Some(size) = usage.window {
                     self.update(json!({
