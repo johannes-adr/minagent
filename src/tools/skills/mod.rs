@@ -16,11 +16,27 @@ use std::path::{Path, PathBuf};
 /// Skills directory, relative to the working directory.
 pub const DIR: &str = "skills";
 
+/// Embeds `builtin_skills/<path>` as `(path, contents)`.
+macro_rules! builtin {
+    ($path:literal) => {
+        (
+            $path,
+            include_str!(concat!("../../../builtin_skills/", $path)),
+        )
+    };
+}
+
 /// Files of the embedded skills: (path below [`DIR`], contents).
-const BUILTIN: &[(&str, &str)] = &[(
-    "creating-skills/SKILL.md",
-    include_str!("../../../builtin_skills/creating-skills/SKILL.md"),
-)];
+const BUILTIN: &[(&str, &str)] = &[
+    builtin!("creating-skills/SKILL.md"),
+    builtin!("paperless/SKILL.md"),
+    builtin!("paperless/scripts/paperless.js"),
+    builtin!("paperless/references/search.md"),
+    builtin!("paperless/references/editing.md"),
+    builtin!("paperless/references/recipes.md"),
+    builtin!("paperless/references/automation.md"),
+    builtin!("paperless/references/rest-api.md"),
+];
 
 /// Built-in skills of older versions; their directories are removed on startup.
 const REMOVED_BUILTIN: &[&str] = &["using-skills"];
@@ -56,7 +72,8 @@ impl Skills {
             "\n\n# Skills\n\nSkills are task-specific instructions. If a task clearly matches a \
              skill's description, call `use_skill` with its name before doing anything else, then \
              follow the returned instructions. Load each skill at most once per conversation, and \
-             only skills listed here.\n\n<available_skills>\n",
+             only skills listed here. When the instructions name a document for a subtopic, load \
+             it with `use_skill` and `file` once the task needs it.\n\n<available_skills>\n",
         );
         for skill in &self.skills {
             let _ = write!(
@@ -251,7 +268,10 @@ mod tests {
         let skills = Skills::load(&dir).unwrap();
         assert!(skills.warnings.is_empty(), "{:?}", skills.warnings);
         let names: Vec<_> = skills.skills.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["creating-skills"]);
+        assert_eq!(names, ["creating-skills", "paperless"]);
+        for (path, _) in BUILTIN {
+            assert!(dir.join(path).is_file(), "{path}");
+        }
         let prompt = skills.prompt();
         assert!(prompt.contains("<name>creating-skills</name>"), "{prompt}");
         assert!(prompt.contains("call `use_skill`"), "{prompt}");
@@ -276,7 +296,7 @@ mod tests {
         let skills = Skills::load(&dir).unwrap();
         assert!(!dir.join("using-skills").exists());
         let names: Vec<_> = skills.skills.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["creating-skills"]);
+        assert_eq!(names, ["creating-skills", "paperless"]);
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -18,7 +18,7 @@ give them. A fresh runtime per call has exactly these globals:
 | Global | What it can do |
 |---|---|
 | `console.log/info/warn/error` | Output; `log`/`info` go to stdout, `warn`/`error` to stderr |
-| `fetch(url, { method, headers, body, secret })` | HTTP to the hosts declared in the call's `hosts` argument only |
+| `fetch(url, { method, headers, body, secret, form, saveTo })` | HTTP to the hosts declared in the call's `hosts` argument only; `form` sends multipart/form-data (files from `work/`), `saveTo` writes a successful response body to a file in `work/` (binary-safe) |
 | `fs.readText/writeText/list/exists(path)` | Files inside `work/` (a subdirectory of the harness's directory) only, never `.env*`. `readText`/`list`/`exists` also accept `skill:<name>/<path>` (files of a skill, read-only) |
 | `import ... from "skill:<name>/<path>.js"` | ES modules shipped by skills, read-only (see below) |
 | `runScript(path, args)` | Runs a script saved in `work/` in-process (an async function body that sees `args`); no process is started |
@@ -89,10 +89,15 @@ const template = fs.readText("skill:github/assets/template.md");
 ## Security rules
 
 - **Network:**
-  - Only `https://` is allowed, plus `http://` for `localhost` and `127.0.0.1`.
+  - Only `https://` is allowed, plus `http://` for `localhost`, `127.0.0.1`,
+    `host.docker.internal` and `host.containers.internal` (this machine, also from a container).
   - The host must be one of the call's declared `hosts`.
   - Redirects are not followed.
-  - Responses are limited to 10 MB.
+  - Responses are limited to 10 MB; responses saved with `saveTo` and files sent in a `form`
+    to 100 MB.
+  - `form` files and `saveTo` targets go through the same path confinement as `fs` (`saveTo`
+    never writes to `skill:` paths). An error response (not 2xx) is returned as text instead of
+    saved.
 - **Secrets:**
   - Configured in `.env` as `AGENT_SECRET_<NAME>=<host> <header value>`.
   - `fetch(url, { secret: "name" })` makes the Rust side set the `Authorization` header,

@@ -27,22 +27,29 @@
   const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
   globalThis.runScript = (path, args = []) => new AsyncFunction("args", fs.readText(path))(args);
 
+  // `form` values: string, number, boolean, { file, filename?, type? } (a file in `work`)
+  // or an array of those. `saveTo` writes a successful response body to a file in `work`.
   globalThis.fetch = async function fetch(url, options = {}) {
     const headers = {};
     for (const [name, value] of Object.entries(options.headers ?? {})) headers[name] = String(value);
     const raw = JSON.parse(
       native.fetch(
         String(url),
-        String(options.method ?? "GET"),
-        JSON.stringify(headers),
-        options.body == null ? null : String(options.body),
-        options.secret == null ? null : String(options.secret),
+        JSON.stringify({
+          method: String(options.method ?? "GET"),
+          headers,
+          body: options.body == null ? null : String(options.body),
+          secret: options.secret == null ? null : String(options.secret),
+          form: options.form ?? null,
+          saveTo: options.saveTo == null ? null : String(options.saveTo),
+        }),
       ),
     );
     return {
       status: raw.status,
       ok: raw.status >= 200 && raw.status < 300,
       headers: raw.headers,
+      saved: raw.saved,
       text: async () => raw.body,
       json: async () => JSON.parse(raw.body),
     };

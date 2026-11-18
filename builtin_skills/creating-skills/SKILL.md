@@ -40,9 +40,10 @@ skills/<skill-name>/
      requirements), `metadata` (string key/value map).
 3. Write the body as instructions for yourself: concrete steps, example inputs and outputs,
    edge cases. Keep it under 500 lines (about 5000 tokens).
-4. Move long material to `references/*.md` and link it relatively
-   (`See [details](references/REFERENCE.md)`), one level deep. Put runnable code in `scripts/`
-   as shell scripts and tell in the body how to run them, e.g.
+4. Move long material to `references/*.md`, one file per subtopic, one level deep. List each
+   file in the body with one line saying when it is needed; the agent then loads it only when a
+   task needs it, with the `use_skill` tool and `file` set to its path (e.g. `references/api.md`).
+   Put runnable code in `scripts/` as shell scripts and tell in the body how to run them, e.g.
    `sh skills/<skill-name>/scripts/run.sh [args]` (script arguments are `$1`, `$2`, ...).
 5. Optionally ship JavaScript modules in `scripts/`, see below.
 6. Check it: call the `use_skill` tool with `name` set to `<skill-name>`. It must return your

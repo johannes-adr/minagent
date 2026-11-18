@@ -80,6 +80,11 @@ pub const VARS: &[Var] = &[
         example: "",
         doc: "execute_javascript: a secret named GITHUB as `<host> <Authorization header value>`, e.g. `api.github.com Bearer ghp_xxx`; scripts use it with fetch(..., {secret: \"GITHUB\"}) and never see the value. Add more as AGENT_SECRET_<NAME>",
     },
+    Var {
+        name: "AGENT_SECRET_PAPERLESS",
+        example: "",
+        doc: "Built-in skill `paperless`: the Paperless-ngx API token (web UI: My Profile) as `<host> Token <token>`, e.g. `paperless.example.com Token 0123abc`. Add the host to AGENT_JS_ALLOWED_HOSTS to skip approvals",
+    },
 ];
 
 /// The `.env.example` contents generated from [`VARS`].

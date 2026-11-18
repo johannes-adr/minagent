@@ -158,16 +158,8 @@ fn install<'js>(ctx: &Ctx<'js>, fetch: Fetch, output: &Rc<RefCell<Output>>) -> R
         "fetch",
         Function::new(
             ctx.clone(),
-            move |ctx: Ctx<'js>,
-                  url: String,
-                  method: String,
-                  headers: String,
-                  body: Option<String>,
-                  secret: Option<String>|
-                  -> Result<String> {
-                fetch
-                    .call(&url, &method, &headers, body, secret.as_deref())
-                    .map_err(|e| throw(&ctx, e))
+            move |ctx: Ctx<'js>, url: String, options: String| -> Result<String> {
+                fetch.call(&url, &options).map_err(|e| throw(&ctx, e))
             },
         ),
     )?;

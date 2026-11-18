@@ -79,9 +79,12 @@ impl ToolPolicy for ExecuteJavascript {
         format!(
             "Use `execute_javascript` for workflow automation: calling APIs and transforming data. \
 The script is an ES module (top-level `await` works) and has only these globals: \
-`console.log/info/warn/error`; `fetch(url, {{method, headers, body, secret}})` returning a promise of \
+`console.log/info/warn/error`; `fetch(url, {{method, headers, body, secret, form, saveTo}})` returning a promise of \
 `{{status, ok, headers, text(), json()}}` (`body` is a string, use `JSON.stringify`; response `headers` is a plain \
-object with lowercase keys; redirects are not followed); the synchronous \
+object with lowercase keys; redirects are not followed). For binary files: `form: {{name: value}}` sends \
+multipart/form-data instead of `body`, where a value is a string, a number, `{{file: \"<path in work>\", filename?, type?}}` \
+(the file's bytes) or an array of those (repeated field); `saveTo: \"<path in work>\"` writes a successful (2xx) \
+response body to that file instead (binary-safe; `text()` is then empty and `saved` is its size in bytes); the synchronous \
 `fs.readText(path)`, `fs.writeText(path, text)`, `fs.list(path)`, `fs.exists(path)`, whose paths are relative \
 to the `work` directory (created on first use; `.env*` files are not accessible), except that the read \
 functions also accept `skill:<name>/<path>` for the files of a skill (read-only, writing fails); and \
@@ -501,5 +504,137 @@ mod tests {
         );
         assert!(!request.contains("bearer fake"), "{request}");
         assert!(request.contains("x-custom: 1\r\n"), "{request}");
+    }
+
+    /// Answers one request with `status` and `body`; returns the raw request, body included.
+    async fn serve_bytes(status: &str, body: Vec<u8>) -> (u16, tokio::task::JoinHandle<Vec<u8>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let status = status.to_owned();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            let header_end = loop {
+                let n = stream.read(&mut buf).await.unwrap();
+                request.extend_from_slice(&buf[..n]);
+                if let Some(i) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break i + 4;
+                }
+            };
+            let head = String::from_utf8_lossy(&request[..header_end]).to_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .map_or(0, |v| v.trim().parse().unwrap());
+            while request.len() < header_end + length {
+                let n = stream.read(&mut buf).await.unwrap();
+                request.extend_from_slice(&buf[..n]);
+            }
+            let head = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+            request
+        });
+        (port, task)
+    }
+
+    /// Bytes that are not valid UTF-8, so a text round trip would corrupt them.
+    const BINARY: &[u8] = b"%PDF-1.4\n\xff\xfe\x00\x80binary\n";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fetch_uploads_a_file_as_multipart_form() {
+        let dir = format!("js_form_test_{}", std::process::id());
+        let on_disk = crate::tools::workdir().join(&dir);
+        std::fs::create_dir_all(&on_disk).unwrap();
+        std::fs::write(on_disk.join("scan.pdf"), BINARY).unwrap();
+        let (port, server) = serve_bytes("200 OK", br#""task-uuid""#.to_vec()).await;
+        let code = format!(
+            r#"
+            const r = await fetch("http://127.0.0.1:{port}/upload/", {{
+                method: "POST",
+                form: {{ title: "Scan", tags: [1, 2], document: {{ file: "{dir}/scan.pdf" }} }},
+            }});
+            console.log(r.status, await r.json());
+        "#
+        );
+        let out = js_with(&code, &["127.0.0.1"], &[], 10).await;
+        let request = server.await.unwrap();
+        let _ = std::fs::remove_dir_all(&on_disk);
+        assert_eq!(out, "ok\nstdout:\n200 task-uuid");
+        let text = String::from_utf8_lossy(&request);
+        assert!(
+            text.contains("content-type: multipart/form-data; boundary="),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "name=\"document\"; filename=\"scan.pdf\"\r\nContent-Type: application/pdf\r\n\r\n"
+            ),
+            "{text}"
+        );
+        assert!(request.windows(BINARY.len()).any(|w| w == BINARY), "{text}");
+        assert_eq!(text.matches("name=\"tags\"").count(), 2, "{text}");
+        assert!(text.contains("name=\"title\"\r\n\r\nScan\r\n"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn form_files_must_be_in_the_working_directory() {
+        for path in ["../Cargo.toml", "/etc/passwd", ".env", "skill:x/../../.env"] {
+            let code = format!(
+                r#"try {{ await fetch("http://127.0.0.1:9/", {{ method: "POST", form: {{ f: {{ file: "{path}" }} }} }}); }}
+                catch (e) {{ console.log("rejected:", e.message); }}"#
+            );
+            let out = js_with(&code, &["127.0.0.1"], &[], 10).await;
+            assert!(out.contains("rejected:"), "{path}: {out}");
+            assert!(!out.contains("[package]"), "{path}: {out}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fetch_saves_a_binary_response_to_a_file() {
+        let dir = format!("js_save_test_{}", std::process::id());
+        let (port, server) = serve_bytes("200 OK", BINARY.to_vec()).await;
+        let code = format!(
+            r#"
+            const r = await fetch("http://127.0.0.1:{port}/doc", {{ saveTo: "{dir}/doc.pdf" }});
+            console.log(r.status, r.saved, JSON.stringify(await r.text()), fs.exists("{dir}/doc.pdf"));
+        "#
+        );
+        let out = js_with(&code, &["127.0.0.1"], &[], 10).await;
+        server.await.unwrap();
+        let on_disk = crate::tools::workdir().join(&dir);
+        let saved = std::fs::read(on_disk.join("doc.pdf"));
+        let _ = std::fs::remove_dir_all(&on_disk);
+        assert_eq!(out, format!("ok\nstdout:\n200 {} \"\" true", BINARY.len()));
+        assert_eq!(saved.unwrap(), BINARY);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_error_response_is_returned_instead_of_saved() {
+        let dir = format!("js_save_error_test_{}", std::process::id());
+        let (port, server) = serve_bytes(
+            "404 Not Found",
+            br#"{"detail":"No Document matches"}"#.to_vec(),
+        )
+        .await;
+        let code = format!(
+            r#"
+            const r = await fetch("http://127.0.0.1:{port}/doc", {{ saveTo: "{dir}/doc.pdf" }});
+            console.log(r.status, r.saved, await r.text(), fs.exists("{dir}/doc.pdf"));
+            try {{ await fetch("http://127.0.0.1:{port}/", {{ saveTo: "skill:x/a" }}); }}
+            catch (e) {{ console.log(e.message); }}
+        "#
+        );
+        let out = js_with(&code, &["127.0.0.1"], &[], 10).await;
+        server.await.unwrap();
+        let _ = std::fs::remove_dir_all(crate::tools::workdir().join(&dir));
+        assert_eq!(
+            out,
+            "ok\nstdout:\n404 undefined {\"detail\":\"No Document matches\"} false\n\"skill:x/a\": skills are read-only"
+        );
     }
 }

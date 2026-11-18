@@ -50,6 +50,15 @@ If the working directory contains an [`AGENTS.md`](https://agents.md), its conte
 - Without the script: `agent --web [addr]` (default `127.0.0.1:8080`). In a container use `agent --web 0.0.0.0:8080` with `-p 127.0.0.1:8080:8080`.
 - The page is a single file without external resources ([`src/frontend/web.html`](src/frontend/web.html)), so it works offline.
 
+## Skills
+
+Skills ([Agent Skills](https://agentskills.io/specification) format) live in `skills/<name>/`. Only their names and descriptions go into the system prompt; the `use_skill` tool loads a skill's `SKILL.md` when a task needs it, and with `file` (e.g. `references/search.md`) a further document the instructions name, so long reference material is only read when needed.
+
+Built-in skills are embedded in the binary from [`builtin_skills/`](builtin_skills) and reinstalled into `skills/` on every start (edit them in `builtin_skills/`):
+
+- `creating-skills`: how to write a new skill.
+- `paperless`: works with a [Paperless-ngx](https://docs.paperless-ngx.com) archive (search and answer from documents, inbox triage, custom fields, bulk edits, upload/download, reports, cleanup) through a JavaScript client for `execute_javascript`. Setup in `.env`: `AGENT_SECRET_PAPERLESS=<host> Token <api token>` and, to skip approvals, the host in `AGENT_JS_ALLOWED_HOSTS`; the agent asks for the URL once and saves it in `work/paperless.json`. Written for Paperless-ngx 3.x (API version 10).
+
 ## `view_image` tool
 
 `view_image(path)` shows a PNG, JPEG, GIF or WebP file (max 5 MiB) to the model, e.g. a screenshot or chart made with `execute`. The type is detected from the file's content, so other files (such as `.env`) are rejected. It is built by default (Cargo feature `image`; opt out with `cargo build --no-default-features --features javascript`). Relative paths are relative to the `work/` directory (a subdirectory of the harness's directory, shared with `execute_javascript`); images inside it (after resolving `..` and symlinks) are shown without asking, and in a container all are; elsewhere each call needs approval, as the file is sent to the model provider.
@@ -67,7 +76,7 @@ cargo build --no-default-features
 The script is an ES module (top-level `await` works) and gets only this API: no `require`/`import`, no npm, no timers, no process or environment access.
 
 - `console.log/info/warn/error`: captured and returned, together with the error if the script throws.
-- `fetch(url, {method, headers, body, secret})`: resolves to `{status, ok, headers, text(), json()}`. Only `https://` (and `http://` for `localhost`/`127.0.0.1`) URLs to hosts in the call's `hosts` argument work; redirects are not followed.
+- `fetch(url, {method, headers, body, secret, form, saveTo})`: resolves to `{status, ok, headers, text(), json()}`. Only `https://` (and `http://` for `localhost`, `127.0.0.1`, `host.docker.internal` and `host.containers.internal`) URLs to hosts in the call's `hosts` argument work; redirects are not followed. For binary files: `form: {title: "x", document: {file: "in/scan.pdf"}}` sends multipart/form-data with the bytes of files in `work/`, and `saveTo: "out/doc.pdf"` writes a successful response body to a file in `work/` instead of returning it (up to 100 MB each).
 - `fs.readText(path)`, `fs.writeText(path, text)`, `fs.list(path)`, `fs.exists(path)`: paths relative to the `work/` directory (a subdirectory of the harness's directory, created on first use); anything outside it (absolute paths, `..`, symlinks) and `.env*` files are rejected.
 
 A script cannot start a process, but it can save another script with `fs.writeText` and run it in-process with arguments using `runScript(path, args)`:

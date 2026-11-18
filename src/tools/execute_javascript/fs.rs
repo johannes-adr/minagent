@@ -69,16 +69,38 @@ pub(super) fn read_text(path: &str) -> Result<String, String> {
     std::fs::read_to_string(resolve_here(path)?).map_err(|e| describe(path, e))
 }
 
-/// Writes `text` to `path`, creating missing parent directories.
-pub(super) fn write_text(path: &str, text: &str) -> Result<(), String> {
+/// The bytes of file `path` (for `fetch` uploads); fails if it is larger than `limit`.
+pub(super) fn read_bytes(path: &str, limit: u64) -> Result<Vec<u8>, String> {
+    let file = resolve_here(path)?;
+    let size = std::fs::metadata(&file)
+        .map_err(|e| describe(path, e))?
+        .len();
+    if size > limit {
+        return Err(format!("{path:?} is larger than {} MB", limit >> 20));
+    }
+    std::fs::read(file).map_err(|e| describe(path, e))
+}
+
+/// Resolves `path` for writing: inside the working directory, never a skill.
+pub(super) fn writable(path: &str) -> Result<PathBuf, String> {
     if path.starts_with(PREFIX) {
         return Err(format!("{path:?}: skills are read-only"));
     }
-    let file = resolve_here(path)?;
+    resolve_here(path)
+}
+
+/// Writes `bytes` to `file` (resolved with [`writable`] from `path`), creating missing
+/// parent directories.
+pub(super) fn write_resolved(file: &Path, path: &str, bytes: &[u8]) -> Result<(), String> {
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent).map_err(|e| describe(path, e))?;
     }
-    std::fs::write(file, text).map_err(|e| describe(path, e))
+    std::fs::write(file, bytes).map_err(|e| describe(path, e))
+}
+
+/// Writes `text` to `path`, creating missing parent directories.
+pub(super) fn write_text(path: &str, text: &str) -> Result<(), String> {
+    write_resolved(&writable(path)?, path, text.as_bytes())
 }
 
 /// The sorted entry names of directory `path`; directories end with `/`.
