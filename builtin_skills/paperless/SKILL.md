@@ -26,10 +26,11 @@ say it too). Raise `timeout_seconds` (max 300) for jobs over many documents.
   Paperless web UI; `<host>` without scheme and port). To run without approval prompts they can
   add the host to `AGENT_JS_ALLOWED_HOSTS`.
 - **URL:** `connect()` reads `work/paperless.json`. If it is missing, ask the user for the
-  URL (e.g. `https://paperless.example.com`), save it with
-  `fs.writeText("paperless.json", JSON.stringify({ url }))`, then connect. Plain `http://` only
-  works for `localhost`, `host.docker.internal` and `host.containers.internal`; other hosts need
-  `https://`.
+  URL as they open Paperless in the browser and save it with
+  `await saveUrl(url)` (also exported; it checks the connection before saving). The saved URL
+  is the user's setting: never change it, its scheme or its port on your own, and never write
+  `paperless.json` with `fs.writeText`. If the connection fails, report the error to the user
+  instead of trying other URLs.
 
 ## The client
 

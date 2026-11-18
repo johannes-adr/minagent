@@ -144,11 +144,31 @@ export function connect(options = {}) {
   if (!url && fs.exists(CONFIG)) url = JSON.parse(fs.readText(CONFIG)).url;
   if (!url) {
     throw new Error(
-      `Paperless URL unknown. Ask the user for it, then save it once with ` +
-        `fs.writeText("${CONFIG}", JSON.stringify({ url: "https://paperless.example.com" })) or pass connect({ url }).`,
+      `Paperless URL unknown. Ask the user for it (exactly as they open Paperless in the browser), ` +
+        `then save it with saveUrl(url), which checks the connection first.`,
     );
   }
   return new Paperless({ ...options, url });
+}
+
+/**
+ * Saves the Paperless URL the user gave to work/paperless.json, after checking that it
+ * connects. An existing, different URL is only replaced with `{ replace: true }`, which needs
+ * the user's explicit request. Returns the result of check().
+ */
+export async function saveUrl(url, { replace = false, ...options } = {}) {
+  url = String(url).trim().replace(/\/+$/, "");
+  const saved = fs.exists(CONFIG) ? JSON.parse(fs.readText(CONFIG)).url : null;
+  if (saved && saved !== url && !replace) {
+    throw new Error(
+      `${CONFIG} already has ${saved}. Do not change it on your own; only if the user asks for ` +
+        `the new URL, call saveUrl(url, { replace: true }).`,
+    );
+  }
+  const check = await new Paperless({ ...options, url }).check();
+  if (!check.ok) throw new Error(`not saved, the connection failed: ${check.error}`);
+  fs.writeText(CONFIG, JSON.stringify({ url }));
+  return check;
 }
 
 export class Paperless {

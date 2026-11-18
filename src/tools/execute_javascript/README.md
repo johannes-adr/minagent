@@ -89,8 +89,8 @@ const template = fs.readText("skill:github/assets/template.md");
 ## Security rules
 
 - **Network:**
-  - Only `https://` is allowed, plus `http://` for `localhost`, `127.0.0.1`,
-    `host.docker.internal` and `host.containers.internal` (this machine, also from a container).
+  - Only `https://` and `http://` are allowed. Over `http://`, requests and secrets go
+    unencrypted.
   - The host must be one of the call's declared `hosts`.
   - Redirects are not followed.
   - Responses are limited to 10 MB; responses saved with `saveTo` and files sent in a `form`

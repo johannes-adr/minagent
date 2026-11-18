@@ -93,7 +93,7 @@ body (no `import`/`export`) that sees `args`, may `await`, and whose `return` va
 Each call starts fresh; only files in `work` persist between calls. There are no \
 timers, no `require`, no npm packages, no `import` except `import {{ f }} from \"skill:<name>/<path>.js\"` of the \
 JavaScript modules a skill documents (read-only; relative imports work inside the skill), no process or environment access and no way to start a process. \
-`fetch` only reaches `https://` hosts you list in \
+`fetch` only reaches `https://` and `http://` URLs of hosts you list in \
 the `hosts` argument (the user must approve hosts that are not pre-approved). \
 `secret: \"NAME\"` makes `fetch` add the `Authorization` header from the configured secret; the script never \
 sees its value, and it only works for the host the secret is bound to. {secrets} \
@@ -222,11 +222,11 @@ mod tests {
 
     async fn js_with(code: &str, hosts: &[&str], secrets: &[(&str, Secret)], secs: u64) -> String {
         let settings = Settings {
-            allowed_hosts: Vec::new(),
             secrets: secrets
                 .iter()
                 .map(|(name, s)| (name.to_string(), secret(&s.host, &s.value)))
                 .collect(),
+            ..Settings::default()
         };
         let hosts = hosts.iter().map(|h| h.to_string()).collect();
         run(

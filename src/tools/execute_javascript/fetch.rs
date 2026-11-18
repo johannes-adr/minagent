@@ -14,14 +14,6 @@ use tokio::runtime::Handle;
 const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 /// Limit for responses saved to a file (`saveTo`) and for files sent in a `form`.
 const MAX_FILE_BYTES: usize = 100 * 1024 * 1024;
-/// Hosts reachable over plain `http://`: this machine, also from inside a container.
-const LOCAL_HOSTS: &[&str] = &[
-    "localhost",
-    "127.0.0.1",
-    "host.docker.internal",
-    "host.containers.internal",
-];
-
 /// The capability behind `fetch` for one script run.
 pub(super) struct Fetch {
     /// Normalized hostnames the script may contact (the `hosts` argument).
@@ -169,14 +161,11 @@ impl Fetch {
     fn authorize(&self, url: &str, secret: Option<&str>) -> Result<(Url, Option<&Secret>), String> {
         let url = Url::parse(url).map_err(|e| format!("invalid URL {url:?}: {e}"))?;
         let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-        let local = LOCAL_HOSTS.contains(&host.as_str());
         match url.scheme() {
-            "https" => {}
-            "http" if local => {}
+            "https" | "http" => {}
             scheme => {
                 return Err(format!(
-                    "{scheme}:// is not allowed; use https:// (http:// only for localhost and \
-                     host.docker.internal/host.containers.internal)"
+                    "{scheme}:// is not allowed; use https:// or http://"
                 ));
             }
         }
@@ -328,8 +317,8 @@ mod tests {
         Fetch {
             hosts: hosts.iter().map(|h| h.to_string()).collect(),
             settings: Arc::new(Settings {
-                allowed_hosts: Vec::new(),
                 secrets,
+                ..Settings::default()
             }),
             deadline: Instant::now() + Duration::from_secs(10),
             handle: tokio::runtime::Builder::new_current_thread()
@@ -341,26 +330,23 @@ mod tests {
     }
 
     #[test]
-    fn only_declared_hosts_over_https_or_localhost_http() {
-        let f = fetch(&["api.example.com", "localhost"], &[]);
+    fn only_declared_hosts_over_http_or_https() {
+        let f = fetch(&["api.example.com", "localhost", "192.168.178.178"], &[]);
         assert!(f.authorize("https://api.example.com/x", None).is_ok());
         assert!(f.authorize("https://API.example.com/x", None).is_ok());
+        assert!(f.authorize("http://api.example.com/x", None).is_ok());
         assert!(f.authorize("http://localhost:8080/x", None).is_ok());
-        let host = fetch(&["host.docker.internal", "host.containers.internal"], &[]);
         assert!(
-            host.authorize("http://host.docker.internal:8000/", None)
-                .is_ok()
-        );
-        assert!(
-            host.authorize("http://host.containers.internal/", None)
+            f.authorize("http://192.168.178.178:8004/api/", None)
                 .is_ok()
         );
         let err = |url| f.authorize(url, None).err().unwrap();
         assert!(err("https://evil.com/").contains("not declared"));
+        assert!(err("http://192.168.178.1/").contains("not declared"));
         assert!(err("https://api.example.com.evil.com/").contains("not declared"));
         assert!(err("https://api.example.com@evil.com/").contains("not declared"));
-        assert!(err("http://api.example.com/").contains("not allowed"));
         assert!(err("file:///etc/passwd").contains("not allowed"));
+        assert!(err("ftp://api.example.com/").contains("not allowed"));
         assert!(err("not a url").contains("invalid URL"));
     }
 
