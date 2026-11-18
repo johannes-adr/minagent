@@ -6,6 +6,7 @@ use base64::engine::general_purpose::STANDARD;
 use rig_agent::rig_tool;
 use rig_core::message::{ImageMediaType, ToolResultContent};
 use rig_core::tool::{ToolExecutionError, ToolOutput};
+use std::path::Path;
 
 /// Largest image file the tool sends (the per-image limit of the strictest provider).
 const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
@@ -33,8 +34,8 @@ async fn load(path: &str) -> Result<ToolOutput, ToolExecutionError> {
     image_output(path, &bytes)
 }
 
-/// The file is read and sent to the model provider, so outside a container the user
-/// must approve it, like `execute`.
+/// The file is sent to the model provider. Images inside the working directory (or any
+/// image in a container) are shown without asking; others need the user's approval.
 impl ToolPolicy for ViewImage {
     const KIND: &'static str = "read";
 
@@ -45,12 +46,28 @@ impl ToolPolicy for ViewImage {
     }
 
     fn approval(args: &ViewImageParameters, context: &Context) -> Approval {
-        if context.isolated {
-            Approval::auto(format!("[isolated] view_image: {}", args.path))
-        } else {
-            Approval::ask(format!("view_image: {}", args.path))
-        }
+        let root = std::env::current_dir().unwrap_or_default();
+        approval_in(&args.path, context, &root)
     }
+}
+
+fn approval_in(path: &str, context: &Context, workdir: &Path) -> Approval {
+    if context.isolated {
+        Approval::auto(format!("[isolated] view_image: {path}"))
+    } else if inside(path, workdir) {
+        Approval::auto(format!("view_image: {path}"))
+    } else {
+        Approval::ask(format!("view_image outside the working directory: {path}"))
+    }
+}
+
+/// Whether `path` (relative to the working directory or absolute) leads to a file inside
+/// `workdir` once `..` and symlinks are resolved. A path that cannot be resolved is not.
+fn inside(path: &str, workdir: &Path) -> bool {
+    let (Ok(file), Ok(root)) = (workdir.join(path).canonicalize(), workdir.canonicalize()) else {
+        return false;
+    };
+    file.starts_with(root)
 }
 
 /// `bytes` as an image result, or an error if they are not a supported image.
@@ -104,16 +121,38 @@ mod tests {
         assert!(image_output("x.txt", PNG_1X1).is_ok());
     }
 
+    fn temp(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("agent_view_approval_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("work")).unwrap();
+        dir
+    }
+
+    /// Only images that resolve into the working directory skip the question.
     #[test]
-    fn outside_a_container_the_user_must_approve() {
-        let args = ViewImageParameters {
-            path: "a.png".into(),
-        };
+    fn only_images_outside_the_workdir_need_approval() {
+        let dir = temp("a");
+        let work = dir.join("work");
+        std::fs::write(work.join("in.png"), PNG_1X1).unwrap();
+        std::fs::write(dir.join("out.png"), PNG_1X1).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.join("out.png"), work.join("link.png")).unwrap();
+        let host = Context { isolated: false };
+        let ask = |p: &str| approval_in(p, &host, &work).ask;
+        assert!(!ask("in.png"));
+        assert!(!ask(work.join("in.png").to_str().unwrap()));
+        assert!(ask("../out.png"));
+        assert!(ask(dir.join("out.png").to_str().unwrap()));
+        #[cfg(unix)]
+        assert!(ask("link.png"));
+        assert!(ask("missing.png"));
+        let in_container = approval_in("../out.png", &Context { isolated: true }, &work);
         assert_eq!(
-            ViewImage::approval(&args, &Context { isolated: false }),
-            Approval::ask("view_image: a.png")
+            in_container,
+            Approval::auto("[isolated] view_image: ../out.png")
         );
-        assert!(!ViewImage::approval(&args, &Context { isolated: true }).ask);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     async fn load_owned(path: String) -> Result<ToolOutput, ToolExecutionError> {
