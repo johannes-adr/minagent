@@ -59,6 +59,11 @@ pub const VARS: &[Var] = &[
         example: "",
         doc: "Ollama token, only for authenticated/proxied daemons",
     },
+    Var {
+        name: "AGENT_TOOLS",
+        example: "",
+        doc: "Comma-separated tools to enable (execute, use_skill, agent); empty enables all",
+    },
 ];
 
 /// The `.env.example` contents generated from [`VARS`].
@@ -110,6 +115,17 @@ impl Config {
     fn required(&self, name: &str) -> Result<&str, String> {
         self.get(name)
             .ok_or_else(|| format!("{name} is not set (in the environment or .env)"))
+    }
+
+    /// The tools listed in `AGENT_TOOLS` (comma separated); `None` means all tools.
+    pub fn tools(&self) -> Option<Vec<String>> {
+        let list: Vec<String> = self
+            .get("AGENT_TOOLS")?
+            .split(',')
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+            .collect();
+        (!list.is_empty()).then_some(list)
     }
 
     pub fn backend(&self) -> Result<Backend, String> {
@@ -188,6 +204,16 @@ mod tests {
         for var in VARS {
             assert!(example.contains(&format!("\n{}=", var.name)), "{example}");
         }
+    }
+
+    #[test]
+    fn tool_list() {
+        assert_eq!(config(&[]).tools(), None);
+        assert_eq!(config(&[("AGENT_TOOLS", " , ")]).tools(), None);
+        assert_eq!(
+            config(&[("AGENT_TOOLS", "execute, agent")]).tools(),
+            Some(vec!["execute".to_owned(), "agent".to_owned()])
+        );
     }
 
     #[test]

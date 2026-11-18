@@ -1,6 +1,6 @@
 //! The `use_skill` tool: loads the full instructions of a skill.
 
-use crate::harness::{Approval, ToolPolicy};
+use crate::harness::{Approval, Context, ToolPolicy};
 use crate::tools::skills;
 use rig_agent::rig_tool;
 use rig_core::tool::ToolExecutionError;
@@ -25,7 +25,12 @@ pub(crate) async fn use_skill(name: String) -> Result<String, ToolExecutionError
 impl ToolPolicy for UseSkill {
     const KIND: &'static str = "read";
 
-    fn approval(args: &UseSkillParameters, _isolated: bool) -> Approval {
+    /// How to load skills and the list of available skills.
+    fn prompt(_context: &Context) -> String {
+        skills::discover(Path::new(skills::DIR)).prompt()
+    }
+
+    fn approval(args: &UseSkillParameters, _context: &Context) -> Approval {
         Approval::auto(format!("[skill] {}", args.name))
     }
 }
@@ -74,7 +79,7 @@ mod tests {
                 name: "demo".into(),
             };
             assert_eq!(
-                UseSkill::approval(&args, isolated),
+                UseSkill::approval(&args, &Context { isolated }),
                 Approval::auto("[skill] demo")
             );
         }

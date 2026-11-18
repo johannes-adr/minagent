@@ -1,6 +1,6 @@
 //! The `execute` tool: runs shell commands.
 
-use crate::harness::{Approval, ToolPolicy};
+use crate::harness::{Approval, Context, ToolPolicy};
 use crate::tools::process::{exit_line, format_output};
 use rig_agent::rig_tool;
 use rig_core::tool::ToolExecutionError;
@@ -16,8 +16,17 @@ const EXECUTE_MAX_TIMEOUT_SECS: u64 = 600;
 impl ToolPolicy for Execute {
     const KIND: &'static str = "execute";
 
-    fn approval(args: &ExecuteParameters, isolated: bool) -> Approval {
-        if isolated {
+    fn prompt(context: &Context) -> String {
+        let environment = if context.isolated {
+            "It runs in an isolated container; network access may be restricted to allowed hosts by a proxy."
+        } else {
+            "It runs directly on this machine, so the user must approve every call."
+        };
+        format!("Use the `execute` tool to run shell commands. {environment}")
+    }
+
+    fn approval(args: &ExecuteParameters, context: &Context) -> Approval {
+        if context.isolated {
             Approval::auto(format!("[isolated] {}", args.command))
         } else {
             Approval::ask(format!("execute: {}", args.command))
@@ -122,6 +131,13 @@ async fn run_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prompt_describes_the_environment() {
+        let local = Execute::prompt(&Context { isolated: false });
+        assert!(local.contains("must approve every call"), "{local}");
+        let isolated = Execute::prompt(&Context { isolated: true });
+        assert!(isolated.contains("isolated container"), "{isolated}");
+    }
 
     async fn sh(command: &str, timeout: Duration) -> String {
         let mut cmd = tokio::process::Command::new("sh");
@@ -165,7 +181,7 @@ mod tests {
 
     fn approval(args: &str, isolated: bool) -> Approval {
         let args = rig_core::serde_json::from_str(args).unwrap();
-        Execute::approval(&args, isolated)
+        Execute::approval(&args, &Context { isolated })
     }
 
     #[test]

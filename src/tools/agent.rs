@@ -2,7 +2,7 @@
 //! only the subagent's final report. Blocking: the call waits until the subagent is done.
 
 use crate::frontend::Frontend;
-use crate::harness::{self, Approval, INVALID_TOOL_CALL_RETRIES, ToolPolicy};
+use crate::harness::{self, Approval, Context, INVALID_TOOL_CALL_RETRIES, ToolPolicy};
 use rig_core::DynModel;
 use rig_core::operation::Completion;
 use rig_core::tool::{Tool, ToolContext};
@@ -66,7 +66,11 @@ impl Subagent {
 
 /// Starting a subagent needs no approval: its own tool calls are approved one by one.
 impl ToolPolicy for Subagent {
-    fn approval(args: &AgentArgs, _isolated: bool) -> Approval {
+    fn prompt(_context: &Context) -> String {
+        "Use `agent` to delegate self-contained tasks (large searches, reading many files) to a subagent that only reports back its result.".to_owned()
+    }
+
+    fn approval(args: &AgentArgs, _context: &Context) -> Approval {
         Approval::auto(format!("[subagent] {}", args.description))
     }
 }

@@ -28,7 +28,7 @@ use rig_core::serde_json::{self, Value};
 use rig_core::tool::{Tool, ToolOutput};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// How often the model may retry after calling a tool that doesn't exist, per prompt.
 pub const INVALID_TOOL_CALL_RETRIES: usize = 3;
@@ -61,10 +61,44 @@ impl Approval {
     }
 }
 
-/// Whether the harness runs inside an isolated container (`AGENT_ISOLATED=1` in the
-/// process environment, set by the `Dockerfile`).
-pub fn isolated() -> bool {
-    std::env::var_os("AGENT_ISOLATED").is_some_and(|v| v == "1")
+/// The tools enabled by `AGENT_TOOLS`; unset means all tools.
+static ENABLED_TOOLS: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Restricts agents to the tools in `names`. Call once at startup, before creating a
+/// [`Session`]. Fails on a name that is not a tool.
+pub fn enable_only(names: Vec<String>) -> Result<(), String> {
+    let known = [Execute::NAME, UseSkill::NAME, Subagent::NAME];
+    if let Some(unknown) = names.iter().find(|n| !known.contains(&n.as_str())) {
+        return Err(format!(
+            "unknown tool {unknown:?} in AGENT_TOOLS; use {}",
+            known.join(", ")
+        ));
+    }
+    let _ = ENABLED_TOOLS.set(names);
+    Ok(())
+}
+
+/// Whether the tool `name` is enabled (see [`enable_only`]).
+pub fn enabled(name: &str) -> bool {
+    ENABLED_TOOLS
+        .get()
+        .is_none_or(|names| names.iter().any(|n| n == name))
+}
+
+/// What the harness tells its tools about the environment it runs in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Context {
+    /// Whether the harness runs inside an isolated container (`AGENT_ISOLATED=1` in the
+    /// process environment, set by the `Dockerfile`).
+    pub isolated: bool,
+}
+
+impl Context {
+    pub fn from_env() -> Self {
+        Self {
+            isolated: std::env::var_os("AGENT_ISOLATED").is_some_and(|v| v == "1"),
+        }
+    }
 }
 
 /// What a tool needs besides [`Tool`] to be offered to the model.
@@ -72,35 +106,49 @@ pub trait ToolPolicy: Tool + 'static {
     /// ACP tool kind (`execute`, `read`, `edit`, `search`, `fetch`, `think`, `other`, ...).
     const KIND: &'static str = "other";
     /// How a call with `args` is shown and whether the user must approve it.
-    /// `isolated` is whether the harness runs in an isolated container ([`isolated`]).
-    fn approval(args: &Self::Args, isolated: bool) -> Approval;
+    fn approval(args: &Self::Args, context: &Context) -> Approval;
+    /// What the system prompt says about this tool; added only while the tool is enabled.
+    /// Empty adds nothing.
+    fn prompt(_context: &Context) -> String {
+        String::new()
+    }
 }
 
 #[derive(Clone, Copy)]
 struct Policy {
     kind: &'static str,
     /// `None` when the arguments don't parse.
-    decide: fn(&str, bool) -> Option<Approval>,
+    decide: fn(&str, &Context) -> Option<Approval>,
 }
 
-fn decide<T: ToolPolicy>(args: &str, isolated: bool) -> Option<Approval> {
+fn decide<T: ToolPolicy>(args: &str, context: &Context) -> Option<Approval> {
     let args = serde_json::from_str::<T::Args>(args).ok()?;
-    Some(T::approval(&args, isolated))
+    Some(T::approval(&args, context))
 }
 
 /// An agent under construction together with the policies of its tools.
 struct Tools {
     builder: AgentBuilder,
+    context: Context,
+    /// The system prompt: the base preamble plus the [`ToolPolicy::prompt`] of each tool.
+    preamble: String,
     policies: HashMap<&'static str, Policy>,
 }
 
 impl Tools {
     fn add<T: ToolPolicy>(mut self, tool: T) -> Self {
+        if !enabled(T::NAME) {
+            return self;
+        }
         let policy = Policy {
             kind: T::KIND,
             decide: decide::<T>,
         };
         self.policies.insert(T::NAME, policy);
+        let prompt = T::prompt(&self.context);
+        if !prompt.trim().is_empty() {
+            self.preamble = format!("{}\n\n{}", self.preamble, prompt.trim());
+        }
         self.builder = self.builder.tool(tool);
         self
     }
@@ -108,9 +156,11 @@ impl Tools {
     fn build(self, frontend: Arc<dyn Frontend>, max_turns: usize) -> Agent {
         let hook = Approve {
             frontend,
+            context: self.context,
             policies: self.policies,
         };
         self.builder
+            .preamble(&self.preamble)
             .add_hook(hook)
             .default_max_turns(max_turns)
             .build()
@@ -119,9 +169,10 @@ impl Tools {
 
 /// The tools every agent (main agent and subagents) has. Add new tools here.
 fn tools(model: &DynModel<Completion>, preamble: &str) -> Tools {
-    let builder = AgentBuilder::new(model.clone()).preamble(preamble);
     Tools {
-        builder,
+        builder: AgentBuilder::new(model.clone()),
+        context: Context::from_env(),
+        preamble: preamble.to_owned(),
         policies: HashMap::new(),
     }
     .add(Execute)
@@ -148,6 +199,7 @@ pub fn subagent(model: DynModel<Completion>, preamble: &str, frontend: Arc<dyn F
 /// policy requires it.
 struct Approve {
     frontend: Arc<dyn Frontend>,
+    context: Context,
     policies: HashMap<&'static str, Policy>,
 }
 
@@ -178,11 +230,11 @@ impl Approve {
         self.policies.get(name).map_or("other", |p| p.kind)
     }
 
-    fn tool_call(&self, id: String, name: &str, args: &str, isolated: bool) -> ToolCall {
+    fn tool_call(&self, id: String, name: &str, args: &str) -> ToolCall {
         let approval = self
             .policies
             .get(name)
-            .and_then(|policy| (policy.decide)(args, isolated))
+            .and_then(|policy| (policy.decide)(args, &self.context))
             .unwrap_or_else(|| Approval::ask(format!("{name} {args}")));
         ToolCall {
             id,
@@ -226,7 +278,7 @@ impl AgentHook for Approve {
         let id = event
             .call_id
             .map_or_else(|| event.id.to_string(), ToString::to_string);
-        let call = self.tool_call(id, name, args, isolated());
+        let call = self.tool_call(id, name, args);
         if call.ask && !self.frontend.approve(&call).await {
             self.frontend.emit(Event::ToolDenied(call));
             return DispatchAction::skip("the user denied this tool call");
@@ -348,26 +400,31 @@ mod tests {
         let tools = tools(&model.into(), "");
         Approve {
             frontend: Arc::new(Silent),
+            context: Context { isolated: true },
             policies: tools.policies,
         }
+    }
+    #[test]
+    fn tools_add_their_sentences_to_the_system_prompt() {
+        let model = MockCompletionModel::from_stream_turns(Vec::<Vec<MockStreamEvent>>::new());
+        let preamble = tools(&model.into(), "BASE").preamble;
+        assert!(preamble.starts_with("BASE\n\n"), "{preamble}");
+        assert!(preamble.contains("Use the `execute` tool"), "{preamble}");
     }
 
     #[test]
     fn calls_get_their_tools_policy() {
         let hook = approve_hook();
-        let call = hook.tool_call("1".into(), "execute", r#"{"command":"ls"}"#, true);
+        let call = hook.tool_call("1".into(), "execute", r#"{"command":"ls"}"#);
         assert_eq!(
             (call.kind, call.title.as_str(), call.ask),
             ("execute", "[isolated] ls", false)
         );
         // Arguments that don't parse and unknown tools are always asked for.
-        let call = hook.tool_call("2".into(), "execute", "not json", true);
+        let call = hook.tool_call("2".into(), "execute", "not json");
         assert!(call.ask);
         assert_eq!(call.title, "execute not json");
-        assert!(
-            hook.tool_call("3".into(), "nope", r#"{"code":"1"}"#, true)
-                .ask
-        );
+        assert!(hook.tool_call("3".into(), "nope", r#"{"code":"1"}"#).ask);
     }
 
     /// A call to a nonexistent tool must not end the run: the model gets feedback and retries.
