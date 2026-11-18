@@ -1,10 +1,12 @@
 //! The `execute_javascript` tool (feature `javascript`): runs a script in an in-process
 //! QuickJS runtime. The script can only use the host API of [`runtime`]: `console`, `fetch`
-//! (to declared hosts, with secrets the script never sees) and `fs` (working directory
-//! only). The sandbox is this capability set itself, so it needs no container.
+//! (to declared hosts, with secrets the script never sees), `fs` (working directory
+//! only, plus read-only `skill:` paths) and `import` of skill modules. The sandbox is this
+//! capability set itself, so it needs no container.
 
 mod fetch;
 mod fs;
+mod modules;
 mod runtime;
 
 use crate::harness::{Approval, Context, ToolPolicy};
@@ -81,11 +83,13 @@ The script is an ES module (top-level `await` works) and has only these globals:
 `{{status, ok, headers, text(), json()}}` (`body` is a string, use `JSON.stringify`; response `headers` is a plain \
 object with lowercase keys; redirects are not followed); the synchronous \
 `fs.readText(path)`, `fs.writeText(path, text)`, `fs.list(path)`, `fs.exists(path)`, whose paths are relative \
-to the `work` directory (created on first use; `.env*` files are not accessible); and \
+to the `work` directory (created on first use; `.env*` files are not accessible), except that the read \
+functions also accept `skill:<name>/<path>` for the files of a skill (read-only, writing fails); and \
 `await runScript(path, args = [])`, which runs a script saved with `fs.writeText`. The saved script is a function \
 body (no `import`/`export`) that sees `args`, may `await`, and whose `return` value is the result. \
 Each call starts fresh; only files in `work` persist between calls. There are no \
-timers, no `require`/`import`, no npm packages, no process or environment access and no way to start a process. \
+timers, no `require`, no npm packages, no `import` except `import {{ f }} from \"skill:<name>/<path>.js\"` of the \
+JavaScript modules a skill documents (read-only; relative imports work inside the skill), no process or environment access and no way to start a process. \
 `fetch` only reaches `https://` hosts you list in \
 the `hosts` argument (the user must approve hosts that are not pre-approved). \
 `secret: \"NAME\"` makes `fetch` add the `Authorization` header from the configured secret; the script never \
@@ -117,7 +121,9 @@ fn approval(args: &ExecuteJavascriptParameters, allowed: &[String]) -> Approval 
 /// Run a JavaScript (ES module) script in a sandboxed in-process runtime and return its
 /// console output and, if it threw, the error. For workflow automation: calling APIs
 /// with `fetch` and transforming data. Only `console`, `fetch`, `fs` and `runScript` exist; there is
-/// no `require`, no npm and no process access.
+/// no `require`, no npm and no process access. `import` works only for skill modules
+/// (`import { f } from "skill:<name>/<path>.js"`), and the `fs` read functions also accept
+/// read-only `skill:<name>/<path>` paths.
 #[rig_tool(params(
     code = "The script (ES module; top-level await works). Print results with console.log.",
     hosts = "Hostnames the script will contact with fetch, e.g. [\"api.github.com\"]. fetch to any other host fails; omit when the script does no network access.",
@@ -277,8 +283,81 @@ mod tests {
         assert_eq!(out, "ok\nstdout:\nfunction function function");
         let out = js("import fs from 'node:fs';").await;
         assert!(out.starts_with("error"), "{out}");
+        assert!(out.contains("only `skill:<name>/<path>` imports"), "{out}");
         let out = js("await new Promise(() => {});").await;
         assert!(out.contains("never settles"), "{out}");
+    }
+
+    /// A throwaway skill in the real skills directory (like the tests of `work/`).
+    struct TestSkill(std::path::PathBuf, String);
+
+    impl TestSkill {
+        fn new(tag: &str) -> Self {
+            let name = format!("jstest-{tag}-{}", std::process::id());
+            let dir = modules::skills_root().join(&name);
+            std::fs::create_dir_all(dir.join("assets")).unwrap();
+            std::fs::write(dir.join("assets/a.txt"), "asset").unwrap();
+            std::fs::write(dir.join("lib.js"), "export const twice = (n) => n * 2;").unwrap();
+            Self(dir, name)
+        }
+    }
+
+    impl Drop for TestSkill {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn skills_are_importable_and_read_only() {
+        let skill = TestSkill::new("import");
+        let name = &skill.1;
+        let out = js(&format!(r#"
+            import {{ twice }} from "skill:{name}/lib.js";
+            console.log(twice(21), fs.readText("skill:{name}/assets/a.txt"));
+            console.log(fs.exists("skill:{name}/lib.js"), fs.exists("skill:{name}/nope"));
+            console.log(JSON.stringify(fs.list("skill:{name}")));
+            for (const op of [
+                () => fs.writeText("skill:{name}/lib.js", "x"),
+                () => fs.writeText("skill:{name}/new.js", "x"),
+                () => fs.writeText("skill:{name}/../x.txt", "x"),
+            ]) {{
+                try {{ op(); console.log("written"); }} catch (e) {{ console.log(e.message); }}
+            }}
+            for (const path of ["skill:../x", "skill:{name}/../../work/x", "skill:{name}/.env", "skill:/etc/passwd"]) {{
+                try {{ fs.readText(path); console.log("read", path); }} catch (e) {{ console.log("blocked"); }}
+            }}
+        "#))
+        .await;
+        assert!(!out.contains("written") && !out.contains("read "), "{out}");
+        assert_eq!(out.matches("skills are read-only").count(), 3, "{out}");
+        assert_eq!(out.matches("blocked").count(), 4, "{out}");
+        assert!(
+            out.contains("42 asset\ntrue false\n[\"assets/\",\"lib.js\"]"),
+            "{out}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(skill.0.join("lib.js")).unwrap(),
+            "export const twice = (n) => n * 2;"
+        );
+        assert!(!skill.0.join("new.js").exists());
+    }
+
+    #[tokio::test]
+    async fn only_skill_imports_work_in_the_main_script() {
+        for code in [
+            "import 'lodash';",
+            "import './x.js';",
+            "import 'https://example.com/x.js';",
+            "import '/etc/passwd';",
+        ] {
+            let out = js(code).await;
+            assert!(out.starts_with("error"), "{code}: {out}");
+            assert!(
+                out.contains("only `skill:<name>/<path>` imports"),
+                "{code}: {out}"
+            );
+        }
     }
 
     #[tokio::test]

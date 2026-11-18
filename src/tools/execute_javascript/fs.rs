@@ -1,6 +1,8 @@
 //! `fs` of `execute_javascript`: file access confined to the working directory, a
-//! subdirectory of the harness's directory (see [`crate::tools::WORKDIR`]).
+//! subdirectory of the harness's directory (see [`crate::tools::WORKDIR`]). Paths written
+//! `skill:<name>/<path>` are read from the skills instead and are read-only.
 
+use super::modules::{self, PREFIX};
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
@@ -9,7 +11,7 @@ const OUTSIDE: &str = "path must be relative to the working directory and stay i
 /// Resolves `path` against `root` and fails if the result would leave `root` (absolute
 /// path, `..`, symlink) or is part of a `.env*` file name. Symlinks are resolved, so a
 /// link inside `root` that points outside is rejected too.
-fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
+pub(super) fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
     let relative = Path::new(path);
     if !relative
         .components()
@@ -48,8 +50,12 @@ fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
     Ok(resolved)
 }
 
-/// Resolves `path` inside [`crate::tools::WORKDIR`], which is created if missing.
+/// Resolves `path` inside [`crate::tools::WORKDIR`], which is created if missing, or, for
+/// `skill:<name>/<path>`, inside the skills root (never created).
 fn resolve_here(path: &str) -> Result<PathBuf, String> {
+    if path.starts_with(PREFIX) {
+        return resolve(&modules::skills_root(), modules::below_root(path)?);
+    }
     let root = crate::tools::workdir();
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     resolve(&root, path)
@@ -65,6 +71,9 @@ pub(super) fn read_text(path: &str) -> Result<String, String> {
 
 /// Writes `text` to `path`, creating missing parent directories.
 pub(super) fn write_text(path: &str, text: &str) -> Result<(), String> {
+    if path.starts_with(PREFIX) {
+        return Err(format!("{path:?}: skills are read-only"));
+    }
     let file = resolve_here(path)?;
     if let Some(parent) = file.parent() {
         std::fs::create_dir_all(parent).map_err(|e| describe(path, e))?;

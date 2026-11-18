@@ -44,8 +44,39 @@ skills/<skill-name>/
    (`See [details](references/REFERENCE.md)`), one level deep. Put runnable code in `scripts/`
    as shell scripts and tell in the body how to run them, e.g.
    `sh skills/<skill-name>/scripts/run.sh [args]` (script arguments are `$1`, `$2`, ...).
-5. Check it: call the `use_skill` tool with `name` set to `<skill-name>`. It must return your
+5. Optionally ship JavaScript modules in `scripts/`, see below.
+6. Check it: call the `use_skill` tool with `name` set to `<skill-name>`. It must return your
    instructions. The skill appears in the system prompt after the agent is restarted.
    A skill with invalid frontmatter is skipped with a warning at startup.
 
 Do not edit or delete the built-in skill `creating-skills`; it is restored on every start.
+
+## JavaScript modules in `scripts/`
+
+Besides shell scripts, `scripts/` may contain JavaScript ES modules that the
+`execute_javascript` tool imports. They are not Node scripts: only `console`, `fetch`, `fs`
+and relative imports inside the skill exist (no `require`, npm packages or Node APIs).
+Skills are read-only for scripts. Export functions:
+
+```js
+// skills/github/scripts/github.js
+export async function listIssues(repo) {
+  const r = await fetch(`https://api.github.com/repos/${repo}/issues`, { secret: "GITHUB" });
+  return r.json();
+}
+```
+
+Document the exported functions in `SKILL.md` (signature, result, the `hosts` the call
+needs), so that the agent can use them:
+
+```markdown
+Use in `execute_javascript` (with `hosts: ["api.github.com"]`):
+    import { listIssues } from "skill:github/scripts/github.js";
+    const issues = await listIssues("owner/repo"); // [{ number, title, ... }]
+```
+
+Other files of the skill can be read with `fs.readText("skill:github/assets/template.md")`.
+Modules import each other relatively (`./util.js`). Because these modules are not Node
+scripts, say so in the `compatibility` frontmatter field, e.g.
+`compatibility: JavaScript modules for the execute_javascript tool (not Node)`.
+Shell scripts are documented and run as before, with `execute`.

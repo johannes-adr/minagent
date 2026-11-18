@@ -5,6 +5,7 @@
 //! blocks until the response is complete. So when the job queue is empty, the script is
 //! either done or waits for a promise that can never settle.
 
+use super::modules::{SkillLoader, SkillResolver, skills_root};
 use super::{Settings, fetch::Fetch, fs};
 use rquickjs::{
     CatchResultExt, CaughtError, Context, Ctx, Error, Exception, Function, Module, Object, Result,
@@ -96,6 +97,12 @@ fn evaluate(
     output: &Rc<RefCell<Output>>,
 ) -> std::result::Result<(), String> {
     let runtime = Runtime::new().map_err(|e| e.to_string())?;
+    runtime.set_loader(
+        SkillResolver,
+        SkillLoader {
+            root: skills_root(),
+        },
+    );
     runtime.set_memory_limit(MEMORY_LIMIT);
     runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
     let context = Context::full(&runtime).map_err(|e| e.to_string())?;

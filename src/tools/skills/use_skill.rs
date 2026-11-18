@@ -12,8 +12,9 @@ use std::path::Path;
 /// Call it BEFORE starting a task that matches a skill's description, then follow the
 /// instructions it returns. Paths in them (`scripts/...`, `references/...`, `assets/...`)
 /// are relative to the returned skill directory. Run the skill's scripts (shell scripts)
-/// with `execute`, e.g. `sh skills/<name>/scripts/x.sh [args]`. A skill is not a tool:
-/// load it with this tool.
+/// with `execute`, e.g. `sh skills/<name>/scripts/x.sh [args]`. Import the skill's
+/// JavaScript modules in `execute_javascript`: `import { f } from "skill:<name>/scripts/x.js"`.
+/// A skill is not a tool: load it with this tool.
 #[rig_tool(params(
     name = "Name of the skill to load, exactly as listed under available_skills (e.g. `creating-skills`)."
 ))]

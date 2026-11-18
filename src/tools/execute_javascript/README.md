@@ -19,10 +19,11 @@ give them. A fresh runtime per call has exactly these globals:
 |---|---|
 | `console.log/info/warn/error` | Output; `log`/`info` go to stdout, `warn`/`error` to stderr |
 | `fetch(url, { method, headers, body, secret })` | HTTP to the hosts declared in the call's `hosts` argument only |
-| `fs.readText/writeText/list/exists(path)` | Files inside `work/` (a subdirectory of the harness's directory) only, never `.env*` |
+| `fs.readText/writeText/list/exists(path)` | Files inside `work/` (a subdirectory of the harness's directory) only, never `.env*`. `readText`/`list`/`exists` also accept `skill:<name>/<path>` (files of a skill, read-only) |
+| `import ... from "skill:<name>/<path>.js"` | ES modules shipped by skills, read-only (see below) |
 | `runScript(path, args)` | Runs a script saved in `work/` in-process (an async function body that sees `args`); no process is started |
 
-There is no `require`, no `import`, no timers, and no access to processes or environment
+There is no `require`, no other `import`, no timers, and no access to processes or environment
 variables. Top-level `await` works because the script runs as an ES module.
 
 ```js
@@ -40,6 +41,28 @@ fs.writeText("greet.js", "console.log('hello', args.join(' ')); return args.leng
 await runScript("greet.js", ["a", "b"]); // prints "hello a b", resolves to 2
 ```
 
+## Skill modules
+
+Skills (`skills/<name>/`) may ship JavaScript ES modules that scripts import:
+
+```js
+import { listIssues } from "skill:github/scripts/github.js";
+const template = fs.readText("skill:github/assets/template.md");
+```
+
+- Only `skill:<name>/<path>` specifiers work. Bare names, URLs, absolute paths and relative
+  imports from the main script fail. Inside a skill module, `./x.js` and `../lib/y.js` resolve
+  relative to the module and must stay in the same skill; `skill:<other>/...` may import
+  another skill.
+- Names are normalized to `skill:<name>/<path>`, so a module is evaluated once however it is
+  imported.
+- Skills are **read-only** from scripts (`fs.writeText("skill:...")` fails). The script runs
+  without approval and can write `work/`, so anything it writes is untrusted, while a skill's
+  `SKILL.md` goes into the system prompt. That is why skills do not live in `work/`.
+- Skills cannot declare hosts or secrets; approval depends only on the call's `hosts`.
+- Files are read with the same confinement as `fs` (`fs::resolve`, applied to the skills root,
+  `modules::skills_root()`): no `..`, no symlinks out of the root, no `.env*`.
+
 ## Files
 
 | File | Role |
@@ -48,7 +71,8 @@ await runScript("greet.js", ["a", "b"]); // prints "hello a b", resolves to 2
 | `runtime.rs` | Builds a fresh QuickJS runtime per call: memory limit, timeout, console capture; runs the script |
 | `prelude.js` | Builds the script-facing `console`, `fetch` and `fs` from the native functions; the native functions themselves stay unreachable |
 | `fetch.rs` | Checks scheme and host, injects secrets, sends the request with `reqwest` |
-| `fs.rs` | Resolves paths and rejects anything outside `work/` or named `.env*` |
+| `fs.rs` | Resolves paths and rejects anything outside `work/` (or the skills root for `skill:` paths) or named `.env*` |
+| `modules.rs` | Resolver and loader for `skill:` ES modules; the skills root |
 
 ## How a call runs
 
@@ -76,6 +100,7 @@ await runScript("greet.js", ["a", "b"]); // prints "hello a b", resolves to 2
   - A secret is only sent to its bound host.
 - **Files:**
   - Absolute paths, `..`, and symlinks that lead outside `work/` are rejected.
+  - `skill:` paths and imports are read-only and confined to the skills directory the same way.
   - So is any path component starting with `.env`.
   - `list` hides `.env*` entries.
 - **Limits:**
