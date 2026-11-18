@@ -73,7 +73,7 @@ pub const VARS: &[Var] = &[
     Var {
         name: "AGENT_JS_ALLOWED_HOSTS",
         example: "",
-        doc: "execute_javascript (build with --features javascript): comma-separated hosts its scripts may contact without asking",
+        doc: "execute_javascript (unless built with --no-default-features): comma-separated hosts its scripts may contact without asking",
     },
     Var {
         name: "AGENT_SECRET_GITHUB",

@@ -4,10 +4,10 @@ Runs a JavaScript script written by the model inside the agent process, using
 [QuickJS](https://bellard.org/quickjs/) (via `rquickjs`). It is meant for workflow automation:
 calling APIs and transforming data.
 
-The tool is only built with the Cargo feature `javascript`:
+The tool is built by default (Cargo feature `javascript`). To opt out:
 
 ```sh
-cargo build --features javascript
+cargo build --no-default-features
 ```
 
 ## Idea: the sandbox is the API

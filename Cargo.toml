@@ -18,6 +18,8 @@ rquickjs = { version = "0.14", optional = true }
 reqwest = { version = "0.13", optional = true, default-features = false, features = ["rustls"] }
 
 [features]
+# Opt out with `--no-default-features`.
+default = ["javascript"]
 # The `execute_javascript` tool: scripts in an in-process QuickJS with a small host API.
 javascript = ["dep:rquickjs", "dep:reqwest"]
 

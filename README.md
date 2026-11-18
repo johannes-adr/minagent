@@ -37,12 +37,12 @@ Notes:
 - Podman: add `--userns=keep-id` so files keep your user (the script does). Docker on Linux: add `--user "$(id -u):$(id -g)"`.
 - The container has full network access, and commands in it can read `.env`. Use keys with minimal scope.
 
-## Optional: `execute_javascript` tool
+## `execute_javascript` tool
 
-For workflow automation (scripts that call APIs and transform data) there is an optional tool that runs JavaScript in-process with [QuickJS (rquickjs)](https://crates.io/crates/rquickjs). It is not built by default:
+For workflow automation (scripts that call APIs and transform data) there is a tool that runs JavaScript in-process with [QuickJS (rquickjs)](https://crates.io/crates/rquickjs). It is built by default (Cargo feature `javascript`). To opt out:
 
 ```sh
-cargo build --features javascript
+cargo build --no-default-features
 ```
 
 The script is an ES module (top-level `await` works) and gets only this API: no `require`/`import`, no npm, no timers, no process or environment access.
