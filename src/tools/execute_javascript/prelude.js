@@ -1,6 +1,6 @@
 // Evaluated once per run; returns a function that receives the native host functions
-// and installs the script-facing globals (`console`, `fetch`, `fs`). The natives are not
-// reachable from the script afterwards.
+// and installs the script-facing globals (`console`, `fetch`, `fs`, `runScript`). The
+// natives are not reachable from the script afterwards.
 (function (native) {
   const show = (value) => {
     if (typeof value === "string") return value;
@@ -21,6 +21,11 @@
     list: (path) => native.list(String(path)),
     exists: (path) => native.exists(String(path)),
   };
+
+  // Runs a saved script in-process: its text is the body of an async function that sees
+  // `args`, may `await` and `return` a value. The script cannot start processes itself.
+  const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
+  globalThis.runScript = (path, args = []) => new AsyncFunction("args", fs.readText(path))(args);
 
   globalThis.fetch = async function fetch(url, options = {}) {
     const headers = {};

@@ -16,38 +16,43 @@ const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 /// Only PNG, JPEG, GIF and WebP files up to 5 MiB work (the type is read from the file's
 /// content, not its name); anything else is rejected. The file's content is sent to the
 /// model provider.
-#[rig_tool(params(path = "Path of the image file, relative to the workspace root or absolute."))]
+#[rig_tool(params(
+    path = "Path of the image file, relative to the `work` directory or absolute."
+))]
 pub(crate) async fn view_image(path: String) -> Result<ToolOutput, ToolExecutionError> {
     load(&path).await
 }
 
-/// Reads the file at `path` and returns it as an image result.
+/// Reads the file at `path` (relative to the work directory, or absolute) and returns it
+/// as an image result.
 async fn load(path: &str) -> Result<ToolOutput, ToolExecutionError> {
     let fail = |e: std::io::Error| ToolExecutionError::other(format!("cannot read {path}: {e}"));
-    let size = tokio::fs::metadata(path).await.map_err(fail)?.len();
+    let file = crate::tools::workdir().join(path);
+    let size = tokio::fs::metadata(&file).await.map_err(fail)?.len();
     if size > MAX_IMAGE_BYTES {
         return Err(ToolExecutionError::other(format!(
             "{path} is {size} bytes; the limit is {MAX_IMAGE_BYTES}. Downscale it first, e.g. with `execute`."
         )));
     }
-    let bytes = tokio::fs::read(path).await.map_err(fail)?;
+    let bytes = tokio::fs::read(&file).await.map_err(fail)?;
     image_output(path, &bytes)
 }
 
-/// The file is sent to the model provider. Images inside the working directory (or any
+/// The file is sent to the model provider. Images inside the work directory (or any
 /// image in a container) are shown without asking; others need the user's approval.
 impl ToolPolicy for ViewImage {
     const KIND: &'static str = "read";
 
     fn prompt(_context: &Context) -> String {
         "Use the `view_image` tool to look at an image file (PNG, JPEG, GIF, WebP); \
-         `execute` and `cat` cannot show images. The model must support image input."
+         `execute` and `cat` cannot show images. Relative paths are relative to the `work` \
+         directory, so save images in `work/` (e.g. with `execute`). The model must support \
+         image input."
             .to_owned()
     }
 
     fn approval(args: &ViewImageParameters, context: &Context) -> Approval {
-        let root = std::env::current_dir().unwrap_or_default();
-        approval_in(&args.path, context, &root)
+        approval_in(&args.path, context, &crate::tools::workdir())
     }
 }
 
@@ -57,12 +62,12 @@ fn approval_in(path: &str, context: &Context, workdir: &Path) -> Approval {
     } else if inside(path, workdir) {
         Approval::auto(format!("view_image: {path}"))
     } else {
-        Approval::ask(format!("view_image outside the working directory: {path}"))
+        Approval::ask(format!("view_image outside the work directory: {path}"))
     }
 }
 
-/// Whether `path` (relative to the working directory or absolute) leads to a file inside
-/// `workdir` once `..` and symlinks are resolved. A path that cannot be resolved is not.
+/// Whether `path` (relative to `workdir` or absolute) leads to a file inside `workdir`
+/// once `..` and symlinks are resolved. A path that cannot be resolved is not.
 fn inside(path: &str, workdir: &Path) -> bool {
     let (Ok(file), Ok(root)) = (workdir.join(path).canonicalize(), workdir.canonicalize()) else {
         return false;

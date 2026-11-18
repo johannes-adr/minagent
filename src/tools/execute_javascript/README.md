@@ -13,13 +13,14 @@ cargo build --no-default-features
 ## Idea: the sandbox is the API
 
 There is no container and no OS sandbox. Scripts are safe because they can only use what we
-give them. A fresh runtime per call has exactly three globals:
+give them. A fresh runtime per call has exactly these globals:
 
 | Global | What it can do |
 |---|---|
 | `console.log/info/warn/error` | Output; `log`/`info` go to stdout, `warn`/`error` to stderr |
 | `fetch(url, { method, headers, body, secret })` | HTTP to the hosts declared in the call's `hosts` argument only |
-| `fs.readText/writeText/list/exists(path)` | Files inside the working directory only, never `.env*` |
+| `fs.readText/writeText/list/exists(path)` | Files inside `work/` (a subdirectory of the harness's directory) only, never `.env*` |
+| `runScript(path, args)` | Runs a script saved in `work/` in-process (an async function body that sees `args`); no process is started |
 
 There is no `require`, no `import`, no timers, and no access to processes or environment
 variables. Top-level `await` works because the script runs as an ES module.
@@ -31,6 +32,14 @@ fs.writeText("out/stars.txt", String(repo.stargazers_count));
 console.log(repo.full_name, repo.stargazers_count);
 ```
 
+A script cannot start a process, but it can save another script and run it in-process, with
+arguments, with `runScript(path, args)`:
+
+```js
+fs.writeText("greet.js", "console.log('hello', args.join(' ')); return args.length;");
+await runScript("greet.js", ["a", "b"]); // prints "hello a b", resolves to 2
+```
+
 ## Files
 
 | File | Role |
@@ -39,7 +48,7 @@ console.log(repo.full_name, repo.stargazers_count);
 | `runtime.rs` | Builds a fresh QuickJS runtime per call: memory limit, timeout, console capture; runs the script |
 | `prelude.js` | Builds the script-facing `console`, `fetch` and `fs` from the native functions; the native functions themselves stay unreachable |
 | `fetch.rs` | Checks scheme and host, injects secrets, sends the request with `reqwest` |
-| `fs.rs` | Resolves paths and rejects anything outside the working directory or named `.env*` |
+| `fs.rs` | Resolves paths and rejects anything outside `work/` or named `.env*` |
 
 ## How a call runs
 
@@ -66,7 +75,7 @@ console.log(repo.full_name, repo.stargazers_count);
     replacing any the script set itself. The script never sees the value.
   - A secret is only sent to its bound host.
 - **Files:**
-  - Absolute paths, `..`, and symlinks that lead outside the working directory are rejected.
+  - Absolute paths, `..`, and symlinks that lead outside `work/` are rejected.
   - So is any path component starting with `.env`.
   - `list` hides `.env*` entries.
 - **Limits:**

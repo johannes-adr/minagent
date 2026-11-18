@@ -1,4 +1,5 @@
-//! `fs` of `execute_javascript`: file access confined to the working directory.
+//! `fs` of `execute_javascript`: file access confined to the working directory, a
+//! subdirectory of the harness's directory (see [`crate::tools::WORKDIR`]).
 
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -47,8 +48,10 @@ fn resolve(root: &Path, path: &str) -> Result<PathBuf, String> {
     Ok(resolved)
 }
 
+/// Resolves `path` inside [`crate::tools::WORKDIR`], which is created if missing.
 fn resolve_here(path: &str) -> Result<PathBuf, String> {
-    let root = std::env::current_dir().map_err(|e| e.to_string())?;
+    let root = crate::tools::workdir();
+    std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     resolve(&root, path)
 }
 

@@ -39,7 +39,7 @@ Notes:
 
 ## `view_image` tool
 
-`view_image(path)` shows a PNG, JPEG, GIF or WebP file (max 5 MiB) to the model, e.g. a screenshot or chart made with `execute`. The type is detected from the file's content, so other files (such as `.env`) are rejected. It is built by default (Cargo feature `image`; opt out with `cargo build --no-default-features --features javascript`). Images inside the working directory (after resolving `..` and symlinks) are shown without asking, and in a container all are; elsewhere each call needs approval, as the file is sent to the model provider.
+`view_image(path)` shows a PNG, JPEG, GIF or WebP file (max 5 MiB) to the model, e.g. a screenshot or chart made with `execute`. The type is detected from the file's content, so other files (such as `.env`) are rejected. It is built by default (Cargo feature `image`; opt out with `cargo build --no-default-features --features javascript`). Relative paths are relative to the `work/` directory (a subdirectory of the harness's directory, shared with `execute_javascript`); images inside it (after resolving `..` and symlinks) are shown without asking, and in a container all are; elsewhere each call needs approval, as the file is sent to the model provider.
 
 The model must accept images: Anthropic and OpenAI models do; with Ollama use a vision model (e.g. `LLM_MODEL=llama3.2-vision`), as the default `qwen3` is text-only. Ollama cannot carry images inside tool results, so rig attaches them to a following user message instead.
 
@@ -55,7 +55,14 @@ The script is an ES module (top-level `await` works) and gets only this API: no 
 
 - `console.log/info/warn/error`: captured and returned, together with the error if the script throws.
 - `fetch(url, {method, headers, body, secret})`: resolves to `{status, ok, headers, text(), json()}`. Only `https://` (and `http://` for `localhost`/`127.0.0.1`) URLs to hosts in the call's `hosts` argument work; redirects are not followed.
-- `fs.readText(path)`, `fs.writeText(path, text)`, `fs.list(path)`, `fs.exists(path)`: paths relative to the working directory; anything outside it (absolute paths, `..`, symlinks) and `.env*` files are rejected.
+- `fs.readText(path)`, `fs.writeText(path, text)`, `fs.list(path)`, `fs.exists(path)`: paths relative to the `work/` directory (a subdirectory of the harness's directory, created on first use); anything outside it (absolute paths, `..`, symlinks) and `.env*` files are rejected.
+
+A script cannot start a process, but it can save another script with `fs.writeText` and run it in-process with arguments using `runScript(path, args)`:
+
+```js
+fs.writeText("greet.js", "console.log('hello', args.join(' ')); return args.length;");
+await runScript("greet.js", ["a", "b"]); // prints "hello a b", resolves to 2
+```
 
 Each call runs in a fresh runtime with a 256 MB memory limit and a timeout (`timeout_seconds`, default 30, max 300).
 

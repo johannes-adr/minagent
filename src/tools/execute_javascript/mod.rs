@@ -78,10 +78,13 @@ impl ToolPolicy for ExecuteJavascript {
             "Use `execute_javascript` for workflow automation: calling APIs and transforming data. \
 The script is an ES module (top-level `await` works) and has only these globals: \
 `console.log/info/warn/error`; `fetch(url, {{method, headers, body, secret}})` returning a promise of \
-`{{status, ok, headers, text(), json()}}` (`body` is a string, use `JSON.stringify`); and the synchronous \
+`{{status, ok, headers, text(), json()}}` (`body` is a string, use `JSON.stringify`); the synchronous \
 `fs.readText(path)`, `fs.writeText(path, text)`, `fs.list(path)`, `fs.exists(path)`, whose paths are relative \
-to the working directory (`.env*` files are not accessible). There are no timers, no `require`/`import`, \
-no npm packages and no process or environment access. `fetch` only reaches `https://` hosts you list in \
+to the `work` directory (created on first use; `.env*` files are not accessible); and \
+`runScript(path, args = [])`, which runs a script saved with `fs.writeText` and returns its result. The saved \
+script is a function body (no `import`/`export`) that sees `args`, may `await` and `return` a value. There are no \
+timers, no `require`/`import`, no npm packages, no process or environment access and no way to start a process. \
+`fetch` only reaches `https://` hosts you list in \
 the `hosts` argument (the user must approve hosts that are not pre-approved). \
 `secret: \"NAME\"` makes `fetch` add the `Authorization` header from the configured secret; the script never \
 sees its value, and it only works for the host the secret is bound to. {secrets} \
@@ -310,15 +313,32 @@ mod tests {
 
     #[tokio::test]
     async fn fs_reads_writes_and_lists() {
-        let dir = format!("target/js_fs_test_{}", std::process::id());
+        let dir = format!("js_fs_test_{}", std::process::id());
         let out = js(&format!(r#"
             fs.writeText("{dir}/sub/a.txt", "héllo");
             console.log(fs.readText("{dir}/sub/a.txt"), fs.exists("{dir}/sub/a.txt"), fs.exists("{dir}/nope"));
             console.log(JSON.stringify(fs.list("{dir}")), JSON.stringify(fs.list("{dir}/sub")));
         "#))
         .await;
-        let _ = std::fs::remove_dir_all(&dir);
+        let on_disk = crate::tools::workdir().join(&dir);
+        let written = std::fs::read_to_string(on_disk.join("sub/a.txt"));
+        let _ = std::fs::remove_dir_all(&on_disk);
         assert_eq!(out, "ok\nstdout:\nhéllo true false\n[\"sub/\"] [\"a.txt\"]");
+        assert_eq!(written.unwrap(), "héllo");
+    }
+
+    /// The pattern from the tool prompt: save a script, run it later with arguments.
+    #[tokio::test]
+    async fn a_saved_script_runs_with_arguments() {
+        let name = format!("js_script_test_{}.js", std::process::id());
+        let out = js(&format!(r#"
+            fs.writeText("{name}", "const v = await Promise.resolve(args.join('+')); console.log('hello', v); return v.length;");
+            console.log(await runScript("{name}", ["a", "b"]));
+            console.log(await runScript("{name}"));
+        "#))
+        .await;
+        let _ = std::fs::remove_file(crate::tools::workdir().join(&name));
+        assert_eq!(out, "ok\nstdout:\nhello a+b\n3\nhello \n0");
     }
 
     #[tokio::test]
