@@ -11,6 +11,7 @@
 
 use crate::frontend::{ContextUsage, Event, Frontend, ToolCall};
 use crate::harness::Session;
+use crate::sessions::{self, Store};
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
@@ -29,6 +30,9 @@ use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 
+/// The receiving end of what the browser asks for, see [`Web::new`].
+pub type Inbox = mpsc::UnboundedReceiver<Command>;
+
 const PAGE: &str = include_str!("web.html");
 pub const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 /// Tool output sent to the browser is cut to this many bytes (the model still gets all of it).
@@ -43,6 +47,16 @@ struct Inner {
     approvals: HashMap<String, oneshot::Sender<bool>>,
     /// The latest context usage; only this one is replayed, after the log.
     context: Option<Value>,
+    /// The stored session being shown; assigned when its first prompt runs.
+    session_id: Option<String>,
+}
+
+/// What the worker does, one at a time.
+pub enum Command {
+    Prompt(String),
+    /// Shows a stored session, or a new one for `None`.
+    Switch(Option<String>),
+    Delete(String),
 }
 
 /// The web frontend's state, shared by the harness side ([`Frontend`]) and the HTTP handlers.
@@ -51,21 +65,23 @@ pub struct Web {
     inner: Mutex<Inner>,
     live: broadcast::Sender<Value>,
     busy: AtomicBool,
-    prompts: mpsc::UnboundedSender<String>,
+    commands: mpsc::UnboundedSender<Command>,
+    store: Store,
     cancel: Notify,
 }
 
 impl Web {
     /// Returns the frontend and the receiving end of the prompts the browser submits,
     /// which [`run`] feeds to the session.
-    pub fn new() -> io::Result<(Arc<Self>, mpsc::UnboundedReceiver<String>)> {
-        let (prompts, inbox) = mpsc::unbounded_channel();
+    pub fn new(store: Store) -> io::Result<(Arc<Self>, Inbox)> {
+        let (commands, inbox) = mpsc::unbounded_channel();
         let web = Self {
             token: random_token()?,
             inner: Mutex::default(),
             live: broadcast::channel(4096).0,
             busy: AtomicBool::new(false),
-            prompts,
+            commands,
+            store,
             cancel: Notify::new(),
         };
         Ok((Arc::new(web), inbox))
@@ -104,9 +120,48 @@ impl Web {
     /// The events so far and a receiver for all later ones.
     fn subscribe(&self) -> (Vec<Value>, broadcast::Receiver<Value>) {
         let inner = self.inner.lock().unwrap();
-        let mut events = inner.log.clone();
+        let mut events = vec![session_event(&inner.session_id)];
+        events.extend(inner.log.clone());
         events.extend(inner.context.clone());
         (events, self.live.subscribe())
+    }
+
+    /// Shows another session: the open pages clear their transcript and get this one.
+    fn replace(&self, id: Option<String>, log: Vec<Value>, context: Option<Value>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.session_id = id;
+        inner.log = log;
+        inner.context = context;
+        let _ = self.live.send(session_event(&inner.session_id));
+        for event in inner.log.iter().chain(&inner.context) {
+            let _ = self.live.send(event.clone());
+        }
+    }
+
+    /// Tells the open pages to reload the session list.
+    fn sessions_changed(&self) {
+        let _ = self.live.send(json!({"type": "sessions"}));
+    }
+
+    /// Writes the current session to disk (without busy markers, which are only live).
+    fn save(&self, history: &[rig_core::message::Message]) -> Result<(), String> {
+        let (id, log, context) = {
+            let mut inner = self.inner.lock().unwrap();
+            let id = inner
+                .session_id
+                .get_or_insert_with(|| self.store.new_id())
+                .clone();
+            let log: Vec<Value> = inner
+                .log
+                .iter()
+                .filter(|e| e["type"] != "status")
+                .cloned()
+                .collect();
+            (id, log, inner.context.clone())
+        };
+        self.store
+            .save(&id, history, &log, context.as_ref())
+            .map_err(|e| format!("could not save session {id}: {e}"))
     }
 
     /// Answers a pending approval; `false` if there is none with this id.
@@ -129,6 +184,20 @@ impl Web {
     fn set_busy(&self, busy: bool) {
         self.busy.store(busy, Ordering::SeqCst);
         self.push(json!({"type": "status", "busy": busy}));
+    }
+}
+
+fn session_event(id: &Option<String>) -> Value {
+    json!({"type": "session", "id": id})
+}
+
+/// Calls that were still waiting or running when a session was saved never finished.
+fn settle(log: &mut [Value]) {
+    for event in log {
+        if event["type"] == "tool" && matches!(event["status"].as_str(), Some("pending" | "running"))
+        {
+            event["status"] = json!("cancelled");
+        }
     }
 }
 
@@ -272,7 +341,7 @@ async fn prompt(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> StatusC
     }
     web.push(json!({"type": "user", "text": text}));
     web.push(json!({"type": "status", "busy": true}));
-    if web.prompts.send(text).is_err() {
+    if web.commands.send(Command::Prompt(text)).is_err() {
         web.set_busy(false);
         return StatusCode::INTERNAL_SERVER_ERROR;
     }
@@ -285,6 +354,41 @@ async fn approve(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> Status
         StatusCode::NO_CONTENT
     } else {
         StatusCode::NOT_FOUND
+    }
+}
+
+async fn list_sessions(State(web): State<Arc<Web>>) -> Json<Value> {
+    let current = web.inner.lock().unwrap().session_id.clone();
+    Json(json!({"current": current, "sessions": web.store.list()}))
+}
+
+/// Takes the one-at-a-time slot and queues `command`.
+fn queue(web: &Web, command: Command) -> StatusCode {
+    if web.busy.swap(true, Ordering::SeqCst) {
+        return StatusCode::CONFLICT;
+    }
+    web.push(json!({"type": "status", "busy": true}));
+    if web.commands.send(command).is_err() {
+        web.set_busy(false);
+        return StatusCode::INTERNAL_SERVER_ERROR;
+    }
+    StatusCode::ACCEPTED
+}
+
+/// `{"id": "..."}` opens that session, no id starts a new one.
+async fn open_session(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> StatusCode {
+    let id = match body["id"].as_str() {
+        Some(id) if sessions::valid_id(id) => Some(id.to_owned()),
+        Some(_) => return StatusCode::BAD_REQUEST,
+        None => None,
+    };
+    queue(&web, Command::Switch(id))
+}
+
+async fn delete_session(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> StatusCode {
+    match body["id"].as_str() {
+        Some(id) if sessions::valid_id(id) => queue(&web, Command::Delete(id.to_owned())),
+        _ => StatusCode::BAD_REQUEST,
     }
 }
 
@@ -301,27 +405,70 @@ fn router(web: Arc<Web>) -> Router {
         .route("/prompt", post(prompt))
         .route("/approve", post(approve))
         .route("/cancel", post(cancel))
+        .route("/sessions", get(list_sessions))
+        .route("/session", post(open_session))
+        .route("/session/delete", post(delete_session))
         .layer(middleware::from_fn_with_state(web.clone(), authorize))
         .with_state(web);
     Router::new().route("/", get(page)).merge(api)
 }
 
-/// Runs the prompts the browser submits, one at a time. A cancelled prompt is dropped
+/// Runs what the browser asks for, one at a time. A cancelled prompt is dropped
 /// and leaves the session's history unchanged.
-async fn worker(web: Arc<Web>, mut session: Session, mut inbox: mpsc::UnboundedReceiver<String>) {
-    while let Some(input) = inbox.recv().await {
-        tokio::select! {
-            result = session.prompt(input) => {
-                if let Err(error) = result {
+async fn worker(web: Arc<Web>, mut session: Session, mut inbox: Inbox) {
+    while let Some(command) = inbox.recv().await {
+        match command {
+            Command::Prompt(input) => {
+                tokio::select! {
+                    result = session.prompt(input) => {
+                        if let Err(error) = result {
+                            web.push(json!({"type": "error", "text": error}));
+                        }
+                    }
+                    _ = web.cancel.notified() => {
+                        web.cancel_approvals();
+                        web.push(json!({"type": "note", "text": "stopped"}));
+                    }
+                }
+                if let Err(error) = web.save(session.history()) {
                     web.push(json!({"type": "error", "text": error}));
                 }
+                web.sessions_changed();
             }
-            _ = web.cancel.notified() => {
-                web.cancel_approvals();
-                web.push(json!({"type": "note", "text": "stopped"}));
+            Command::Switch(id) => switch(&web, &mut session, id),
+            Command::Delete(id) => {
+                let current = web.inner.lock().unwrap().session_id.clone();
+                match web.store.delete(&id) {
+                    Ok(()) if current.as_deref() == Some(id.as_str()) => {
+                        switch(&web, &mut session, None)
+                    }
+                    Ok(()) => {}
+                    Err(error) => web.push(
+                        json!({"type": "error", "text": format!("could not delete {id}: {error}")}),
+                    ),
+                }
+                web.sessions_changed();
             }
         }
         web.set_busy(false);
+    }
+}
+
+/// Makes `id` (or a fresh session) the one the agent continues and the pages show.
+fn switch(web: &Web, session: &mut Session, id: Option<String>) {
+    let Some(id) = id else {
+        session.set_history(Vec::new());
+        web.replace(None, Vec::new(), None);
+        return;
+    };
+    match web.store.load(&id) {
+        Ok(saved) => {
+            let mut log = saved.log;
+            settle(&mut log);
+            session.set_history(saved.history);
+            web.replace(Some(id), log, saved.context);
+        }
+        Err(error) => web.push(json!({"type": "error", "text": error})),
     }
 }
 
@@ -329,7 +476,7 @@ async fn worker(web: Arc<Web>, mut session: Session, mut inbox: mpsc::UnboundedR
 /// as its frontend and `inbox` is the receiver from [`Web::new`].
 pub async fn run(
     web: Arc<Web>,
-    inbox: mpsc::UnboundedReceiver<String>,
+    inbox: Inbox,
     session: Session,
     addr: &str,
 ) -> io::Result<()> {
@@ -353,13 +500,22 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
+    fn temp_store() -> Store {
+        use std::sync::atomic::AtomicUsize;
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("agent_web_{}_{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        Store::new(dir)
+    }
+
     fn turn(event: MockStreamEvent) -> Vec<MockStreamEvent> {
         vec![event, MockStreamEvent::final_response_with_total_tokens(1)]
     }
 
     /// A server whose model answers with `turns`.
     async fn start(turns: Vec<Vec<MockStreamEvent>>) -> (Arc<Web>, SocketAddr) {
-        let (web, inbox) = Web::new().unwrap();
+        let (web, inbox) = Web::new(temp_store()).unwrap();
         let model = MockCompletionModel::from_stream_turns(turns);
         let session = Session::new(model.into(), "", web.clone());
         tokio::spawn(worker(web.clone(), session, inbox));
@@ -403,7 +559,7 @@ mod tests {
 
     #[test]
     fn adjacent_text_is_merged_in_the_log_only() {
-        let (web, _inbox) = Web::new().unwrap();
+        let (web, _inbox) = Web::new(temp_store()).unwrap();
         let (_, mut live) = web.subscribe();
         web.emit(Event::Text("hel".into()));
         web.emit(Event::Text("lo".into()));
@@ -419,7 +575,7 @@ mod tests {
     /// Every update goes to the open pages; a page that connects later gets only the latest.
     #[test]
     fn only_the_latest_context_usage_is_replayed() {
-        let (web, _inbox) = Web::new().unwrap();
+        let (web, _inbox) = Web::new(temp_store()).unwrap();
         let (_, mut live) = web.subscribe();
         let usage = |tokens| ContextUsage {
             tokens,
@@ -442,7 +598,14 @@ mod tests {
             })
         );
         let (replayed, _) = web.subscribe();
-        assert_eq!(replayed, [json!({"type": "text", "text": "hi"}), latest]);
+        assert_eq!(
+            replayed,
+            [
+                json!({"type": "session", "id": null}),
+                json!({"type": "text", "text": "hi"}),
+                latest
+            ]
+        );
         // Without a window the page shows only the tokens.
         web.emit(Event::Context(ContextUsage {
             tokens: 5,
@@ -626,5 +789,55 @@ mod tests {
         wait_for(&web, |e| e["type"] == "note" && e["text"] == "stopped").await;
         wait_for(&web, |e| e["type"] == "status" && e["busy"] == false).await;
         assert!(!web.busy.load(Ordering::SeqCst));
+    }
+
+    /// A prompt is saved; another page can list, open, and delete the session.
+    #[tokio::test]
+    async fn sessions_are_saved_listed_opened_and_deleted() {
+        let (web, addr) = start(vec![
+            turn(MockStreamEvent::text("one")),
+            turn(MockStreamEvent::text("two")),
+        ])
+        .await;
+        let token = Some(web.token.as_str());
+        request(addr, "POST /prompt", token, r#"{"text":"first chat"}"#).await;
+        wait_for(&web, |e| e["type"] == "status" && e["busy"] == false).await;
+        let listed = request(addr, "GET /sessions", token, "").await;
+        assert!(listed.contains("first chat"), "{listed}");
+        let id = web.inner.lock().unwrap().session_id.clone().unwrap();
+        assert!(web.store.dir().join(format!("{id}.json")).exists());
+
+        // A new session starts empty ...
+        let started = request(addr, "POST /session", token, "{}").await;
+        assert!(started.starts_with("HTTP/1.1 202"), "{started}");
+        for _ in 0..500 {
+            if log(&web).iter().all(|e| e["type"] == "status") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(web.inner.lock().unwrap().session_id.is_none());
+        request(addr, "POST /prompt", token, r#"{"text":"second chat"}"#).await;
+        wait_for(&web, |e| e["type"] == "text" && e["text"] == "two").await;
+        wait_for(&web, |e| e["type"] == "status" && e["busy"] == false).await;
+        assert_eq!(web.store.list().len(), 2);
+
+        // ... and the first one can be opened again with its transcript.
+        let body = format!(r#"{{"id":"{id}"}}"#);
+        request(addr, "POST /session", token, &body).await;
+        wait_for(&web, |e| e["type"] == "text" && e["text"] == "one").await;
+        assert!(!log(&web).iter().any(|e| e["text"] == "two"));
+        let bad = request(addr, "POST /session", token, r#"{"id":"../x"}"#).await;
+        assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+
+        request(addr, "POST /session/delete", token, &body).await;
+        for _ in 0..500 {
+            if web.store.list().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(web.store.list().len(), 1);
+        let _ = std::fs::remove_dir_all(web.store.dir());
     }
 }

@@ -422,6 +422,16 @@ impl Session {
         self
     }
 
+    /// The conversation so far, as the model sees it.
+    pub fn history(&self) -> &[Message] {
+        &self.history
+    }
+
+    /// Continues another conversation from `history`.
+    pub fn set_history(&mut self, history: Vec<Message>) {
+        self.history = history;
+    }
+
     /// Runs one prompt to the end; on success it becomes part of the history.
     /// Dropping the future cancels the prompt and leaves the history unchanged.
     pub async fn prompt(&mut self, input: String) -> Result<(), String> {

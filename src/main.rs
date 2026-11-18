@@ -1,6 +1,7 @@
 mod config;
 mod frontend;
 mod harness;
+mod sessions;
 mod tools;
 
 use frontend::{acp, tui, web};
@@ -103,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if acp {
         acp::serve(new_session).await?;
     } else if let Some(addr) = web_addr {
-        let (frontend, inbox) = web::Web::new()?;
+        let (frontend, inbox) = web::Web::new(sessions::Store::new(sessions::DIR))?;
         let session = new_session(frontend.clone());
         web::run(frontend, inbox, session, addr).await?;
     } else {

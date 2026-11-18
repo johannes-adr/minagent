@@ -29,6 +29,21 @@ header {
   display: flex; align-items: center; gap: 10px; padding: 12px 20px;
   border-bottom: 1px solid var(--border);
 }
+#sessions-btn { padding: 4px 10px; font-size: 13px; }
+#drawer { position: fixed; inset: 0 auto 0 0; width: min(320px, 85vw); z-index: 10; display: flex; flex-direction: column; background: var(--surface); border-right: 1px solid var(--border); transform: translateX(-100%); transition: transform .2s; }
+body.drawer #drawer { transform: none; }
+#drawer-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; border-bottom: 1px solid var(--border); font-weight: 600; }
+#session-list { flex: 1; overflow-y: auto; padding: 8px; display: flex; flex-direction: column; gap: 2px; }
+.session { display: flex; align-items: center; gap: 6px; border-radius: 8px; padding: 6px 8px; cursor: pointer; }
+.session:hover { background: var(--code); }
+.session.current { background: var(--user); }
+.session .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session .when { display: block; color: var(--muted); font-size: 11px; }
+.session .del { border: 0; background: none; color: var(--muted); padding: 2px 6px; border-radius: 6px; opacity: 0; }
+.session:hover .del { opacity: 1; } .session .del:hover { color: var(--bad); }
+.none { color: var(--muted); padding: 8px; font-size: 13px; }
+#scrim { position: fixed; inset: 0; z-index: 9; background: rgba(0,0,0,.35); display: none; }
+body.drawer #scrim { display: block; }
 header h1 { margin: 0 auto 0 0; font-size: 15px; font-weight: 600; }
 #context { display: flex; align-items: center; gap: 8px; margin-right: 8px; color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 #context[hidden] { display: none; }
@@ -106,7 +121,13 @@ body.busy #send { display: none; } body.busy #stop { display: block; }
 </style>
 </head>
 <body>
+<aside id="drawer">
+  <div id="drawer-head"><span>Sessions</span><button class="btn primary" id="new-session">+ New</button></div>
+  <div id="session-list"></div>
+</aside>
+<div id="scrim"></div>
 <header>
+  <button class="btn" id="sessions-btn">☰ Sessions</button>
   <h1>agent</h1>
   <div id="context" hidden><span class="meter"><span></span></span><span id="context-text"></span></div>
   <div id="state"><span class="dot"></span><span id="state-text">Connecting…</span></div>
@@ -310,8 +331,58 @@ function handle(event) {
     case "tool": upsertTool(event); break;
     case "status": setBusy(event.busy); break;
     case "context": setContext(event); break;
+    case "session":
+      // Another session is shown: start its transcript over.
+      chat.replaceChildren(); tools = new Map(); pinned = true;
+      $("context").hidden = true; currentSession = event.id;
+      loadSessions();
+      break;
+    case "sessions": loadSessions(); break;
   }
 }
+
+// ---- Sessions ----
+let currentSession = null;
+const drawer = (open) => document.body.classList.toggle("drawer", open);
+async function loadSessions() {
+  const response = await fetch("/sessions", {headers: {"x-token": token}});
+  if (!response.ok) return;
+  const {sessions} = await response.json();
+  const list = $("session-list");
+  list.replaceChildren();
+  if (!sessions.length) list.append(Object.assign(document.createElement("div"), {className: "none", textContent: "No saved sessions yet."}));
+  for (const s of sessions) {
+    const row = document.createElement("div");
+    row.className = "session" + (s.id === currentSession ? " current" : "");
+    const name = document.createElement("div");
+    name.className = "name";
+    name.textContent = s.title || "(empty)";
+    const when = document.createElement("span");
+    when.className = "when";
+    when.textContent = new Date(s.updated * 1000).toLocaleString();
+    name.append(when);
+    const del = document.createElement("button");
+    del.className = "del"; del.textContent = "✕"; del.title = "Delete";
+    del.onclick = async (e) => {
+      e.stopPropagation();
+      if (confirm("Delete this session?")) await busyAware(post("/session/delete", {id: s.id}));
+    };
+    row.onclick = async () => {
+      if (s.id !== currentSession && await busyAware(post("/session", {id: s.id}))) drawer(false);
+    };
+    row.append(name, del);
+    list.append(row);
+  }
+}
+async function busyAware(promise) {
+  const response = await promise;
+  if (response.status === 409) add("note", "Wait for the agent to finish before switching sessions.");
+  else if (!response.ok && response.status !== 202) add("error", `Request failed (HTTP ${response.status})`);
+  return response.status === 202;
+}
+$("sessions-btn").onclick = () => { loadSessions(); drawer(true); };
+$("scrim").onclick = () => drawer(false);
+$("new-session").onclick = async () => { if (await busyAware(post("/session", {}))) drawer(false); };
 
 // ---- Connection: every (re)connect replays the whole transcript ----
 function connect() {
