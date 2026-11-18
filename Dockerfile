@@ -16,7 +16,7 @@ RUN apt-get update \
 COPY --from=builder /build/target/release/agent /usr/local/bin/agent
 USER agent
 WORKDIR /workspace
-# We already run in an isolated container: no sandbox-exec, `execute` runs without asking.
+# We run in an isolated container: `execute` runs without asking.
 ENV AGENT_ISOLATED=1
 ENTRYPOINT ["agent"]
 CMD ["--acp"]

@@ -6,7 +6,6 @@
 //! in [`tools`].
 
 use crate::frontend::{Event, Frontend, ToolCall};
-use crate::sandbox;
 use crate::tools::agent::Subagent;
 use crate::tools::execute::Execute;
 use crate::tools::skills::{self, use_skill::UseSkill};
@@ -62,14 +61,19 @@ impl Approval {
     }
 }
 
+/// Whether the harness runs inside an isolated container (`AGENT_ISOLATED=1` in the
+/// process environment, set by the `Dockerfile`).
+pub fn isolated() -> bool {
+    std::env::var_os("AGENT_ISOLATED").is_some_and(|v| v == "1")
+}
+
 /// What a tool needs besides [`Tool`] to be offered to the model.
 pub trait ToolPolicy: Tool + 'static {
     /// ACP tool kind (`execute`, `read`, `edit`, `search`, `fetch`, `think`, `other`, ...).
     const KIND: &'static str = "other";
     /// How a call with `args` is shown and whether the user must approve it.
-    /// `sandboxed` is whether commands are contained: the OS sandbox is available or the
-    /// harness runs in an isolated container.
-    fn approval(args: &Self::Args, sandboxed: bool) -> Approval;
+    /// `isolated` is whether the harness runs in an isolated container ([`isolated`]).
+    fn approval(args: &Self::Args, isolated: bool) -> Approval;
 }
 
 #[derive(Clone, Copy)]
@@ -79,9 +83,9 @@ struct Policy {
     decide: fn(&str, bool) -> Option<Approval>,
 }
 
-fn decide<T: ToolPolicy>(args: &str, sandboxed: bool) -> Option<Approval> {
+fn decide<T: ToolPolicy>(args: &str, isolated: bool) -> Option<Approval> {
     let args = serde_json::from_str::<T::Args>(args).ok()?;
-    Some(T::approval(&args, sandboxed))
+    Some(T::approval(&args, isolated))
 }
 
 /// An agent under construction together with the policies of its tools.
@@ -174,11 +178,11 @@ impl Approve {
         self.policies.get(name).map_or("other", |p| p.kind)
     }
 
-    fn tool_call(&self, id: String, name: &str, args: &str, sandboxed: bool) -> ToolCall {
+    fn tool_call(&self, id: String, name: &str, args: &str, isolated: bool) -> ToolCall {
         let approval = self
             .policies
             .get(name)
-            .and_then(|policy| (policy.decide)(args, sandboxed))
+            .and_then(|policy| (policy.decide)(args, isolated))
             .unwrap_or_else(|| Approval::ask(format!("{name} {args}")));
         ToolCall {
             id,
@@ -222,8 +226,7 @@ impl AgentHook for Approve {
         let id = event
             .call_id
             .map_or_else(|| event.id.to_string(), ToString::to_string);
-        let contained = sandbox::supported() || sandbox::isolated();
-        let call = self.tool_call(id, name, args, contained);
+        let call = self.tool_call(id, name, args, isolated());
         if call.ask && !self.frontend.approve(&call).await {
             self.frontend.emit(Event::ToolDenied(call));
             return DispatchAction::skip("the user denied this tool call");
@@ -355,7 +358,7 @@ mod tests {
         let call = hook.tool_call("1".into(), "execute", r#"{"command":"ls"}"#, true);
         assert_eq!(
             (call.kind, call.title.as_str(), call.ask),
-            ("execute", "[sandboxed] ls", false)
+            ("execute", "[isolated] ls", false)
         );
         // Arguments that don't parse and unknown tools are always asked for.
         let call = hook.tool_call("2".into(), "execute", "not json", true);
@@ -394,7 +397,7 @@ mod tests {
     #[tokio::test]
     async fn tool_calls_are_reported_to_the_frontend() {
         for approve in [true, false] {
-            let args = serde_json::json!({"command": "echo hi", "disable_sandbox": true});
+            let args = serde_json::json!({"command": "echo hi"});
             let model = MockCompletionModel::from_stream_turns([
                 vec![
                     MockStreamEvent::tool_call("t1", "execute", args),
@@ -422,7 +425,7 @@ mod tests {
                     Event::Text(t) => t.clone(),
                 })
                 .collect();
-            let ask = "ask execute (not sandboxed): echo hi".to_string();
+            let ask = "ask execute: echo hi".to_string();
             if approve {
                 let expected = [
                     ask,

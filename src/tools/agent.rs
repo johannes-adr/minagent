@@ -66,7 +66,7 @@ impl Subagent {
 
 /// Starting a subagent needs no approval: its own tool calls are approved one by one.
 impl ToolPolicy for Subagent {
-    fn approval(args: &AgentArgs, _sandboxed: bool) -> Approval {
+    fn approval(args: &AgentArgs, _isolated: bool) -> Approval {
         Approval::auto(format!("[subagent] {}", args.description))
     }
 }

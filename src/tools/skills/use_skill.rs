@@ -25,7 +25,7 @@ pub(crate) async fn use_skill(name: String) -> Result<String, ToolExecutionError
 impl ToolPolicy for UseSkill {
     const KIND: &'static str = "read";
 
-    fn approval(args: &UseSkillParameters, _sandboxed: bool) -> Approval {
+    fn approval(args: &UseSkillParameters, _isolated: bool) -> Approval {
         Approval::auto(format!("[skill] {}", args.name))
     }
 }
@@ -69,12 +69,12 @@ mod tests {
 
     #[test]
     fn loading_a_skill_needs_no_approval() {
-        for sandboxed in [true, false] {
+        for isolated in [true, false] {
             let args = UseSkillParameters {
                 name: "demo".into(),
             };
             assert_eq!(
-                UseSkill::approval(&args, sandboxed),
+                UseSkill::approval(&args, isolated),
                 Approval::auto("[skill] demo")
             );
         }

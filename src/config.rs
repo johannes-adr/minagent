@@ -2,7 +2,7 @@
 //!
 //! [`VARS`] is the single source of truth: it drives [`Config::load`] and the
 //! generated `.env.example` ([`env_example`]). Values from `.env` are not put into the
-//! process environment, so sandboxed child processes don't inherit them.
+//! process environment, so child processes don't inherit them.
 
 use rig_core::DynModel;
 use rig_core::operation::Completion;

@@ -642,11 +642,11 @@ mod tests {
     #[test]
     fn draws_chat_status_and_scrolls() {
         let mut app = App::new();
-        app.handle_ui(UiEvent::Info("[sandboxed] ls".into()));
+        app.handle_ui(UiEvent::Info("[isolated] ls".into()));
         app.handle_ui(UiEvent::ToolOutput("file_a\nfile_b".into()));
         app.handle_ui(UiEvent::Status(Status::Tool));
         let text = screen(&mut app, 60, 12);
-        assert!(text.contains("• [sandboxed] ls"), "{text}");
+        assert!(text.contains("• [isolated] ls"), "{text}");
         assert!(text.contains("│ file_b"), "{text}");
         assert!(text.contains("Running tool…"), "{text}");
 

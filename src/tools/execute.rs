@@ -1,8 +1,7 @@
-//! The `execute` tool: runs shell commands, sandboxed where supported.
+//! The `execute` tool: runs shell commands.
 
 use crate::harness::{Approval, ToolPolicy};
-use crate::sandbox;
-use crate::tools::process::{self, exit_line, format_output};
+use crate::tools::process::{exit_line, format_output};
 use rig_agent::rig_tool;
 use rig_core::tool::ToolExecutionError;
 use std::process::Stdio;
@@ -13,21 +12,16 @@ use std::time::Duration;
 const EXECUTE_DEFAULT_TIMEOUT_SECS: u64 = 120;
 const EXECUTE_MAX_TIMEOUT_SECS: u64 = 600;
 
-/// Sandboxed commands run without asking; everything else needs approval.
+/// Commands in an isolated container run without asking; outside one they need approval.
 impl ToolPolicy for Execute {
     const KIND: &'static str = "execute";
 
-    fn approval(args: &ExecuteParameters, sandboxed: bool) -> Approval {
-        approve(args, sandboxed, sandbox::isolated())
-    }
-}
-
-/// In an isolated container there is no sandbox to disable, so `disable_sandbox` is moot.
-fn approve(args: &ExecuteParameters, sandboxed: bool, isolated: bool) -> Approval {
-    if sandboxed && (isolated || args.disable_sandbox != Some(true)) {
-        Approval::auto(format!("[sandboxed] {}", args.command))
-    } else {
-        Approval::ask(format!("execute (not sandboxed): {}", args.command))
+    fn approval(args: &ExecuteParameters, isolated: bool) -> Approval {
+        if isolated {
+            Approval::auto(format!("[isolated] {}", args.command))
+        } else {
+            Approval::ask(format!("execute: {}", args.command))
+        }
     }
 }
 
@@ -49,17 +43,14 @@ fn approve(args: &ExecuteParameters, sandboxed: bool, isolated: bool) -> Approva
 ///   `cat > file <<'EOF' ... EOF`.
 #[rig_tool(params(
     command = "The shell command to run (POSIX sh). Chain steps that depend on each other with `&&`.",
-    timeout_seconds = "Kill the command after this many seconds (default 120, max 600). Raise it for slow builds, installs or test suites.",
-    disable_sandbox = "Set to true only when a command failed with \"Operation not permitted\" or needs network access (e.g. installs, git push); the user must then approve it."
+    timeout_seconds = "Kill the command after this many seconds (default 120, max 600). Raise it for slow builds, installs or test suites."
 ))]
 pub(crate) async fn execute(
     command: String,
     timeout_seconds: Option<u64>,
-    disable_sandbox: Option<bool>,
 ) -> Result<String, ToolExecutionError> {
-    let sandboxed = disable_sandbox != Some(true);
-    let cmd = process::command("sh", ["-c", &command], sandboxed)
-        .map_err(ToolExecutionError::from_error)?;
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.args(["-c", &command]);
     let secs = timeout_seconds
         .unwrap_or(EXECUTE_DEFAULT_TIMEOUT_SECS)
         .clamp(1, EXECUTE_MAX_TIMEOUT_SECS);
@@ -172,28 +163,20 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(3));
     }
 
-    fn approval(args: &str, sandboxed: bool, isolated: bool) -> Approval {
+    fn approval(args: &str, isolated: bool) -> Approval {
         let args = rig_core::serde_json::from_str(args).unwrap();
-        approve(&args, sandboxed, isolated)
+        Execute::approval(&args, isolated)
     }
 
     #[test]
-    fn only_sandboxed_commands_run_without_asking() {
+    fn only_isolated_commands_run_without_asking() {
         assert_eq!(
-            approval(r#"{"command":"ls"}"#, true, false),
-            Approval::auto("[sandboxed] ls")
+            approval(r#"{"command":"ls"}"#, true),
+            Approval::auto("[isolated] ls")
         );
-        assert!(approval(r#"{"command":"ls"}"#, false, false).ask);
-        assert!(approval(r#"{"command":"ls","disable_sandbox":true}"#, true, false).ask);
-    }
-
-    /// Isolated containers have nothing to disable: `disable_sandbox` runs without asking.
-    #[test]
-    fn isolated_commands_run_without_asking() {
-        let disabled = r#"{"command":"ls","disable_sandbox":true}"#;
         assert_eq!(
-            approval(disabled, true, true),
-            Approval::auto("[sandboxed] ls")
+            approval(r#"{"command":"ls"}"#, false),
+            Approval::ask("execute: ls")
         );
     }
 }

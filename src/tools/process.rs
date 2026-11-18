@@ -1,23 +1,6 @@
 //! Helpers for the tools that start processes (`execute`).
 
-use crate::sandbox;
-use std::ffi::OsStr;
 use std::process::ExitStatus;
-
-/// `program args`, in the sandbox when `sandboxed` is requested and the OS supports it
-/// (never when the harness already runs [isolated](sandbox::isolated)).
-pub(crate) fn command<S: AsRef<OsStr>>(
-    program: impl AsRef<OsStr>,
-    args: impl IntoIterator<Item = S>,
-    sandboxed: bool,
-) -> std::io::Result<tokio::process::Command> {
-    if sandboxed && sandbox::supported() && !sandbox::isolated() {
-        return sandbox::command(program, args);
-    }
-    let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args);
-    Ok(cmd)
-}
 
 pub(crate) fn exit_line(status: &ExitStatus) -> String {
     match status.code() {

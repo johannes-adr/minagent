@@ -416,8 +416,9 @@ mod tests {
         vec![event, MockStreamEvent::final_response_with_total_tokens(1)]
     }
 
-    fn unsandboxed_echo() -> Vec<MockStreamEvent> {
-        let args = json!({"command": "echo hi", "disable_sandbox": true});
+    /// Outside an isolated container `execute` needs approval.
+    fn echo() -> Vec<MockStreamEvent> {
+        let args = json!({"command": "echo hi"});
         turn(MockStreamEvent::tool_call("t1", "execute", args))
     }
 
@@ -452,10 +453,7 @@ mod tests {
     /// A call that needs approval is reported, the client is asked, and the result is reported.
     #[tokio::test]
     async fn permission_is_requested_and_tool_result_reported() {
-        let mut client = Client::start(vec![
-            unsandboxed_echo(),
-            turn(MockStreamEvent::text("done")),
-        ]);
+        let mut client = Client::start(vec![echo(), turn(MockStreamEvent::text("done"))]);
         let session = client.new_session().await;
         client.prompt(&session, "say hi").await;
         let mut messages = Vec::new();
@@ -467,10 +465,7 @@ mod tests {
             messages.push(message);
         };
         assert_eq!(request["params"]["toolCall"]["toolCallId"], "t1");
-        assert_eq!(
-            request["params"]["toolCall"]["title"],
-            "execute (not sandboxed): echo hi"
-        );
+        assert_eq!(request["params"]["toolCall"]["title"], "execute: echo hi");
         client
             .send(json!({"jsonrpc": "2.0", "id": request["id"], "result": {"outcome": {"outcome": "selected", "optionId": "allow"}}}))
             .await;
@@ -499,7 +494,7 @@ mod tests {
     /// `session/cancel` while the client is being asked ends the prompt as `cancelled`.
     #[tokio::test]
     async fn cancel_ends_the_prompt() {
-        let mut client = Client::start(vec![unsandboxed_echo()]);
+        let mut client = Client::start(vec![echo()]);
         let session = client.new_session().await;
         client.prompt(&session, "say hi").await;
         let request = loop {
