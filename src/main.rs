@@ -3,7 +3,7 @@ mod frontend;
 mod harness;
 mod tools;
 
-use frontend::{acp, tui};
+use frontend::{acp, tui, web};
 use harness::Session;
 use std::path::Path;
 use std::sync::Arc;
@@ -25,6 +25,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // `--acp` serves the Agent Client Protocol on stdin/stdout instead of the terminal UI.
     let acp = matches!(args.as_slice(), [_, flag] if flag == "--acp");
+    // `--web [addr]` serves the browser UI instead.
+    let web_addr = match args.as_slice() {
+        [_, flag] if flag == "--web" => Some(web::DEFAULT_ADDR),
+        [_, flag, addr] if flag == "--web" => Some(addr.as_str()),
+        _ => None,
+    };
 
     let config = config::Config::load()?;
     if let Some(tools) = config.tools()
@@ -69,6 +75,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if acp {
         acp::serve(|frontend| Session::new(model.clone(), PREAMBLE, frontend)).await?;
+    } else if let Some(addr) = web_addr {
+        let (frontend, inbox) = web::Web::new()?;
+        let session = Session::new(model, PREAMBLE, frontend.clone());
+        web::run(frontend, inbox, session, addr).await?;
     } else {
         tui::run(Session::new(model, PREAMBLE, Arc::new(tui::Tui))).await?;
     }

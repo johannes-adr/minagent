@@ -1,11 +1,13 @@
 //! What the harness reports to a frontend and asks it, plus the frontends themselves:
-//! the terminal UI ([`tui`]) and the Agent Client Protocol server ([`acp`]).
+//! the terminal UI ([`tui`]), the Agent Client Protocol server ([`acp`]) and the
+//! browser UI ([`web`]).
 //!
 //! The harness (agent runs, approval hook) only talks to a [`Frontend`]; tools don't
 //! talk to frontends at all, their results are reported by the hook.
 
 pub mod acp;
 pub mod tui;
+pub mod web;
 
 use futures::future::BoxFuture;
 use rig_core::serde_json::Value;

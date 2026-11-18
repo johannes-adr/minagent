@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff; --surface: #f6f7f9; --border: #e3e5e9; --text: #1d2125; --muted: #667085;
+  --accent: #3b6fd4; --accent-text: #ffffff; --user: #eaf0fc; --code: #f1f3f5;
+  --ok: #1a7f4b; --bad: #c0392b; --warn: #b7791f;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161a; --surface: #1c1f25; --border: #2c3038; --text: #e6e8eb; --muted: #8b93a1;
+    --accent: #5b8def; --accent-text: #0d1117; --user: #1f2a40; --code: #0f1115;
+    --ok: #4cc38a; --bad: #f2776a; --warn: #e2b23f;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body {
+  display: flex; flex-direction: column; background: var(--bg); color: var(--text);
+  font: 15px/1.6 -apple-system, "Segoe UI", system-ui, sans-serif;
+}
+header {
+  display: flex; align-items: center; gap: 10px; padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+}
+header h1 { margin: 0; font-size: 15px; font-weight: 600; }
+#state { margin-left: auto; display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); }
+body.busy .dot { background: var(--accent); animation: pulse 1.1s ease-in-out infinite; }
+body.offline .dot { background: var(--bad); }
+@keyframes pulse { 50% { opacity: .25; } }
+
+#scroll { flex: 1; overflow-y: auto; }
+#chat { max-width: 800px; margin: 0 auto; padding: 24px 20px 12px; display: flex; flex-direction: column; gap: 16px; }
+#empty { color: var(--muted); text-align: center; margin-top: 18vh; }
+#empty b { display: block; font-size: 18px; color: var(--text); margin-bottom: 4px; }
+
+.user { align-self: flex-end; max-width: 85%; background: var(--user); padding: 8px 14px; border-radius: 14px 14px 4px 14px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.assistant { overflow-wrap: anywhere; }
+.assistant > :first-child { margin-top: 0; } .assistant > :last-child { margin-bottom: 0; }
+.assistant h1, .assistant h2, .assistant h3, .assistant h4 { margin: 1.1em 0 .4em; line-height: 1.3; }
+.assistant h1 { font-size: 1.35em; } .assistant h2 { font-size: 1.2em; } .assistant h3, .assistant h4 { font-size: 1.05em; }
+.assistant p { margin: .6em 0; } .assistant ul, .assistant ol { margin: .6em 0; padding-left: 1.5em; }
+.assistant blockquote { margin: .6em 0; padding: 0 12px; border-left: 3px solid var(--border); color: var(--muted); }
+.assistant hr { border: 0; border-top: 1px solid var(--border); }
+.assistant a { color: var(--accent); }
+code { font: 13px var(--mono); background: var(--code); padding: 1px 5px; border-radius: 4px; }
+.code { position: relative; margin: .7em 0; }
+.code pre { margin: 0; }
+pre { margin: 0; padding: 10px 12px; background: var(--code); border: 1px solid var(--border); border-radius: 8px; overflow-x: auto; font: 13px/1.5 var(--mono); }
+pre code { background: none; padding: 0; font: inherit; }
+.copy { position: absolute; top: 6px; right: 6px; font: 12px inherit; padding: 2px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: var(--muted); cursor: pointer; opacity: 0; transition: opacity .15s; }
+.code:hover .copy { opacity: 1; }
+
+.note { color: var(--muted); font-size: 13px; font-style: italic; }
+.error { border: 1px solid var(--bad); color: var(--bad); border-radius: 8px; padding: 8px 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.tool { border: 1px solid var(--border); border-radius: 10px; background: var(--surface); font-size: 13px; }
+.tool > summary { display: flex; align-items: center; gap: 10px; padding: 8px 12px; cursor: pointer; list-style: none; }
+.tool > summary::-webkit-details-marker { display: none; }
+.tool > summary::before { content: "▸"; color: var(--muted); font-size: 11px; }
+.tool[open] > summary::before { content: "▾"; }
+.kind { font: 11px var(--mono); text-transform: uppercase; letter-spacing: .04em; color: var(--muted); border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; }
+.title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--mono); }
+.chip { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+.tool[data-status=done] .chip { color: var(--ok); }
+.tool[data-status=failed] .chip, .tool[data-status=denied] .chip { color: var(--bad); }
+.tool[data-status=pending] { border-color: var(--warn); }
+.tool[data-status=pending] .chip { color: var(--warn); }
+.tool[data-status=running] .chip::before { content: ""; width: 10px; height: 10px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.body { padding: 0 12px 12px; display: flex; flex-direction: column; gap: 8px; }
+.body pre { max-height: 520px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.body .label { color: var(--muted); font-size: 12px; margin-bottom: -4px; }
+.actions { display: flex; gap: 8px; }
+
+button { font: inherit; cursor: pointer; }
+.btn { padding: 5px 14px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+.btn:disabled { opacity: .5; cursor: default; }
+
+footer { border-top: 1px solid var(--border); padding: 12px 20px 16px; }
+#composer { max-width: 800px; margin: 0 auto; display: flex; gap: 10px; align-items: flex-end; border: 1px solid var(--border); border-radius: 14px; background: var(--surface); padding: 8px 8px 8px 14px; }
+#composer:focus-within { border-color: var(--accent); }
+textarea { flex: 1; resize: none; border: 0; outline: 0; background: transparent; color: var(--text); font: inherit; max-height: 200px; padding: 4px 0; }
+#send, #stop { border-radius: 10px; padding: 6px 16px; border: 0; }
+#send { background: var(--accent); color: var(--accent-text); }
+#send:disabled { opacity: .4; cursor: default; }
+#stop { background: var(--bad); color: var(--bg); display: none; }
+body.busy #send { display: none; } body.busy #stop { display: block; }
+.hint { max-width: 800px; margin: 6px auto 0; color: var(--muted); font-size: 12px; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>agent</h1>
+  <div id="state"><span class="dot"></span><span id="state-text">Connecting…</span></div>
+</header>
+<div id="scroll"><div id="chat"><div id="empty"><b>How can I help?</b>Ask something, or give the agent a task.</div></div></div>
+<footer>
+  <div id="composer">
+    <textarea id="input" rows="1" placeholder="Message the agent…" autofocus></textarea>
+    <button id="send" disabled>Send</button>
+    <button id="stop">Stop</button>
+  </div>
+  <div class="hint">Enter to send · Shift+Enter for a new line</div>
+</footer>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const chat = $("chat"), scroller = $("scroll"), input = $("input");
+
+// The token comes in the URL fragment (never sent to a server); keep it for reloads.
+const token = (() => {
+  const found = location.hash.match(/token=([0-9a-f]+)/);
+  if (found) { sessionStorage.setItem("token", found[1]); history.replaceState(null, "", location.pathname); }
+  return sessionStorage.getItem("token") || "";
+})();
+const post = (path, body) => fetch(path, {
+  method: "POST", headers: {"content-type": "application/json", "x-token": token}, body: JSON.stringify(body || {}),
+});
+
+// ---- Markdown (small subset; everything is escaped first) ----
+const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+function inline(text) {
+  const codes = [];
+  let s = esc(text).replace(/`([^`]+)`/g, (_, c) => { codes.push(c); return `\u0001${codes.length - 1}\u0001`; });
+  s = s.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+       .replace(/(^|[^*\w])\*([^*\s][^*]*)\*/g, "$1<em>$2</em>")
+       .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  return s.replace(/\u0001(\d+)\u0001/g, (_, i) => `<code>${codes[i]}</code>`);
+}
+function markdown(source) {
+  const fences = [];
+  // An unfinished fence (still streaming) counts as closed at the end of the text.
+  source = source.replace(/^```[^\n]*\n([\s\S]*?)(?:^```|$(?![\s\S]))/gm, (_, code) => {
+    fences.push(`<div class="code"><button class="copy">Copy</button><pre><code>${esc(code.replace(/\n$/, ""))}</code></pre></div>`);
+    return `\u0000${fences.length - 1}\u0000`;
+  });
+  const out = [];
+  let list = null, para = [];
+  const endPara = () => { if (para.length) { out.push(`<p>${inline(para.join("\n"))}</p>`); para = []; } };
+  const endList = () => { if (list) { out.push(`<${list.tag}>${list.items.map((i) => `<li>${inline(i)}</li>`).join("")}</${list.tag}>`); list = null; } };
+  for (const line of source.split("\n")) {
+    let m;
+    if ((m = line.match(/^\u0000(\d+)\u0000$/))) { endPara(); endList(); out.push(fences[m[1]]); }
+    else if ((m = line.match(/^(#{1,4})\s+(.*)/))) { endPara(); endList(); out.push(`<h${m[1].length}>${inline(m[2])}</h${m[1].length}>`); }
+    else if ((m = line.match(/^\s*([-*]|\d+\.)\s+(.*)/))) {
+      endPara();
+      const tag = /\d/.test(m[1]) ? "ol" : "ul";
+      if (list && list.tag !== tag) endList();
+      (list ??= {tag, items: []}).items.push(m[2]);
+    }
+    else if ((m = line.match(/^>\s?(.*)/))) { endPara(); endList(); out.push(`<blockquote>${inline(m[1])}</blockquote>`); }
+    else if (/^\s*(---|\*\*\*)\s*$/.test(line)) { endPara(); endList(); out.push("<hr>"); }
+    else if (!line.trim()) { endPara(); endList(); }
+    else { endList(); para.push(line); }
+  }
+  endPara(); endList();
+  return out.join("");
+}
+
+// ---- Transcript ----
+let assistant = null;   // the answer block text is currently streaming into
+let tools = new Map();  // tool call id -> {el, data}
+let pinned = true;      // follow new output while the user is at the bottom
+scroller.addEventListener("scroll", () => {
+  pinned = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 80;
+});
+let scrollQueued = false;
+function follow() {
+  if (!pinned || scrollQueued) return;
+  scrollQueued = true;
+  requestAnimationFrame(() => { scrollQueued = false; scroller.scrollTop = scroller.scrollHeight; });
+}
+function add(className, text) {
+  $("empty")?.remove();
+  const el = document.createElement("div");
+  el.className = className;
+  if (text !== undefined) el.textContent = text;
+  chat.append(el);
+  follow();
+  return el;
+}
+
+let renderQueued = false;
+function renderAssistant() {
+  if (renderQueued) return;
+  renderQueued = true;
+  requestAnimationFrame(() => {
+    renderQueued = false;
+    for (const el of chat.querySelectorAll(".assistant[data-dirty]")) {
+      el.innerHTML = markdown(el.dataset.raw);
+      delete el.dataset.dirty;
+    }
+    follow();
+  });
+}
+
+function renderTool(tool) {
+  const {el, data} = tool;
+  const [title, ...rest] = (data.title || data.name || "").split("\n");
+  el.dataset.status = data.status;
+  el.querySelector(".kind").textContent = data.kind || "tool";
+  el.querySelector(".title").textContent = title;
+  el.querySelector(".title").title = title;
+  el.querySelector(".chip span").textContent = {
+    pending: "needs approval", running: "running", done: "done",
+    failed: "failed", denied: "denied", cancelled: "cancelled",
+  }[data.status] || data.status;
+  const body = el.querySelector(".body");
+  body.replaceChildren();
+  const section = (label, text) => {
+    const l = document.createElement("div"); l.className = "label"; l.textContent = label;
+    const pre = document.createElement("pre"); pre.textContent = text;
+    body.append(l, pre);
+  };
+  // The title can be shortened by the tool (a script shows only its first line), so show
+  // every argument as the model sent it.
+  const args = data.args && typeof data.args === "object" ? Object.entries(data.args) : [];
+  if (args.length) {
+    for (const [key, value] of args) section(key, typeof value === "string" ? value : JSON.stringify(value));
+  } else if (rest.length) {
+    section("call", rest.join("\n"));
+  }
+  if (data.output) section("output", data.output);
+  if (data.status === "pending") {
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    for (const [label, allow] of [["Allow", true], ["Deny", false]]) {
+      const b = document.createElement("button");
+      b.className = "btn" + (allow ? " primary" : "");
+      b.textContent = label;
+      b.onclick = () => {
+        actions.querySelectorAll("button").forEach((x) => (x.disabled = true));
+        post("/approve", {id: data.id, allow});
+      };
+      actions.append(b);
+    }
+    body.append(actions);
+  }
+  // Calls that need a decision, run or fail are shown open, so the whole call can be read;
+  // finished ones fold away unless the user has opened or closed the card themselves.
+  if (!tool.touched) el.open = ["pending", "running", "failed"].includes(data.status);
+}
+
+function upsertTool(event) {
+  let tool = tools.get(event.id);
+  if (!tool) {
+    $("empty")?.remove();
+    const el = document.createElement("details");
+    el.className = "tool";
+    el.innerHTML = '<summary><span class="kind"></span><span class="title"></span><span class="chip"><span></span></span></summary><div class="body"></div>';
+    chat.append(el);
+    tool = {el, data: {}, touched: false};
+    el.querySelector("summary").addEventListener("click", () => { tool.touched = true; });
+    tools.set(event.id, tool);
+  }
+  Object.assign(tool.data, event);
+  renderTool(tool);
+  follow();
+}
+
+function setBusy(busy) {
+  document.body.classList.toggle("busy", busy);
+  $("state-text").textContent = busy ? "Working…" : "Ready";
+}
+
+function handle(event) {
+  if (event.type !== "text") assistant = null;
+  switch (event.type) {
+    case "user": add("user", event.text); break;
+    case "text":
+      if (!assistant) assistant = add("assistant");
+      assistant.dataset.raw = (assistant.dataset.raw || "") + event.text;
+      assistant.dataset.dirty = "1";
+      renderAssistant();
+      break;
+    case "note": add("note", event.text); break;
+    case "error": add("error", event.text); break;
+    case "tool": upsertTool(event); break;
+    case "status": setBusy(event.busy); break;
+  }
+}
+
+// ---- Connection: every (re)connect replays the whole transcript ----
+function connect() {
+  const source = new EventSource(`/events?token=${encodeURIComponent(token)}`);
+  source.onopen = () => {
+    document.body.classList.remove("offline");
+    chat.replaceChildren(); tools = new Map(); assistant = null; pinned = true;
+    setBusy(false);
+  };
+  source.onmessage = (message) => handle(JSON.parse(message.data));
+  source.onerror = () => {
+    document.body.classList.add("offline");
+    $("state-text").textContent = source.readyState === EventSource.CLOSED
+      ? "Not connected: open the URL the agent printed" : "Reconnecting…";
+    if (source.readyState === EventSource.CLOSED && token) setTimeout(connect, 3000);
+  };
+}
+connect();
+
+// ---- Composer ----
+async function send() {
+  const text = input.value.trim();
+  if (!text || document.body.classList.contains("busy")) return;
+  const response = await post("/prompt", {text});
+  if (response.status === 202) { input.value = ""; fit(); sendState(); pinned = true; }
+  else if (response.status === 409) add("note", "The agent is still working on the previous message.");
+  else add("error", `Could not send (HTTP ${response.status})`);
+}
+function fit() { input.style.height = "auto"; input.style.height = input.scrollHeight + "px"; }
+function sendState() { $("send").disabled = !input.value.trim(); }
+input.addEventListener("input", () => { fit(); sendState(); });
+input.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); }
+});
+$("send").onclick = send;
+$("stop").onclick = () => post("/cancel");
+chat.addEventListener("click", (e) => {
+  if (!e.target.classList.contains("copy")) return;
+  navigator.clipboard?.writeText(e.target.parentElement.querySelector("pre").innerText);
+  e.target.textContent = "Copied";
+  setTimeout(() => (e.target.textContent = "Copy"), 1200);
+});
+</script>
+</body>
+</html>

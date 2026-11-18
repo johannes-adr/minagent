@@ -1,6 +1,6 @@
 # agent
 
-LLM agent harness with a terminal UI and an [ACP](https://agentclientprotocol.com) server.
+LLM agent harness with a terminal UI, a browser UI and an [ACP](https://agentclientprotocol.com) server.
 Commands run inside a container; the workspace is the only host directory it sees.
 
 ## Run in a container
@@ -8,6 +8,7 @@ Commands run inside a container; the workspace is the only host directory it see
 ```sh
 cp .env.example .env          # in your workspace; fill in LLM_BACKEND, API key, ...
 /path/to/agent/agent.sh       # terminal UI
+/path/to/agent/agent.sh --web # browser UI
 /path/to/agent/agent.sh --acp # ACP over stdio
 ```
 
@@ -36,6 +37,14 @@ Notes:
 - Ollama on the host: `OLLAMA_API_BASE_URL=http://host.docker.internal:11434` (podman: `host.containers.internal`).
 - Podman: add `--userns=keep-id` so files keep your user (the script does). Docker on Linux: add `--user "$(id -u):$(id -g)"`.
 - The container has full network access, and commands in it can read `.env`. Use keys with minimal scope.
+
+## Browser UI
+
+`agent.sh --web` prints a URL like `http://localhost:8080/#token=...`; open it. The page streams the answer as markdown, shows each tool call as a card with all of its arguments (e.g. the full script of an `execute_javascript` call) and its output (open while pending, running or failed, folded once done) and asks for approval with Allow/Deny buttons where the terminal UI would ask `y/N`. Stop cancels the running prompt. Reloading the page or opening a second tab shows the same session.
+
+- The agent can run commands, so the API requires the random token printed at startup (the page keeps it in `sessionStorage` and removes it from the address bar). The script publishes the port on `127.0.0.1` only; `AGENT_WEB_PORT=9000` changes it.
+- Without the script: `agent --web [addr]` (default `127.0.0.1:8080`). In a container use `agent --web 0.0.0.0:8080` with `-p 127.0.0.1:8080:8080`.
+- The page is a single file without external resources ([`src/frontend/web.html`](src/frontend/web.html)), so it works offline.
 
 ## `view_image` tool
 
