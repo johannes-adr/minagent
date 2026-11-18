@@ -38,6 +38,10 @@ Notes:
 - Podman: add `--userns=keep-id` so files keep your user (the script does). Docker on Linux: add `--user "$(id -u):$(id -g)"`.
 - The container has full network access, and commands in it can read `.env`. Use keys with minimal scope.
 
+## `AGENTS.md`
+
+If the working directory contains an [`AGENTS.md`](https://agents.md), its contents are added to the system prompt (of the main agent and its subagents) on startup. Restart the agent after editing it.
+
 ## Browser UI
 
 `agent.sh --web` prints a URL like `http://localhost:8080/#token=...`; open it. The page streams the answer as markdown, shows each tool call as a card with all of its arguments (e.g. the full script of an `execute_javascript` call) and its output (open while pending, running or failed, folded once done) and asks for approval with Allow/Deny buttons where the terminal UI would ask `y/N`. Stop cancels the running prompt. Reloading the page or opening a second tab shows the same session.

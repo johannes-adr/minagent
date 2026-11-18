@@ -53,21 +53,17 @@ impl Skills {
             return String::new();
         }
         let mut out = String::from(
-            "\n\n# Skills\n\nSkills are specialised instructions stored as files. When a task \
-             matches a skill's description, you MUST first load its full instructions with the \
-             `use_skill` tool (argument `name`: the skill's name) and then follow them (do not \
-             answer from the description alone). A skill's name is not a tool: never call a skill \
-             by its name, call `use_skill` with it. Scripts of a skill are shell scripts, run \
-             with the `execute` tool, e.g. `sh skills/<name>/scripts/x.sh [args]`.\n\n\
-             <available_skills>\n",
+            "\n\n# Skills\n\nSkills are task-specific instructions. If a task clearly matches a \
+             skill's description, call `use_skill` with its name before doing anything else, then \
+             follow the returned instructions. Load each skill at most once per conversation, and \
+             only skills listed here.\n\n<available_skills>\n",
         );
         for skill in &self.skills {
             let _ = write!(
                 out,
-                "<skill>\n<name>{}</name>\n<description>{}</description>\n<location>{}</location>\n</skill>\n",
+                "<skill>\n<name>{}</name>\n<description>{}</description>\n</skill>\n",
                 escape(&skill.name),
                 escape(&skill.description),
-                escape(&skill.location.display().to_string()),
             );
         }
         out.push_str("</available_skills>\n");
@@ -258,8 +254,8 @@ mod tests {
         assert_eq!(names, ["creating-skills"]);
         let prompt = skills.prompt();
         assert!(prompt.contains("<name>creating-skills</name>"), "{prompt}");
-        assert!(prompt.contains("`use_skill` tool"), "{prompt}");
-        assert!(prompt.contains("sh skills/<name>/scripts/x.sh"), "{prompt}");
+        assert!(prompt.contains("call `use_skill`"), "{prompt}");
+        assert!(!prompt.contains("<location>"), "{prompt}");
         assert!(!prompt.contains("--js"), "{prompt}");
         let _ = fs::remove_dir_all(&dir);
     }
