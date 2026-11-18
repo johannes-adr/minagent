@@ -29,6 +29,28 @@ fn preamble_with_agents_md(dir: &Path) -> String {
     }
 }
 
+/// Today's date (UTC) as `YYYY-MM-DD`, from the system clock.
+fn today() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    date_from_unix(secs)
+}
+
+/// Civil date for a Unix timestamp (Howard Hinnant's `civil_from_days`).
+fn date_from_unix(secs: u64) -> String {
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
@@ -98,7 +120,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         eprintln!("skills: {warning}");
     }
 
-    let preamble = preamble_with_agents_md(Path::new("."));
+    let preamble = format!(
+        "{}\n\nThe session started on {} (UTC).",
+        preamble_with_agents_md(Path::new(".")),
+        today()
+    );
     let new_session = |frontend| {
         Session::new(model.clone(), &preamble, frontend).with_context_window(context_window)
     };
@@ -124,6 +150,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unix_time_becomes_a_date() {
+        assert_eq!(date_from_unix(0), "1970-01-01");
+        assert_eq!(date_from_unix(951_782_400), "2000-02-29");
+        assert_eq!(date_from_unix(1_795_000_000), "2026-11-18");
+    }
 
     #[test]
     fn agents_md_is_appended_to_the_preamble() {
