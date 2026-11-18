@@ -12,7 +12,7 @@ use std::sync::Arc;
 /// Added to the system prompt of every subagent.
 const SUBAGENT_NOTE: &str = "\n\n# Subagent\n\nYou are a subagent. Complete the task autonomously and end with a concise final report of what you found or did; the report is all the caller sees. You cannot start further subagents (there is no `agent` tool for you) and you cannot ask the caller questions.";
 
-const DESCRIPTION: &str = "Delegate a self-contained task to a subagent that works in its own fresh context and returns only its final report. The subagent has the same tools as you (`execute`, `execute_javascript`, `use_skill`) but does not see this conversation; the call blocks until it is done.
+const DESCRIPTION: &str = "Delegate a self-contained task to a subagent that works in its own fresh context and returns only its final report. The subagent has the same tools as you (`execute`, `use_skill`) but does not see this conversation; the call blocks until it is done.
 
 Use it for large searches or exploration, reading many files or long logs, and independent sub-tasks whose details you do not need afterwards. This keeps your own context small.
 Do not use it for simple lookups (run `execute` yourself) or for tasks that need the conversation's context; if you delegate such a task anyway, put everything the subagent needs into `prompt`.
@@ -139,7 +139,7 @@ mod tests {
         assert!(tool_names(&requests[0]).contains(&"agent".to_string()));
         let sub_tools = tool_names(&requests[1]);
         assert!(!sub_tools.contains(&"agent".to_string()), "{sub_tools:?}");
-        for name in ["execute", "execute_javascript", "use_skill"] {
+        for name in ["execute", "use_skill"] {
             assert!(sub_tools.contains(&name.to_string()), "{sub_tools:?}");
         }
         // The subagent starts fresh: it sees its prompt, not the main conversation.

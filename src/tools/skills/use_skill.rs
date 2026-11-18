@@ -11,9 +11,9 @@ use std::path::Path;
 /// Load the full instructions of a skill listed under `available_skills` in the system prompt.
 /// Call it BEFORE starting a task that matches a skill's description, then follow the
 /// instructions it returns. Paths in them (`scripts/...`, `references/...`, `assets/...`)
-/// are relative to the returned skill directory. Run the skill's scripts with `execute`,
-/// e.g. `<exe> --js skills/<name>/scripts/x.js [args]`, where `<exe>` is the agent
-/// executable from the system prompt. A skill is not a tool: load it with this tool.
+/// are relative to the returned skill directory. Run the skill's scripts (shell scripts)
+/// with `execute`, e.g. `sh skills/<name>/scripts/x.sh [args]`. A skill is not a tool:
+/// load it with this tool.
 #[rig_tool(params(
     name = "Name of the skill to load, exactly as listed under available_skills (e.g. `creating-skills`)."
 ))]

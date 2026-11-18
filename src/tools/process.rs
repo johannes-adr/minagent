@@ -1,18 +1,18 @@
-//! Helpers shared by the tools that start processes (`execute`, `execute_javascript`).
+//! Helpers for the tools that start processes (`execute`).
 
 use crate::sandbox;
 use std::ffi::OsStr;
 use std::process::ExitStatus;
 
-/// `program args`, in the sandbox when `sandboxed` is requested and the OS supports it.
+/// `program args`, in the sandbox when `sandboxed` is requested and the OS supports it
+/// (never when the harness already runs [isolated](sandbox::isolated)).
 pub(crate) fn command<S: AsRef<OsStr>>(
     program: impl AsRef<OsStr>,
     args: impl IntoIterator<Item = S>,
     sandboxed: bool,
-    allow_network: bool,
 ) -> std::io::Result<tokio::process::Command> {
-    if sandboxed && sandbox::supported() {
-        return sandbox::command(program, args, allow_network);
+    if sandboxed && sandbox::supported() && !sandbox::isolated() {
+        return sandbox::command(program, args);
     }
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args);

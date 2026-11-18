@@ -42,8 +42,8 @@ skills/<skill-name>/
    edge cases. Keep it under 500 lines (about 5000 tokens).
 4. Move long material to `references/*.md` and link it relatively
    (`See [details](references/REFERENCE.md)`), one level deep. Put runnable code in `scripts/`
-   and tell in the body how to run it, e.g. `AGENT --js skills/<skill-name>/scripts/run.js [args]`
-   (`AGENT` is the agent executable from the system prompt; script arguments are in `globalThis.ARGS`).
+   as shell scripts and tell in the body how to run them, e.g.
+   `sh skills/<skill-name>/scripts/run.sh [args]` (script arguments are `$1`, `$2`, ...).
 5. Check it: call the `use_skill` tool with `name` set to `<skill-name>`. It must return your
    instructions. The skill appears in the system prompt after the agent is restarted.
    A skill with invalid frontmatter is skipped with a warning at startup.

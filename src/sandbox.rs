@@ -7,7 +7,6 @@
 //! readable so `ls -l` etc. keep working. (Bob also protects its own `.bob` directory;
 //! this project has no such directory, so that rule is dropped.)
 
-use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -76,28 +75,25 @@ pub fn supported() -> bool {
     cfg!(target_os = "macos") && Path::new(SANDBOX_EXEC).exists()
 }
 
+/// Whether the harness already runs inside an isolated container (`AGENT_ISOLATED=1` in the
+/// process environment): commands then run directly and count as sandboxed.
+pub fn isolated() -> bool {
+    std::env::var_os("AGENT_ISOLATED").is_some_and(|v| v == "1")
+}
+
 /// Wraps `program args...` in `sandbox-exec`, scoped to the current directory as workspace.
-/// With `allow_network`, outbound internet access is allowed on top of the localhost-only profile.
 pub fn command<S: AsRef<OsStr>>(
     program: impl AsRef<OsStr>,
     args: impl IntoIterator<Item = S>,
-    allow_network: bool,
 ) -> io::Result<Command> {
-    command_in(&std::env::current_dir()?, program, args, allow_network)
+    command_in(&std::env::current_dir()?, program, args)
 }
 
 fn command_in<S: AsRef<OsStr>>(
     workspace: &Path,
     program: impl AsRef<OsStr>,
     args: impl IntoIterator<Item = S>,
-    allow_network: bool,
 ) -> io::Result<Command> {
-    // Later SBPL rules win, so this overrides the localhost-only `network-outbound` rule.
-    let profile = if allow_network {
-        Cow::Owned(format!("{PROFILE}(allow network-outbound)\n"))
-    } else {
-        Cow::Borrowed(PROFILE)
-    };
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::other("HOME is not set"))?;
@@ -106,7 +102,7 @@ fn command_in<S: AsRef<OsStr>>(
     };
     let mut cmd = Command::new(SANDBOX_EXEC);
     cmd.arg("-p")
-        .arg(&*profile)
+        .arg(PROFILE)
         .args(["-D", &param("HOME", &home)?])
         .args(["-D", &param("WORKSPACE", workspace)?])
         .args(["-D", &param("TMP", &std::env::temp_dir())?])
@@ -140,11 +136,7 @@ mod tests {
 
     /// Runs `sh -c script` sandboxed in `ws`; returns (success, stderr).
     async fn run(ws: &Workspace, script: &str) -> (bool, String) {
-        run_net(ws, script, false).await
-    }
-
-    async fn run_net(ws: &Workspace, script: &str, allow_network: bool) -> (bool, String) {
-        let out = command_in(&ws.0, "sh", ["-c", script], allow_network)
+        let out = command_in(&ws.0, "sh", ["-c", script])
             .unwrap()
             .current_dir(&ws.0)
             .output()
@@ -245,15 +237,12 @@ mod tests {
     /// Needs internet, so it is not run by default: `cargo test -- --ignored`.
     #[tokio::test]
     #[ignore = "requires internet access"]
-    async fn network_only_with_allow_network() {
+    async fn blocks_internet_access() {
         if !supported() {
             return;
         }
         let ws = Workspace::new("net");
-        let curl = "curl -sS -m 10 -o /dev/null https://example.com";
-        let (ok, _) = run_net(&ws, curl, false).await;
-        assert!(!ok, "internet must be blocked by default");
-        let (ok, err) = run_net(&ws, curl, true).await;
-        assert!(ok, "{err}");
+        let (ok, _) = run(&ws, "curl -sS -m 10 -o /dev/null https://example.com").await;
+        assert!(!ok, "internet must be blocked");
     }
 }

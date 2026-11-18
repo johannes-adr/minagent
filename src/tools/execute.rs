@@ -1,6 +1,7 @@
 //! The `execute` tool: runs shell commands, sandboxed where supported.
 
 use crate::harness::{Approval, ToolPolicy};
+use crate::sandbox;
 use crate::tools::process::{self, exit_line, format_output};
 use rig_agent::rig_tool;
 use rig_core::tool::ToolExecutionError;
@@ -17,11 +18,16 @@ impl ToolPolicy for Execute {
     const KIND: &'static str = "execute";
 
     fn approval(args: &ExecuteParameters, sandboxed: bool) -> Approval {
-        if sandboxed && args.disable_sandbox != Some(true) {
-            Approval::auto(format!("[sandboxed] {}", args.command))
-        } else {
-            Approval::ask(format!("execute (not sandboxed): {}", args.command))
-        }
+        approve(args, sandboxed, sandbox::isolated())
+    }
+}
+
+/// In an isolated container there is no sandbox to disable, so `disable_sandbox` is moot.
+fn approve(args: &ExecuteParameters, sandboxed: bool, isolated: bool) -> Approval {
+    if sandboxed && (isolated || args.disable_sandbox != Some(true)) {
+        Approval::auto(format!("[sandboxed] {}", args.command))
+    } else {
+        Approval::ask(format!("execute (not sandboxed): {}", args.command))
     }
 }
 
@@ -39,7 +45,8 @@ impl ToolPolicy for Execute {
 /// - Start servers and watchers in the background with their output redirected, e.g.
 ///   `nohup npm run dev > dev.log 2>&1 &`, and read the log in a later call.
 /// - Also use it to read, search and inspect files (`cat -n`, `grep -rn`, `find`, `ls`, `git`).
-///   For multi-line file edits, `execute_javascript` with `node:fs` is more reliable than `sed`.
+///   For multi-line file edits, a heredoc is more reliable than `sed`:
+///   `cat > file <<'EOF' ... EOF`.
 #[rig_tool(params(
     command = "The shell command to run (POSIX sh). Chain steps that depend on each other with `&&`.",
     timeout_seconds = "Kill the command after this many seconds (default 120, max 600). Raise it for slow builds, installs or test suites.",
@@ -51,7 +58,7 @@ pub(crate) async fn execute(
     disable_sandbox: Option<bool>,
 ) -> Result<String, ToolExecutionError> {
     let sandboxed = disable_sandbox != Some(true);
-    let cmd = process::command("sh", ["-c", &command], sandboxed, false)
+    let cmd = process::command("sh", ["-c", &command], sandboxed)
         .map_err(ToolExecutionError::from_error)?;
     let secs = timeout_seconds
         .unwrap_or(EXECUTE_DEFAULT_TIMEOUT_SECS)
@@ -165,18 +172,28 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(3));
     }
 
-    fn approval(args: &str, sandboxed: bool) -> Approval {
+    fn approval(args: &str, sandboxed: bool, isolated: bool) -> Approval {
         let args = rig_core::serde_json::from_str(args).unwrap();
-        Execute::approval(&args, sandboxed)
+        approve(&args, sandboxed, isolated)
     }
 
     #[test]
     fn only_sandboxed_commands_run_without_asking() {
         assert_eq!(
-            approval(r#"{"command":"ls"}"#, true),
+            approval(r#"{"command":"ls"}"#, true, false),
             Approval::auto("[sandboxed] ls")
         );
-        assert!(approval(r#"{"command":"ls"}"#, false).ask);
-        assert!(approval(r#"{"command":"ls","disable_sandbox":true}"#, true).ask);
+        assert!(approval(r#"{"command":"ls"}"#, false, false).ask);
+        assert!(approval(r#"{"command":"ls","disable_sandbox":true}"#, true, false).ask);
+    }
+
+    /// Isolated containers have nothing to disable: `disable_sandbox` runs without asking.
+    #[test]
+    fn isolated_commands_run_without_asking() {
+        let disabled = r#"{"command":"ls","disable_sandbox":true}"#;
+        assert_eq!(
+            approval(disabled, true, true),
+            Approval::auto("[sandboxed] ls")
+        );
     }
 }

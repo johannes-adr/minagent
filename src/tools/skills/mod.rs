@@ -48,19 +48,18 @@ impl Skills {
     }
 
     /// The system prompt section: how to load skills and the list of available skills.
-    pub fn prompt(&self, agent_exe: &Path) -> String {
+    pub fn prompt(&self) -> String {
         if self.skills.is_empty() {
             return String::new();
         }
-        let exe = agent_exe.display();
-        let mut out = format!(
+        let mut out = String::from(
             "\n\n# Skills\n\nSkills are specialised instructions stored as files. When a task \
              matches a skill's description, you MUST first load its full instructions with the \
              `use_skill` tool (argument `name`: the skill's name) and then follow them (do not \
              answer from the description alone). A skill's name is not a tool: never call a skill \
-             by its name, call `use_skill` with it. Scripts of a skill are run with the `execute` \
-             tool.\n\n\
-             JavaScript files are run with `{exe} --js <file> [args]`.\n\n<available_skills>\n"
+             by its name, call `use_skill` with it. Scripts of a skill are shell scripts, run \
+             with the `execute` tool, e.g. `sh skills/<name>/scripts/x.sh [args]`.\n\n\
+             <available_skills>\n",
         );
         for skill in &self.skills {
             let _ = write!(
@@ -77,11 +76,12 @@ impl Skills {
 }
 
 fn escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
-/// Writes the embedded skills to `root` (the skill text refers to the agent executable
-/// as `AGENT`; the system prompt gives its path) and removes retired built-in skills.
+/// Writes the embedded skills to `root` and removes retired built-in skills.
 fn install_builtin(root: &Path) -> io::Result<()> {
     for name in REMOVED_BUILTIN {
         let stale = root.join(name);
@@ -148,7 +148,9 @@ fn split_frontmatter(text: &str) -> Result<(&str, &str), &'static str> {
 
 /// The instructions of a `SKILL.md`: its body without the frontmatter, trimmed.
 pub fn instructions(text: &str) -> &str {
-    split_frontmatter(text).map_or(text, |(_, body)| body).trim()
+    split_frontmatter(text)
+        .map_or(text, |(_, body)| body)
+        .trim()
 }
 
 /// Parses and validates the frontmatter of a `SKILL.md`; returns (name, description).
@@ -174,7 +176,9 @@ fn parse(text: &str, dir_name: &str) -> Result<(String, String), String> {
     let description = description.ok_or("missing `description`")?;
     validate_name(&name)?;
     if name != dir_name {
-        return Err(format!("name `{name}` does not match directory `{dir_name}`"));
+        return Err(format!(
+            "name `{name}` does not match directory `{dir_name}`"
+        ));
     }
     if description.is_empty() || description.chars().count() > 1024 {
         return Err("`description` must be 1-1024 characters".into());
@@ -192,13 +196,18 @@ fn unquote(v: &str) -> String {
 }
 
 fn validate_name(name: &str) -> Result<(), String> {
-    let ok_char = |c: char| c.is_lowercase() && c.is_alphanumeric() || c.is_ascii_digit() || c == '-';
+    let ok_char =
+        |c: char| c.is_lowercase() && c.is_alphanumeric() || c.is_ascii_digit() || c == '-';
     if name.is_empty() || name.chars().count() > 64 {
         Err("`name` must be 1-64 characters".into())
     } else if !name.chars().all(ok_char) {
-        Err(format!("`name` `{name}` may only contain lowercase letters, digits and hyphens"))
+        Err(format!(
+            "`name` `{name}` may only contain lowercase letters, digits and hyphens"
+        ))
     } else if name.starts_with('-') || name.ends_with('-') || name.contains("--") {
-        Err(format!("`name` `{name}` must not start/end with or repeat hyphens"))
+        Err(format!(
+            "`name` `{name}` must not start/end with or repeat hyphens"
+        ))
     } else {
         Ok(())
     }
@@ -247,11 +256,11 @@ mod tests {
         assert!(skills.warnings.is_empty(), "{:?}", skills.warnings);
         let names: Vec<_> = skills.skills.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, ["creating-skills"]);
-        let prompt = skills.prompt(Path::new("/bin/agent"));
+        let prompt = skills.prompt();
         assert!(prompt.contains("<name>creating-skills</name>"), "{prompt}");
         assert!(prompt.contains("`use_skill` tool"), "{prompt}");
-        assert!(prompt.contains("/bin/agent --js <file> [args]"), "{prompt}");
-        assert!(!prompt.contains("use_skill.js"), "{prompt}");
+        assert!(prompt.contains("sh skills/<name>/scripts/x.sh"), "{prompt}");
+        assert!(!prompt.contains("--js"), "{prompt}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -262,7 +271,11 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let stale = dir.join("using-skills/scripts");
         fs::create_dir_all(&stale).unwrap();
-        fs::write(dir.join("using-skills/SKILL.md"), "---\nname: using-skills\ndescription: old\n---\n").unwrap();
+        fs::write(
+            dir.join("using-skills/SKILL.md"),
+            "---\nname: using-skills\ndescription: old\n---\n",
+        )
+        .unwrap();
         fs::write(stale.join("use_skill.js"), "").unwrap();
         let skills = Skills::load(&dir).unwrap();
         assert!(!dir.join("using-skills").exists());

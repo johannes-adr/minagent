@@ -3,6 +3,5 @@
 
 pub mod agent;
 pub mod execute;
-pub mod execute_javascript;
 mod process;
 pub mod skills;

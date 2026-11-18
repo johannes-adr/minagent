@@ -9,7 +9,6 @@ use crate::frontend::{Event, Frontend, ToolCall};
 use crate::sandbox;
 use crate::tools::agent::Subagent;
 use crate::tools::execute::Execute;
-use crate::tools::execute_javascript::ExecuteJavascript;
 use crate::tools::skills::{self, use_skill::UseSkill};
 use futures::StreamExt;
 use rig_agent::AgentBuilder;
@@ -68,7 +67,8 @@ pub trait ToolPolicy: Tool + 'static {
     /// ACP tool kind (`execute`, `read`, `edit`, `search`, `fetch`, `think`, `other`, ...).
     const KIND: &'static str = "other";
     /// How a call with `args` is shown and whether the user must approve it.
-    /// `sandboxed` is whether the OS sandbox is available.
+    /// `sandboxed` is whether commands are contained: the OS sandbox is available or the
+    /// harness runs in an isolated container.
     fn approval(args: &Self::Args, sandboxed: bool) -> Approval;
 }
 
@@ -121,7 +121,6 @@ fn tools(model: &DynModel<Completion>, preamble: &str) -> Tools {
         policies: HashMap::new(),
     }
     .add(Execute)
-    .add(ExecuteJavascript)
     .add(UseSkill)
 }
 
@@ -151,7 +150,7 @@ struct Approve {
 fn unknown_tool_feedback(tool: &str, available: &[String], is_skill: bool) -> String {
     let mut text = format!(
         "There is no tool named `{tool}`. Available tools: {}. Retry with one of these \
-         (use `execute` for shell commands, `execute_javascript` for JavaScript).",
+         (use `execute` for shell commands).",
         available.join(", ")
     );
     if is_skill {
@@ -223,7 +222,8 @@ impl AgentHook for Approve {
         let id = event
             .call_id
             .map_or_else(|| event.id.to_string(), ToString::to_string);
-        let call = self.tool_call(id, name, args, sandbox::supported());
+        let contained = sandbox::supported() || sandbox::isolated();
+        let call = self.tool_call(id, name, args, contained);
         if call.ask && !self.frontend.approve(&call).await {
             self.frontend.emit(Event::ToolDenied(call));
             return DispatchAction::skip("the user denied this tool call");
@@ -439,10 +439,10 @@ mod tests {
 
     #[test]
     fn unknown_tool_feedback_lists_available_tools() {
-        let tools = ["execute".into(), "execute_javascript".into()];
+        let tools = ["execute".into(), "agent".into()];
         let text = unknown_tool_feedback("bash", &tools, false);
         assert!(
-            text.contains("`bash`") && text.contains("execute, execute_javascript"),
+            text.contains("`bash`") && text.contains("execute, agent"),
             "{text}"
         );
         assert!(!text.contains("use_skill"), "{text}");
