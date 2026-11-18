@@ -26,7 +26,7 @@ There is no `require`, no `import`, no timers, and no access to processes or env
 variables. Top-level `await` works because the script runs as an ES module.
 
 ```js
-const r = await fetch("https://api.github.com/repos/rust-lang/rust", { secret: "github" });
+const r = await fetch("https://api.github.com/repos/rust-lang/rust", { secret: "GITHUB" });
 const repo = await r.json();
 fs.writeText("out/stars.txt", String(repo.stargazers_count));
 console.log(repo.full_name, repo.stargazers_count);
@@ -89,7 +89,7 @@ await runScript("greet.js", ["a", "b"]); // prints "hello a b", resolves to 2
 
 ```sh
 AGENT_JS_ALLOWED_HOSTS=api.github.com,example.com   # calls to these hosts run without asking
-AGENT_SECRET_GITHUB=api.github.com Bearer ghp_xxx   # used as fetch(url, { secret: "github" })
+AGENT_SECRET_GITHUB=api.github.com Bearer ghp_xxx   # used as fetch(url, { secret: "GITHUB" })
 ```
 
 ## Adding a host function

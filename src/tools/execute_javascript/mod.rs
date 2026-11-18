@@ -78,11 +78,13 @@ impl ToolPolicy for ExecuteJavascript {
             "Use `execute_javascript` for workflow automation: calling APIs and transforming data. \
 The script is an ES module (top-level `await` works) and has only these globals: \
 `console.log/info/warn/error`; `fetch(url, {{method, headers, body, secret}})` returning a promise of \
-`{{status, ok, headers, text(), json()}}` (`body` is a string, use `JSON.stringify`); the synchronous \
+`{{status, ok, headers, text(), json()}}` (`body` is a string, use `JSON.stringify`; response `headers` is a plain \
+object with lowercase keys; redirects are not followed); the synchronous \
 `fs.readText(path)`, `fs.writeText(path, text)`, `fs.list(path)`, `fs.exists(path)`, whose paths are relative \
 to the `work` directory (created on first use; `.env*` files are not accessible); and \
-`runScript(path, args = [])`, which runs a script saved with `fs.writeText` and returns its result. The saved \
-script is a function body (no `import`/`export`) that sees `args`, may `await` and `return` a value. There are no \
+`await runScript(path, args = [])`, which runs a script saved with `fs.writeText`. The saved script is a function \
+body (no `import`/`export`) that sees `args`, may `await`, and whose `return` value is the result. \
+Each call starts fresh; only files in `work` persist between calls. There are no \
 timers, no `require`/`import`, no npm packages, no process or environment access and no way to start a process. \
 `fetch` only reaches `https://` hosts you list in \
 the `hosts` argument (the user must approve hosts that are not pre-approved). \
@@ -114,7 +116,7 @@ fn approval(args: &ExecuteJavascriptParameters, allowed: &[String]) -> Approval 
 
 /// Run a JavaScript (ES module) script in a sandboxed in-process runtime and return its
 /// console output and, if it threw, the error. For workflow automation: calling APIs
-/// with `fetch` and transforming data. Only `console`, `fetch` and `fs` exist; there is
+/// with `fetch` and transforming data. Only `console`, `fetch`, `fs` and `runScript` exist; there is
 /// no `require`, no npm and no process access.
 #[rig_tool(params(
     code = "The script (ES module; top-level await works). Print results with console.log.",
