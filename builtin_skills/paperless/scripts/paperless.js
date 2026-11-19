@@ -540,6 +540,7 @@ export class Paperless {
       title: doc.title,
       created: doc.created,
       added: doc.added?.slice(0, 10),
+      modified: doc.modified,
       correspondent: await name("correspondent", doc.correspondent),
       document_type: await name("documentType", doc.document_type),
       storage_path: await name("storagePath", doc.storage_path),
@@ -624,14 +625,25 @@ export class Paperless {
     return out;
   }
 
+  /** Throws if the document's `modified` differs from `modified` (somebody changed it meanwhile). */
+  async assertUnchanged(id, modified) {
+    const now = (await this.get(`/api/documents/${id}/`, { fields: "modified" })).modified;
+    if (new Date(now).getTime() !== new Date(modified).getTime()) {
+      throw new Error(`document ${id} was changed since you read it (modified ${now}, expected ${modified}); read it again and redo the proposal`);
+    }
+  }
+
   /**
    * Changes one document. `changes`: title, created ("YYYY-MM-DD"), asn, correspondent,
    * documentType, storagePath (name, id or null), tags (replaces all), addTags, removeTags,
    * customFields ({name: value}; null removes the field), removeInboxTags (true), owner.
    * Names that do not exist yet are created for tags/correspondents/document types when
-   * `create: true`. Returns the updated compact document.
+   * `create: true`. With `unchangedSince` (the `modified` of the document as you read it) it
+   * throws, before changing anything, if the document was changed since. Returns the updated
+   * compact document.
    */
-  async update(id, changes, { create = false } = {}) {
+  async update(id, changes, { create = false, unchangedSince } = {}) {
+    if (unchangedSince) await this.assertUnchanged(id, unchangedSince);
     const body = {};
     const opts = { create };
     let current;

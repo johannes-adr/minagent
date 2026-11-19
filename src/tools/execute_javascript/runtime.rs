@@ -6,8 +6,8 @@
 //! either done or waits for a promise that can never settle.
 
 use super::modules::{SkillLoader, SkillResolver, skills_root};
+use crate::tools::skills::SkillFilter;
 use super::{Settings, fetch::Fetch, fs};
-use crate::frontend::Frontend;
 use rquickjs::{
     CatchResultExt, CaughtError, Context, Ctx, Error, Exception, Function, Module, Object, Result,
     Runtime,
@@ -30,6 +30,8 @@ pub(super) struct Outcome {
     pub exit: String,
     pub stdout: String,
     pub stderr: String,
+    /// The requests that changed data, as `METHOD url -> status`.
+    pub sent: Vec<String>,
 }
 
 /// Console output of a run: `log`/`info` to stdout, `warn`/`error` to stderr.
@@ -53,26 +55,29 @@ impl Output {
 }
 
 /// Runs `code` as an ES module (so top-level `await` works) in a fresh runtime. `hosts`
-/// are the hostnames `fetch` may contact. Blocks until the script is done or `timeout`
+/// are the hostnames `fetch` may contact, and `writes` whether it may change data there. Blocks until the script is done or `timeout`
 /// has passed; call it from a blocking thread inside a tokio runtime (`handle`).
 pub(super) fn run(
     code: &str,
     hosts: Vec<String>,
-    confirm_writes: Option<Arc<dyn Frontend>>,
+    writes: bool,
     timeout: Duration,
     settings: Arc<Settings>,
+    skills: SkillFilter,
     handle: Handle,
 ) -> Outcome {
     let deadline = Instant::now() + timeout;
     let output = Rc::new(RefCell::new(Output::default()));
+    let sent = Rc::new(RefCell::new(Vec::new()));
     let fetch = Fetch {
         hosts,
-        confirm_writes,
+        writes,
         settings,
         deadline,
         handle,
+        sent: sent.clone(),
     };
-    let result = evaluate(code, deadline, fetch, &output);
+    let result = super::modules::with_filter(skills, || evaluate(code, deadline, fetch, &output));
     let mut output = output.take();
     let exit = match result {
         Ok(()) => "ok".to_owned(),
@@ -89,6 +94,7 @@ pub(super) fn run(
         exit,
         stdout: output.stdout,
         stderr: output.stderr,
+        sent: sent.take(),
     }
 }
 

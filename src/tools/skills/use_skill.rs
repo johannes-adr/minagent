@@ -2,9 +2,9 @@
 //! (e.g. a reference document on a subtopic) when the instructions name it.
 
 use crate::harness::{Approval, Context, ToolPolicy};
-use crate::tools::skills::{self, Skill};
-use rig_agent::rig_tool;
-use rig_core::tool::ToolExecutionError;
+use crate::tools::skills::{self, Skill, SkillFilter};
+use rig_core::tool::{Tool, ToolContext};
+use std::convert::Infallible;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -12,33 +12,76 @@ use std::path::{Component, Path, PathBuf};
 /// At most this many files are listed when a requested file does not exist.
 const MAX_LISTED_FILES: usize = 50;
 
-/// Load the full instructions of a skill listed under `available_skills` in the system prompt.
-/// Call it BEFORE starting a task that matches a skill's description, then follow the
-/// instructions it returns. Paths in them (`scripts/...`, `references/...`, `assets/...`)
-/// are relative to the returned skill directory. When the instructions name a document for a
-/// subtopic (e.g. `references/search.md`), load it only once the task needs it: call this tool
-/// again with the same `name` and `file` set to that path. Run the skill's scripts (shell
-/// scripts) with `execute`, e.g. `sh skills/<name>/scripts/x.sh [args]`. Import the skill's
-/// JavaScript modules in `execute_javascript`: `import { f } from "skill:<name>/scripts/x.js"`.
-/// A skill is not a tool: load it with this tool.
-#[rig_tool(params(
-    name = "Name of the skill to load, exactly as listed under available_skills (e.g. `creating-skills`).",
-    file = "Optional: a file of the skill to load instead of its instructions, as the instructions name it (e.g. `references/search.md`). Omit it to load the instructions."
-))]
-pub(crate) async fn use_skill(
-    name: String,
-    file: Option<String>,
-) -> Result<String, ToolExecutionError> {
-    Ok(load(Path::new(skills::DIR), &name, file.as_deref()))
+const DESCRIPTION: &str = "Load the full instructions of a skill listed under `available_skills` in the system prompt. \
+Call it BEFORE starting a task that matches a skill's description, then follow the \
+instructions it returns. Paths in them (`scripts/...`, `references/...`, `assets/...`) \
+are relative to the returned skill directory. When the instructions name a document for a \
+subtopic (e.g. `references/search.md`), load it only once the task needs it: call this tool \
+again with the same `name` and `file` set to that path. Run the skill's scripts (shell \
+scripts) with `execute`, e.g. `sh skills/<name>/scripts/x.sh [args]`. Import the skill's \
+JavaScript modules in `execute_javascript`: `import { f } from \"skill:<name>/scripts/x.js\"`. \
+A skill is not a tool: load it with this tool.";
+
+#[derive(rig_core::serde::Deserialize, rig_core::schemars::JsonSchema)]
+#[serde(crate = "rig_core::serde")]
+#[schemars(crate = "rig_core::schemars")]
+pub(crate) struct UseSkillParameters {
+    /// Name of the skill to load, exactly as listed under available_skills (e.g. `creating-skills`).
+    pub name: String,
+    /// Optional: a file of the skill to load instead of its instructions, as the instructions name it (e.g. `references/search.md`). Omit it to load the instructions.
+    #[serde(default)]
+    pub file: Option<String>,
+}
+
+/// Loads skills. It cannot be a `#[rig_tool]` function because it needs to know which
+/// skills the agent may use.
+pub(crate) struct UseSkill {
+    allowed: SkillFilter,
+}
+
+impl UseSkill {
+    pub(crate) fn new(allowed: SkillFilter) -> Self {
+        Self { allowed }
+    }
+}
+
+impl Tool for UseSkill {
+    const NAME: &'static str = "use_skill";
+    type Args = UseSkillParameters;
+    type Output = String;
+    type Error = Infallible;
+
+    fn description(&self) -> String {
+        DESCRIPTION.to_string()
+    }
+
+    fn parameters(&self) -> rig_core::serde_json::Value {
+        rig_core::schemars::schema_for!(UseSkillParameters).to_value()
+    }
+
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<String, Infallible> {
+        Ok(load(
+            Path::new(skills::DIR),
+            &args.name,
+            args.file.as_deref(),
+            &self.allowed,
+        ))
+    }
 }
 
 /// Loading a skill only reads files, so it needs no approval.
 impl ToolPolicy for UseSkill {
     const KIND: &'static str = "read";
 
-    /// How to load skills and the list of available skills.
-    fn prompt(_context: &Context) -> String {
-        skills::discover(Path::new(skills::DIR)).prompt()
+    /// How to load skills and the list of available skills: the ones this agent may use.
+    fn instance_prompt(&self, _context: &Context) -> String {
+        skills::discover(Path::new(skills::DIR))
+            .filtered(&self.allowed)
+            .prompt()
     }
 
     fn approval(args: &UseSkillParameters, _context: &Context) -> Approval {
@@ -55,8 +98,8 @@ fn non_empty(file: Option<&str>) -> Option<&str> {
 
 /// The instructions of skill `name` in `root` (or its `file`), or a message listing the
 /// available skills.
-fn load(root: &Path, name: &str, file: Option<&str>) -> String {
-    let found = skills::discover(root);
+fn load(root: &Path, name: &str, file: Option<&str>, allowed: &SkillFilter) -> String {
+    let found = skills::discover(root).filtered(allowed);
     let Some(skill) = found.skills.iter().find(|s| s.name == name) else {
         let mut out = format!("Unknown skill `{name}`. Available skills:");
         for skill in &found.skills {
@@ -165,6 +208,27 @@ fn list_files(dir: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn load(root: &Path, name: &str, file: Option<&str>) -> String {
+        super::load(root, name, file, &SkillFilter::All)
+    }
+
+    #[test]
+    fn a_skill_that_is_not_allowed_is_unknown() {
+        let dir = workspace("filtered");
+        let off = SkillFilter::disabled(["demo".to_owned()]);
+        let only_other = SkillFilter::only(["other".to_owned()]);
+        for filter in [off, only_other] {
+            for file in [None, Some("search")] {
+                let out = super::load(&dir, "demo", file, &filter);
+                assert!(out.starts_with("Unknown skill `demo`"), "{out}");
+                assert!(!out.contains("A demo."), "{out}");
+            }
+        }
+        let on = SkillFilter::only(["demo".to_owned()]);
+        assert!(super::load(&dir, "demo", None, &on).contains("Do it."));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     fn workspace(tag: &str) -> std::path::PathBuf {
         let dir =
@@ -300,7 +364,7 @@ mod tests {
             .split('`')
             .filter(|s| s.starts_with("references/") && s.ends_with(".md"))
             .collect();
-        assert_eq!(named.len(), 5, "{named:?}");
+        assert_eq!(named.len(), 6, "{named:?}");
         for file in named {
             let out = load(&dir, "paperless", Some(file));
             assert!(

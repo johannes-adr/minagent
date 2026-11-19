@@ -2,6 +2,7 @@
   import { chat, loadSessions, setThinking } from "../lib/chat.svelte.js";
   import { go } from "../lib/route.svelte.js";
   import ToolsMenu from "./ToolsMenu.svelte";
+  import SkillsMenu from "./SkillsMenu.svelte";
 
   // While dragging only the label follows; the level is sent on release. Each level sent
   // while dragging came back from the server and moved the slider under the finger.
@@ -53,7 +54,11 @@
     </div>
   {/if}
   <ToolsMenu />
+  <SkillsMenu />
   <button class="btn settings" title="Files: skills and working directory" onclick={() => go("/files")}>🗂</button>
+  <button class="btn settings approvals" title="Approvals: writes of webhook runs waiting for you" onclick={() => go("/approvals")}>
+    Approvals{#if chat.approvals.length}<span class="badge">{chat.approvals.length}</span>{/if}
+  </button>
   <button class="btn settings" title="Webhooks" onclick={() => go("/hooks")}>⚡</button>
   <button class="btn settings" title="Settings" onclick={() => go("/settings")}>⚙</button>
   <div class="state" class:busy={chat.busy} class:offline={chat.offline}>
@@ -65,6 +70,8 @@
   header { display: flex; align-items: center; gap: 10px; padding: 12px 20px; border-bottom: 1px solid var(--border); }
   .sessions { padding: 4px 10px; font-size: 13px; }
   .settings { padding: 3px 9px; font-size: 14px; }
+  .approvals { font-size: 13px; display: flex; align-items: center; gap: 6px; }
+  .badge { min-width: 18px; padding: 0 5px; border-radius: 9px; background: var(--warn); color: var(--bg); font-size: 11px; font-weight: 600; text-align: center; }
   h1 { margin: 0 auto 0 0; font-size: 15px; font-weight: 600; }
   .context { display: flex; align-items: center; gap: 8px; margin-right: 8px; color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .meter { width: 64px; height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }

@@ -118,6 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Session::new(model.clone(), &preamble, frontend)
             .with_context_window(context_window)
             .with_tools(config.tools())
+            .with_disabled_skills(config.disabled_skills())
     };
     if acp {
         acp::serve(new_session).await?;
@@ -134,7 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             thinking,
             config::config_path(),
         )?;
-        frontend.set_default_tools(config.tools());
+        frontend.set_defaults(config.tools(), config.disabled_skills());
         let session = new_session(frontend.clone());
         web::run(frontend, inbox, session, addr).await?;
     } else {

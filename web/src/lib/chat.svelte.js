@@ -18,7 +18,9 @@ export const chat = $state({
   context: null,
   thinking: null,
   tools: null, // {available, enabled, default, custom}
+  skills: null, // {available: [{name, description}], disabled, default, custom}
   sessions: [],
+  approvals: [], // webhook runs waiting for the user: {session, hook, time, message, title, hosts, code}
   current: null,
   drawer: false,
 });
@@ -87,7 +89,7 @@ function upsertTool(event) {
   Object.assign(tool.data, event);
   // Calls that need a decision, run or fail are shown open, so the whole call can be read;
   // finished ones fold away unless the user has opened or closed the card themselves.
-  if (!tool.touched) tool.open = ["pending", "running", "failed"].includes(event.status);
+  if (!tool.touched) tool.open = ["pending", "waiting", "running", "failed"].includes(event.status);
 }
 
 function upsertQuestion(event) {
@@ -145,6 +147,9 @@ function handle(event) {
     case "tools":
       chat.tools = event;
       break;
+    case "skills":
+      chat.skills = event;
+      break;
     case "session":
       // Another session is shown: start its transcript over.
       resetTranscript();
@@ -153,6 +158,7 @@ function handle(event) {
       break;
     case "sessions":
       loadSessions();
+      loadApprovals();
       break;
   }
 }
@@ -183,6 +189,12 @@ export async function loadSessions() {
   const response = await get("/sessions");
   if (!response.ok) return;
   chat.sessions = (await response.json()).sessions;
+}
+
+export async function loadApprovals() {
+  const response = await get("/approvals");
+  if (!response.ok) return;
+  chat.approvals = (await response.json()).approvals;
 }
 
 /** Runs a request that is refused while the agent works; returns whether it was accepted. */
@@ -217,12 +229,15 @@ export const answer = (id, text) => post("/answer", { id, answer: text });
 export const setThinking = (level) => post("/thinking", { level });
 /** Gives this chat its own tools; `null` goes back to the configured ones. */
 export const setTools = (tools) => busyAware(post("/tools", { tools }));
+/** Switches skills off for this chat; `null` goes back to the configured ones. */
+export const setSkills = (disabled) => busyAware(post("/skills", { disabled }));
 
 // ---- Connection: every (re)connect replays the whole transcript ----
 export function connect() {
   const source = new EventSource(eventsUrl());
   source.onopen = () => {
     chat.offline = false;
+    loadApprovals();
     queue = [];
     resetTranscript();
     setBusy(false);

@@ -22,8 +22,9 @@ export const blank = () => ({
   enabled: true,
   template: "",
   tools: [],
+  skills: [],
   hosts: "",
-  allow_writes: false,
+  writes: "approve",
   callback_url: "",
   timeout_minutes: 10,
 });
@@ -35,8 +36,9 @@ export const toForm = (hook) => ({
   enabled: hook.enabled,
   template: hook.template,
   tools: [...hook.tools],
+  skills: [...hook.skills],
   hosts: hook.hosts.join("\n"),
-  allow_writes: hook.allow_writes,
+  writes: hook.writes,
   callback_url: hook.callback_url ?? "",
   timeout_minutes: hook.timeout_minutes,
 });

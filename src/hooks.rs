@@ -2,13 +2,15 @@
 //!
 //! A hook has its own token (stored only as a hash), a prompt template filled from the
 //! request, and what its runs may do. Nobody is there to answer questions during a run, so
-//! everything that would ask the user is declined unless the hook allows it: only the listed
+//! everything that would ask the user is declined unless the hook allows it (a write waits for
+//! the user's decision instead, see `frontend::hook_run`): only the listed
 //! tools exist, JavaScript may reach only the listed hosts, and `execute` (a shell) is only
 //! available inside an isolated container. Hooks live in `hooks.json` next to the settings
 //! file; see `frontend::hook_run` for how runs are queued and executed.
 
 use crate::config::write_private;
 use crate::harness::{self, Toolset};
+use crate::tools::skills::SkillFilter;
 use rig_core::serde_json::{self, Value, json};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -26,6 +28,44 @@ pub fn path_for(config: &Path) -> PathBuf {
     config.with_file_name(FILE)
 }
 
+/// What happens when a run calls `execute_javascript` with `writes: true`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Writes {
+    /// The call is declined.
+    Deny,
+    /// The run is paused until the user approves or declines the call (see `hook_run`).
+    #[default]
+    Approve,
+    /// The call runs without asking.
+    Allow,
+}
+
+impl Writes {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Deny => "deny",
+            Self::Approve => "approve",
+            Self::Allow => "allow",
+        }
+    }
+
+    /// The mode a hook's JSON asks for: `writes`, else the older `allow_writes` flag, else
+    /// the default (`approve`). An unknown `writes` value is an error.
+    fn from_json(value: &Value) -> Result<Self, String> {
+        match &value["writes"] {
+            Value::Null if value["allow_writes"] == true => Ok(Self::Allow),
+            Value::Null => Ok(Self::default()),
+            Value::String(mode) => match mode.as_str() {
+                "deny" => Ok(Self::Deny),
+                "approve" => Ok(Self::Approve),
+                "allow" => Ok(Self::Allow),
+                other => Err(format!("writes must be deny, approve or allow, not {other:?}")),
+            },
+            _ => Err("writes must be deny, approve or allow".into()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Hook {
     /// The name in the URL: `/hooks/<name>`.
@@ -36,10 +76,12 @@ pub struct Hook {
     pub template: String,
     /// The tools a run has.
     pub tools: Vec<String>,
+    /// The skills a run may use; none by default (skills added later stay off).
+    pub skills: Vec<String>,
     /// The hosts scripts may reach without asking (instead of `AGENT_JS_ALLOWED_HOSTS`).
     pub hosts: Vec<String>,
-    /// Whether scripts may change data (POST, PUT, ...) on those hosts.
-    pub allow_writes: bool,
+    /// What happens to scripts that change data (POST, PUT, ...) on those hosts.
+    pub writes: Writes,
     /// Where to POST the result of a run.
     pub callback_url: Option<String>,
     pub enabled: bool,
@@ -67,8 +109,9 @@ impl Hook {
             "name": self.name,
             "template": self.template,
             "tools": self.tools,
+            "skills": self.skills,
             "hosts": self.hosts,
-            "allow_writes": self.allow_writes,
+            "writes": self.writes.name(),
             "callback_url": self.callback_url,
             "enabled": self.enabled,
             "timeout_minutes": self.timeout_minutes,
@@ -93,12 +136,20 @@ impl Hook {
             token_hash: value["token_hash"].as_str()?.to_owned(),
             template: value["template"].as_str()?.to_owned(),
             tools: strings("tools"),
+            skills: strings("skills"),
             hosts: strings("hosts"),
-            allow_writes: value["allow_writes"].as_bool().unwrap_or(false),
+            writes: Writes::from_json(value).unwrap_or_default(),
             callback_url: value["callback_url"].as_str().map(str::to_owned),
             enabled: value["enabled"].as_bool().unwrap_or(true),
             timeout_minutes: value["timeout_minutes"].as_u64().unwrap_or(DEFAULT_TIMEOUT_MINUTES),
         })
+    }
+
+    /// The JavaScript settings of a run: only the hook's hosts, and writes without asking
+    /// only in mode `allow`.
+    #[cfg(feature = "javascript")]
+    pub fn js_settings(&self) -> crate::tools::execute_javascript::Settings {
+        crate::tools::execute_javascript::settings_with(self.hosts.clone(), self.writes == Writes::Allow)
     }
 
     /// The tools of a run. `ask_user` is never there (nobody answers), and `execute` only
@@ -110,21 +161,27 @@ impl Hook {
             .filter(|t| t.as_str() != "ask_user" && (isolated || t.as_str() != "execute"))
             .cloned()
             .collect();
-        let toolset = Toolset::only(Some(names));
+        let toolset = Toolset::only(Some(names)).with_skills(SkillFilter::only(self.skills.clone()));
         #[cfg(feature = "javascript")]
-        let toolset = toolset.with_js(crate::tools::execute_javascript::settings_with(
-            self.hosts.clone(),
-            self.allow_writes,
-        ));
+        let toolset = toolset.with_js(self.js_settings());
         toolset
     }
 
     /// Added to the system prompt of a run.
     pub fn note(&self) -> String {
+        let writes = match self.writes {
+            Writes::Deny => " Calls of `execute_javascript` with `writes: true` are declined: this hook is read-only.",
+            Writes::Approve => {
+                " A call of `execute_javascript` with `writes: true` pauses this conversation until the user \
+                 approves it, possibly hours later; then you continue with its result (or their refusal). \
+                 Put all writes into one such call."
+            }
+            Writes::Allow => "",
+        };
         format!(
             "This conversation was started by the webhook `{}`, not by a person: nobody can \
              answer questions, and tool calls that would need the user's approval are declined \
-             automatically. Complete the task on your own and finish with a short report of the \
+             automatically.{writes} Complete the task on your own and finish with a short report of the \
              result.",
             self.name
         )
@@ -137,8 +194,9 @@ pub struct Fields {
     pub name: Option<String>,
     pub template: String,
     pub tools: Vec<String>,
+    pub skills: Vec<String>,
     pub hosts: Vec<String>,
-    pub allow_writes: bool,
+    pub writes: Writes,
     pub callback_url: Option<String>,
     pub enabled: bool,
     pub timeout_minutes: u64,
@@ -189,6 +247,9 @@ impl Fields {
                 return Err("execute (a shell) is only available to webhooks inside an isolated container (AGENT_ISOLATED=1)".into());
             }
         }
+        let mut skills: Vec<String> = strings("skills")?.into_iter().filter(|s| !s.is_empty()).collect();
+        skills.sort();
+        skills.dedup();
         let mut hosts: Vec<String> = strings("hosts")?
             .into_iter()
             .map(|h| h.to_ascii_lowercase())
@@ -209,8 +270,9 @@ impl Fields {
             name,
             template,
             tools,
+            skills,
             hosts,
-            allow_writes: body["allow_writes"].as_bool().unwrap_or(false),
+            writes: Writes::from_json(body)?,
             callback_url,
             enabled: body["enabled"].as_bool().unwrap_or(true),
             timeout_minutes: body["timeout_minutes"].as_u64().unwrap_or(DEFAULT_TIMEOUT_MINUTES).clamp(1, 240),
@@ -271,8 +333,9 @@ impl Hooks {
             token_hash,
             template: fields.template,
             tools: fields.tools,
+            skills: fields.skills,
             hosts: fields.hosts,
-            allow_writes: fields.allow_writes,
+            writes: fields.writes,
             callback_url: fields.callback_url,
             enabled: fields.enabled,
             timeout_minutes: fields.timeout_minutes,
@@ -445,6 +508,39 @@ mod tests {
     }
 
     #[test]
+    fn write_modes_are_parsed_and_old_files_still_load() {
+        assert_eq!(fields(json!({})).unwrap().writes, Writes::Approve);
+        for (given, mode) in [("deny", Writes::Deny), ("approve", Writes::Approve), ("allow", Writes::Allow)] {
+            assert_eq!(fields(json!({"writes": given})).unwrap().writes, mode);
+            assert_eq!(mode.name(), given);
+        }
+        assert!(fields(json!({"writes": "sure"})).is_err());
+        assert!(fields(json!({"writes": true})).is_err());
+        // The older flag still means something for clients that send it.
+        assert_eq!(fields(json!({"allow_writes": true})).unwrap().writes, Writes::Allow);
+        assert_eq!(fields(json!({"allow_writes": false})).unwrap().writes, Writes::Approve);
+        assert_eq!(fields(json!({"allow_writes": true, "writes": "deny"})).unwrap().writes, Writes::Deny);
+
+        // A hooks.json from before `writes` existed.
+        let path = temp("legacy");
+        let old = |name: &str, extra: &str| {
+            format!(r#"{{"name":"{name}","token_hash":"h","template":"t"{extra}}}"#)
+        };
+        let file = format!(
+            r#"{{"hooks":[{},{},{}]}}"#,
+            old("a", r#","allow_writes":true"#),
+            old("b", r#","allow_writes":false"#),
+            old("c", "")
+        );
+        std::fs::write(&path, file).unwrap();
+        let hooks = Hooks::load(path.clone()).unwrap();
+        let mode = |n: &str| hooks.get(n).unwrap().writes;
+        assert_eq!((mode("a"), mode("b"), mode("c")), (Writes::Allow, Writes::Approve, Writes::Approve));
+        assert_eq!(hooks.get("a").unwrap().to_public()["writes"], "allow");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
     fn tokens_are_stored_as_hashes_and_checked() {
         let path = temp("tokens");
         let mut hooks = Hooks::load(path.clone()).unwrap();
@@ -480,5 +576,18 @@ mod tests {
         hook.tools = vec!["execute".into(), "ask_user".into(), "use_skill".into()];
         assert_eq!(hook.toolset(false).names(), ["use_skill"]);
         assert_eq!(hook.toolset(true).names(), ["execute", "use_skill"]);
+    }
+
+    #[test]
+    fn a_run_has_no_skills_unless_the_hook_lists_them() {
+        let mut hook = Hooks::load(temp("skills")).unwrap()
+            .upsert(fields(json!({})).unwrap(), || "t".into()).unwrap().0;
+        assert!(!hook.toolset(false).skills().allows("paperless")); // the default: none
+        hook.skills = vec!["paperless".into()];
+        let toolset = hook.toolset(false);
+        assert!(toolset.skills().allows("paperless") && !toolset.skills().allows("other"));
+        let parsed = fields(json!({"skills": [" b ", "a", "b", ""]})).unwrap();
+        assert_eq!(parsed.skills, ["a", "b"]);
+        assert!(fields(json!({"skills": "a"})).is_err());
     }
 }

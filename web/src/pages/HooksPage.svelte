@@ -52,6 +52,11 @@
   function toggleTool(name, on) {
     form.tools = on ? [...form.tools, name] : form.tools.filter((t) => t !== name);
   }
+  function toggleSkill(name, on) {
+    form.skills = on ? [...form.skills, name] : form.skills.filter((t) => t !== name);
+  }
+  // Skills the hook lists that no longer exist stay visible, so they can be removed.
+  const skillNames = $derived([...new Set([...(info?.skills ?? []).map((s) => s.name), ...(form?.skills ?? [])])].sort());
 
   async function copy(text) {
     await navigator.clipboard?.writeText(text);
@@ -133,12 +138,38 @@
           </div>
         </div>
 
+        <div class="col">
+          <span>Skills of a run (none by default)</span>
+          <div class="tools">
+            {#each skillNames as name}
+              {@const known = (info?.skills ?? []).find((s) => s.name === name)}
+              <label class="check" title={known?.description ?? "this skill no longer exists"}>
+                <input type="checkbox" checked={form.skills.includes(name)} onchange={(e) => toggleSkill(name, e.target.checked)} />
+                <code>{name}</code>
+              </label>
+            {:else}
+              <small>No skills yet.</small>
+            {/each}
+          </div>
+        </div>
+
         <label class="col">
           <span>Hosts scripts may reach (one per line)</span>
           <textarea bind:value={form.hosts} rows="3" spellcheck="false" placeholder="api.github.com"></textarea>
           <small>Replaces <code>AGENT_JS_ALLOWED_HOSTS</code> for runs of this hook. Everything else is declined.</small>
         </label>
-        <label class="check"><input type="checkbox" bind:checked={form.allow_writes} /> Scripts may change data (POST, PUT, PATCH, DELETE) on those hosts</label>
+        <label class="col">
+          <span>Writes (scripts that change data: POST, PUT, PATCH, DELETE)</span>
+          <select bind:value={form.writes}>
+            <option value="approve">Ask me: the run pauses until I approve or decline</option>
+            <option value="deny">Never: declined automatically</option>
+            <option value="allow">Always: run without asking</option>
+          </select>
+          <small>
+            Only on the hosts above, and only in a script call with <code>writes: true</code>. A paused run waits on
+            the <button class="link" onclick={() => go("/approvals")}>Approvals</button> page and goes on after your decision.
+          </small>
+        </label>
 
         <label class="row">
           <span>Callback URL</span>
@@ -183,16 +214,17 @@
   .form { display: flex; flex-direction: column; gap: 14px; max-width: 720px; }
   .row { display: flex; align-items: center; gap: 12px; } .row > span { width: 150px; flex: none; color: var(--muted); font-size: 13px; }
   .col { display: flex; flex-direction: column; gap: 4px; } .col > span { color: var(--muted); font-size: 13px; }
-  input, textarea { padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font: inherit; }
+  input, textarea, select { padding: 6px 10px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font: inherit; }
   .row input { flex: 1; min-width: 0; } .short { max-width: 100px; flex: none !important; }
   textarea { font: 13px/1.5 var(--mono); resize: vertical; }
-  input:focus, textarea:focus { outline: 0; border-color: var(--accent); }
+  input:focus, textarea:focus, select:focus { outline: 0; border-color: var(--accent); }
   small, .hint { color: var(--muted); font-size: 12px; }
   .check { display: flex; align-items: center; gap: 8px; font-size: 14px; }
   .tools { display: flex; flex-wrap: wrap; gap: 6px 18px; }
   .actions { display: flex; align-items: center; gap: 10px; margin-top: 6px; } .spacer { flex: 1; }
   .ok { color: var(--ok); font-size: 13px; }
   .danger:hover { border-color: var(--bad); color: var(--bad); }
+  .link { border: 0; background: none; color: var(--accent); padding: 0; font: inherit; }
   .error { border: 1px solid var(--bad); color: var(--bad); border-radius: 8px; padding: 8px 12px; margin-bottom: 14px; overflow-wrap: anywhere; }
   .secret { border: 1px solid var(--warn); border-radius: 10px; padding: 12px; margin-bottom: 16px; display: flex; flex-direction: column; gap: 8px; max-width: 720px; }
   .token { display: flex; align-items: center; gap: 10px; } .token code { flex: 1; overflow-wrap: anywhere; }

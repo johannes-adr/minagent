@@ -23,8 +23,9 @@ say it too). Raise `timeout_seconds` (max 300) for jobs over many documents.
 - **Token:** the harness adds it; scripts never see it. If `check()` reports an unknown secret,
   tell the user to add to `.env` and restart the agent:
   `AGENT_SECRET_PAPERLESS=<host> Token <api token>` (the token is under "My Profile" in the
-  Paperless web UI; `<host>` without scheme and port). To run without approval prompts they can
-  add the host to `AGENT_JS_ALLOWED_HOSTS`.
+  Paperless web UI; `<host>` without scheme and port). To run without approval prompts for
+  reads they can add the host to `AGENT_JS_ALLOWED_HOSTS`; writing calls (`writes: true`) are
+  approved by the user each time unless they also set `AGENT_JS_ALLOW_WRITES=1`.
 - **URL:** `connect()` reads `work/paperless.json`. If it is missing, ask the user for the
   URL as they open Paperless in the browser and save it with
   `await saveUrl(url)` (also exported; it checks the connection before saving). The saved URL
@@ -45,7 +46,7 @@ with similar names. Documents come back compact: names instead of ids, custom fi
 | `count(filters)`, `ids(filters)` | number of matches / all matching ids |
 | `doc(id, {content = true})` | one document with text (up to 20000 characters by default) and notes |
 | `vocabulary()` | all tags (with `inbox`, `parent`), correspondents, document types, storage paths, custom fields (type, options), with document counts and matching rules |
-| `update(id, changes, {create})` | changes one document, returns it; `changes`: `title`, `created` (`YYYY-MM-DD`), `asn`, `correspondent`, `documentType`, `storagePath` (null clears), `tags` (replaces), `addTags`, `removeTags`, `customFields` (`{name: value}`, null removes), `removeInboxTags: true`; `create: true` creates missing tags, correspondents, document types |
+| `update(id, changes, {create, unchangedSince})` | changes one document, returns it (the compact document has `modified`; with `unchangedSince: <modified>` it throws if the document changed since you read it); `changes`: `title`, `created` (`YYYY-MM-DD`), `asn`, `correspondent`, `documentType`, `storagePath` (null clears), `tags` (replaces), `addTags`, `removeTags`, `customFields` (`{name: value}`, null removes), `removeInboxTags: true`; `create: true` creates missing tags, correspondents, document types |
 | `addTags(ids, tags)`, `removeTags(ids, tags)`, `modifyTags(ids, {add, remove})` | bulk edit, `{task_id}` |
 | `setCorrespondent(ids, x)`, `setDocumentType(ids, x)`, `setStoragePath(ids, x)`, `setCustomFields(ids, {name: value})` | bulk edit, `{task_id}` |
 | `deleteDocuments(ids)`, `reprocess(ids)` | moves to trash / re-runs OCR, `{task_id}` |
@@ -78,6 +79,18 @@ await pl.update(42, { title: "Stromrechnung März 2025", correspondent: "Stadtwe
 
 ## Rules
 
+- **Reads never use `writes`.** `execute_javascript` is read-only by default: requests that
+  change data (every `update`, `create...`, bulk edit, `upload`, `delete...`, `addNote`) fail
+  with "this call is read-only". Search, read and prepare in calls without `writes`, then do
+  **all writes of the task in one call with `writes: true`**. The user approves that call as a
+  whole (they see the script), so one clear call is better than several small ones. If it fails
+  half-way, read the state again and fix it with another `writes: true` call.
+- **A writing call only writes what you already decided.** Put literal ids and values in it:
+  no `find`, no searching, no loops over search results, no values computed from what the
+  script reads. Decide everything in the read-only calls before, then the approved script is
+  exactly the list of changes the user sees, and it does the same thing however long the
+  approval takes. For many documents, list their ids literally (`addTags([12, 15, 31], ...)`).
+  Its output ends with every request it sent that changed data; check it.
 - **Ask before destructive or wide changes.** Before deleting documents or objects, merging,
   reprocessing, or changing more than about 10 documents, show the user what will change (a
   count and a few examples) and wait for a yes. Deleted documents go to the trash.
@@ -100,6 +113,9 @@ Load one with the `use_skill` tool: `name: "paperless"`, `file: "references/<fil
   sorting. Load for any search that is more than a few words.
 - `references/editing.md`: how fields behave (created date, tags and inbox tags, nested tags,
   custom field types and value formats, ASN, notes, permissions), objects and matching rules.
+- `references/consume.md`: what to do for a newly consumed document (usually started by a
+  webhook with the document id): gather context, decide all fields, show the proposal as a
+  table, write everything in one approved call.
 - `references/recipes.md`: step-by-step playbooks: inbox triage, extracting data into custom
   fields, answering questions and reports, CSV export, cleanup of duplicates and unused objects,
   uploading, sharing.

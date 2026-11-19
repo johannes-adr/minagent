@@ -10,6 +10,7 @@
   import SettingsPage from "./pages/SettingsPage.svelte";
   import FilesPage from "./pages/FilesPage.svelte";
   import HooksPage from "./pages/HooksPage.svelte";
+  import ApprovalsPage from "./pages/ApprovalsPage.svelte";
 
   // The event stream stays connected while the settings page is shown.
   onMount(connect);
@@ -21,6 +22,8 @@
   <FilesPage />
 {:else if nav.path.startsWith("/hooks")}
   <HooksPage />
+{:else if nav.path.startsWith("/approvals")}
+  <ApprovalsPage />
 {:else}
   <SessionDrawer />
   <Header />

@@ -18,7 +18,7 @@ give them. A fresh runtime per call has exactly these globals:
 | Global | What it can do |
 |---|---|
 | `console.log/info/warn/error` | Output; `log`/`info` go to stdout, `warn`/`error` to stderr |
-| `fetch(url, { method, headers, body, secret, form, saveTo })` | HTTP to the hosts declared in the call's `hosts` argument only; `form` sends multipart/form-data (files from `work/`), `saveTo` writes a successful response body to a file in `work/` (binary-safe) |
+| `fetch(url, { method, headers, body, secret, form, saveTo })` | HTTP to the hosts declared in the call's `hosts` argument only; requests that change data throw unless the call has `writes: true`; `form` sends multipart/form-data (files from `work/`), `saveTo` writes a successful response body to a file in `work/` (binary-safe) |
 | `fs.readText/writeText/list/exists(path)` | Files inside `work/` (a subdirectory of the harness's directory) only, never `.env*`. `readText`/`list`/`exists` also accept `skill:<name>/<path>` (files of a skill, read-only) |
 | `import ... from "skill:<name>/<path>.js"` | ES modules shipped by skills, read-only (see below) |
 | `runScript(path, args)` | Runs a script saved in `work/` in-process (an async function body that sees `args`); no process is started |
@@ -67,7 +67,7 @@ const template = fs.readText("skill:github/assets/template.md");
 
 | File | Role |
 |---|---|
-| `mod.rs` | The tool (args `code`, `hosts`, `timeout_seconds`), its approval rule (`ToolPolicy`), the settings from config, and the tests |
+| `mod.rs` | The tool (args `code`, `hosts`, `timeout_seconds`, `writes`), its approval rule (`ToolPolicy`), the settings from config, and the tests |
 | `runtime.rs` | Builds a fresh QuickJS runtime per call: memory limit, timeout, console capture; runs the script |
 | `prelude.js` | Builds the script-facing `console`, `fetch` and `fs` from the native functions; the native functions themselves stay unreachable |
 | `fetch.rs` | Checks scheme and host, injects secrets, sends the request with `reqwest` |
@@ -77,10 +77,15 @@ const template = fs.readText("skill:github/assets/template.md");
 ## How a call runs
 
 1. **Approval** (`mod.rs`): if every host in `hosts` is listed in `AGENT_JS_ALLOWED_HOSTS`
-   (or `hosts` is empty), the call runs without asking. Then `fetch` asks the frontend
-   (`Frontend::approve`, with method, URL and body) before each request that is not
-   GET/HEAD/OPTIONS, unless `AGENT_JS_ALLOW_WRITES=1`; a refusal makes `fetch` throw. Otherwise the user approves it, and
-   sees the hosts and the full code.
+   (or `hosts` is empty) and the call is read-only, it runs without asking. A call is
+   read-only unless it says `writes: true`: `fetch` then throws for every method but
+   GET/HEAD/OPTIONS. A call with `writes: true` needs approval as a whole (one approval, also
+   for hosts that are not allowed), unless `AGENT_JS_ALLOW_WRITES=1` and all hosts are
+   allowed. The user sees the hosts and the full code. A webhook run has its own rules
+   (`frontend/hook_run.rs`): its own hosts and writes mode replace the configured ones
+   (`instance_approval`), it can park a writing call until the user decides, and then run
+   it with `run_approved`. Every request that changed data is listed at the end of the
+   call's output (`requests that changed data:`), so the transcript shows what it did.
 2. **Run** (`runtime.rs`): the runtime is synchronous and runs on a blocking thread. `fetch`
    blocks until the response is complete, then returns an already-resolved promise. Without
    timers there is no event loop. When no jobs are left, the script is either done or waiting
@@ -121,7 +126,7 @@ const template = fs.readText("skill:github/assets/template.md");
 
 ```sh
 AGENT_JS_ALLOWED_HOSTS=api.github.com,example.com   # calls to these hosts run without asking
-AGENT_JS_ALLOW_WRITES=1                             # ...and may POST/PUT/PATCH/DELETE there without asking too
+AGENT_JS_ALLOW_WRITES=1                             # ...and calls with writes: true (POST/PUT/PATCH/DELETE) there run without asking too
 AGENT_SECRET_GITHUB=api.github.com Bearer ghp_xxx   # used as fetch(url, { secret: "GITHUB" })
 ```
 

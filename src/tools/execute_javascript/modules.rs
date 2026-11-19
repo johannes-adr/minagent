@@ -7,7 +7,8 @@
 //! same confinement as `fs` (no escape from the skills root, no `.env*`).
 
 use super::fs;
-use crate::tools::skills;
+use crate::tools::skills::{self, SkillFilter};
+use std::cell::RefCell;
 use rquickjs::loader::{ImportAttributes, Loader, Resolver};
 use rquickjs::module::Declared;
 use rquickjs::{Ctx, Error, Module, Result};
@@ -16,6 +17,32 @@ use std::path::PathBuf;
 /// The prefix of skill module specifiers and `fs` paths.
 pub(super) const PREFIX: &str = "skill:";
 const ONLY_SKILLS: &str = "only `skill:<name>/<path>` imports are supported";
+
+thread_local! {
+    /// The skills the script running on this thread may use. A script runs on one blocking
+    /// thread from start to end, and `fs` and the module loader have no other way to know.
+    static ALLOWED: RefCell<SkillFilter> = const { RefCell::new(SkillFilter::All) };
+}
+
+/// Runs `f` (a script) with only the skills `filter` allows.
+pub(super) fn with_filter<R>(filter: SkillFilter, f: impl FnOnce() -> R) -> R {
+    struct Restore(SkillFilter);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ALLOWED.replace(std::mem::take(&mut self.0));
+        }
+    }
+    let _restore = Restore(ALLOWED.replace(filter));
+    f()
+}
+
+fn check_allowed(name: &str) -> std::result::Result<(), String> {
+    if ALLOWED.with(|allowed| allowed.borrow().allows(name)) {
+        Ok(())
+    } else {
+        Err(format!("the skill {name:?} is not enabled"))
+    }
+}
 
 /// Where the skills are stored; the only place that knows.
 pub(super) fn skills_root() -> PathBuf {
@@ -49,6 +76,7 @@ fn parse_absolute(spec: &str) -> std::result::Result<(String, Vec<String>), Stri
     if name.is_empty() || name == "." || name == ".." || name.contains(['\\', ':']) {
         return Err(format!("{spec:?}: invalid skill name"));
     }
+    check_allowed(name)?;
     let path = normalize(path, Vec::new())
         .filter(|p| !p.is_empty())
         .ok_or_else(|| format!("{spec:?}: path must stay inside the skill"))?;
@@ -75,7 +103,10 @@ pub(super) fn resolve_name(base: &str, spec: &str) -> std::result::Result<String
 /// The path below the skills root of a canonical or `skill:` path (`demo/lib.js`).
 pub(super) fn below_root(spec: &str) -> std::result::Result<&str, String> {
     match spec.strip_prefix(PREFIX) {
-        Some(rest) if !rest.is_empty() => Ok(rest),
+        Some(rest) if !rest.is_empty() => {
+            check_allowed(rest.split('/').next().unwrap_or_default())?;
+            Ok(rest)
+        }
         _ => Err(format!("{spec:?}: expected skill:<name>/<path>")),
     }
 }
@@ -123,6 +154,20 @@ mod tests {
     use super::*;
     use rquickjs::{CatchResultExt, Context, Runtime};
     use std::path::Path;
+
+    #[test]
+    fn skills_that_are_not_allowed_cannot_be_imported_or_read() {
+        let off = SkillFilter::disabled(["demo".to_owned()]);
+        with_filter(off, || {
+            assert!(resolve_name("script", "skill:demo/lib.js").unwrap_err().contains("not enabled"));
+            assert!(resolve_name("skill:demo/a.js", "./b.js").is_err());
+            assert!(below_root("skill:demo/lib.js").unwrap_err().contains("not enabled"));
+            assert!(resolve_name("script", "skill:other/lib.js").is_ok());
+            assert_eq!(below_root("skill:other/x"), Ok("other/x"));
+        });
+        // The filter does not outlive the script.
+        assert!(below_root("skill:demo/lib.js").is_ok());
+    }
 
     #[test]
     fn specifiers_are_normalized() {

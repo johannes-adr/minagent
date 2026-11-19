@@ -8,10 +8,12 @@
 
 pub mod use_skill;
 
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Skills directory, relative to the working directory.
 pub const DIR: &str = "skills";
@@ -33,6 +35,7 @@ const BUILTIN: &[(&str, &str)] = &[
     builtin!("paperless/scripts/paperless.js"),
     builtin!("paperless/references/search.md"),
     builtin!("paperless/references/editing.md"),
+    builtin!("paperless/references/consume.md"),
     builtin!("paperless/references/recipes.md"),
     builtin!("paperless/references/automation.md"),
     builtin!("paperless/references/rest-api.md"),
@@ -46,6 +49,37 @@ pub fn builtin_paths() -> impl Iterator<Item = &'static str> {
 
 /// Built-in skills of older versions; their directories are removed on startup.
 const REMOVED_BUILTIN: &[&str] = &["using-skills"];
+
+/// Which skills an agent may use: all, all but some, or only some. A skill that is not
+/// allowed is not listed in the system prompt, `use_skill` doesn't know it and scripts can't
+/// import or read it. (It is still a file: with `execute` the agent can read it anyway.)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum SkillFilter {
+    #[default]
+    All,
+    /// All skills except these; skills added later are allowed.
+    Disabled(Arc<BTreeSet<String>>),
+    /// Only these; skills added later are not.
+    Only(Arc<BTreeSet<String>>),
+}
+
+impl SkillFilter {
+    pub fn disabled(names: impl IntoIterator<Item = String>) -> Self {
+        Self::Disabled(Arc::new(names.into_iter().collect()))
+    }
+
+    pub fn only(names: impl IntoIterator<Item = String>) -> Self {
+        Self::Only(Arc::new(names.into_iter().collect()))
+    }
+
+    pub fn allows(&self, name: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Disabled(names) => !names.contains(name),
+            Self::Only(names) => names.contains(name),
+        }
+    }
+}
 
 #[derive(Debug, PartialEq)]
 pub struct Skill {
@@ -63,6 +97,12 @@ pub struct Skills {
 }
 
 impl Skills {
+    /// Only the skills `filter` allows.
+    pub fn filtered(mut self, filter: &SkillFilter) -> Self {
+        self.skills.retain(|s| filter.allows(&s.name));
+        self
+    }
+
     /// Installs the built-in skills into `root`, then discovers all skills there.
     pub fn load(root: &Path) -> io::Result<Skills> {
         install_builtin(root)?;
@@ -235,6 +275,15 @@ fn validate_name(name: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filters_allow_the_right_skills() {
+        let off = |names: &[&str]| SkillFilter::disabled(names.iter().map(|n| n.to_string()));
+        let on = |names: &[&str]| SkillFilter::only(names.iter().map(|n| n.to_string()));
+        assert!(SkillFilter::All.allows("a"));
+        assert!(!off(&["a"]).allows("a") && off(&["a"]).allows("b"));
+        assert!(on(&["a"]).allows("a") && !on(&["a"]).allows("b") && !on(&[]).allows("a"));
+    }
 
     #[test]
     fn parses_valid_frontmatter() {

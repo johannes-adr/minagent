@@ -9,9 +9,9 @@ mod fs;
 mod modules;
 mod runtime;
 
-use crate::frontend::Frontend;
 use crate::harness::{Approval, Context, ToolPolicy};
 use crate::tools::process::format_output;
+use crate::tools::skills::SkillFilter;
 use rig_core::tool::{Tool, ToolContext};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -36,8 +36,8 @@ pub struct Secret {
 pub struct Settings {
     /// Hosts whose calls run without asking (`AGENT_JS_ALLOWED_HOSTS`), lowercase.
     pub allowed_hosts: Vec<String>,
-    /// Whether calls to allowed hosts may also change data (POST, PUT, PATCH, DELETE)
-    /// without asking (`AGENT_JS_ALLOW_WRITES`). Otherwise each such request asks.
+    /// Whether calls with `writes: true` to allowed hosts run without asking
+    /// (`AGENT_JS_ALLOW_WRITES`). Otherwise such a call needs the user's approval.
     pub allow_writes: bool,
     /// Secrets by name (the `<NAME>` of `AGENT_SECRET_<NAME>`).
     pub secrets: HashMap<String, Secret>,
@@ -87,8 +87,10 @@ fn normalize(hosts: Option<&[String]>) -> Vec<String> {
 }
 
 /// Calls that only contact allowed hosts (or none) run without asking; the rest needs
-/// approval. On allowed hosts, requests that change data (anything but GET/HEAD/OPTIONS)
-/// are approved one by one while the script runs, unless `AGENT_JS_ALLOW_WRITES` is set. The container is irrelevant: the script's capabilities are what is checked.
+/// approval. Requests that change data (anything but GET/HEAD/OPTIONS) only work in a call
+/// with `writes: true`, which needs approval as a whole unless `AGENT_JS_ALLOW_WRITES` is set
+/// and all its hosts are allowed. The container is irrelevant: the script's capabilities are
+/// what is checked.
 impl ToolPolicy for ExecuteJavascript {
     const KIND: &'static str = "execute";
 
@@ -122,9 +124,11 @@ Each call starts fresh; only files in `work` persist between calls. There are no
 timers, no `require`, no npm packages, no `import` except `import {{ f }} from \"skill:<name>/<path>.js\"` of the \
 JavaScript modules a skill documents (read-only; relative imports work inside the skill), no process or environment access and no way to start a process. \
 `fetch` only reaches `https://` and `http://` URLs of hosts you list in \
-the `hosts` argument (the user must approve hosts that are not pre-approved). On pre-approved hosts \
-requests that change data (POST, PUT, PATCH, DELETE, uploads) may still ask the user for approval while \
-the script runs; if they decline, `fetch` throws. \
+the `hosts` argument (the user must approve hosts that are not pre-approved). A call is read-only: \
+requests that change data (POST, PUT, PATCH, DELETE, uploads) fail inside the script. To change data, \
+do ALL writes of a task in one call with `writes: true`; the user approves that call as a whole (and \
+sees the code), so read and prepare first in separate calls, then write once with literal values. If it is declined, nothing ran; \
+if it ran, its output ends with every request that changed data and its status. \
 `secret: \"NAME\"` makes `fetch` add the `Authorization` header from the configured secret; the script never \
 sees its value, and it only works for the host the secret is bound to. {secrets} \
 Print results with `console.log`; thrown errors are returned as output."
@@ -132,26 +136,38 @@ Print results with `console.log`; thrown errors are returned as output."
     }
 
     fn approval(args: &ExecuteJavascriptParameters, _context: &Context) -> Approval {
-        approval(args, &settings().allowed_hosts)
+        let settings = settings();
+        approval(args, &settings.allowed_hosts, settings.allow_writes)
+    }
+
+    /// A run with settings of its own (a webhook's hosts and write mode) is approved by
+    /// those, not by the configured ones: a configured `AGENT_JS_ALLOW_WRITES` must not let
+    /// a webhook's writing call skip the webhook's decision.
+    fn instance_approval(&self) -> crate::harness::Approver<ExecuteJavascriptParameters> {
+        let own = self.own_settings.clone();
+        Arc::new(move |args, _context| {
+            let settings = own.clone().unwrap_or_else(settings);
+            approval(args, &settings.allowed_hosts, settings.allow_writes)
+        })
     }
 }
 
-fn approval(args: &ExecuteJavascriptParameters, allowed: &[String]) -> Approval {
+fn approval(args: &ExecuteJavascriptParameters, allowed: &[String], allow_writes: bool) -> Approval {
     let hosts = normalize(args.hosts.as_deref());
-    if hosts.iter().all(|h| allowed.contains(h)) {
+    let writes = args.writes == Some(true);
+    if hosts.iter().all(|h| allowed.contains(h)) && (!writes || allow_writes) {
         let mut lines = args.code.lines();
         let first = lines.next().unwrap_or_default();
         let more = if lines.next().is_some() { " ..." } else { "" };
-        return Approval::auto(format!("[javascript] {first}{more}"));
+        let kind = if writes { "javascript, writes" } else { "javascript" };
+        return Approval::auto(format!("[{kind}] {first}{more}"));
     }
-    Approval::ask(format!(
-        "execute_javascript with network access to {}:\n{}",
-        hosts.join(", "),
-        args.code
-    ))
+    let what = if writes { "execute_javascript that CHANGES DATA on" } else { "execute_javascript with network access to" };
+    let hosts = if hosts.is_empty() { "no host".to_owned() } else { hosts.join(", ") };
+    Approval::ask(format!("{what} {hosts}:\n{}", args.code))
 }
 
-const DESCRIPTION: &str = "Run a JavaScript (ES module) script in a sandboxed in-process runtime and return its console output and, if it threw, the error. For workflow automation: calling APIs with `fetch` and transforming data. Only `console`, `fetch`, `fs` and `runScript` exist; there is no `require`, no npm and no process access. `import` works only for skill modules (`import { f } from \"skill:<name>/<path>.js\"`), and the `fs` read functions also accept read-only `skill:<name>/<path>` paths.";
+const DESCRIPTION: &str = "Run a JavaScript (ES module) script in a sandboxed in-process runtime and return its console output and, if it threw, the error. For workflow automation: calling APIs with `fetch` and transforming data. Scripts are read-only unless `writes: true` is set (then the user approves the call as a whole): requests that change data (POST, PUT, PATCH, DELETE, uploads) fail otherwise. Only `console`, `fetch`, `fs` and `runScript` exist; there is no `require`, no npm and no process access. `import` works only for skill modules (`import { f } from \"skill:<name>/<path>.js\"`), and the `fs` read functions also accept read-only `skill:<name>/<path>` paths.";
 
 #[derive(rig_core::serde::Deserialize, rig_core::schemars::JsonSchema)]
 #[serde(crate = "rig_core::serde")]
@@ -165,22 +181,25 @@ pub(crate) struct ExecuteJavascriptParameters {
     /// Stop the script after this many seconds (default 30, max 300).
     #[serde(default)]
     timeout_seconds: Option<u64>,
+    /// Set true to let the script change data (fetch with POST, PUT, PATCH, DELETE or a form upload); the user must approve the call. Default false: such requests fail. Put all writes of a task into one call.
+    #[serde(default)]
+    writes: Option<bool>,
 }
 
-/// Runs scripts. It cannot be a `#[rig_tool]` function because it needs the frontend, to
-/// ask the user about requests that change data while a script runs.
+/// Runs scripts.
 pub(crate) struct ExecuteJavascript {
-    frontend: Arc<dyn Frontend>,
     /// Settings of this run instead of the configured ones; scripts may then only declare
     /// the hosts they allow.
     own_settings: Option<Arc<Settings>>,
+    /// The skills scripts may import and read.
+    skills: SkillFilter,
 }
 
 impl ExecuteJavascript {
-    pub(crate) fn new(frontend: Arc<dyn Frontend>, own_settings: Option<Arc<Settings>>) -> Self {
+    pub(crate) fn new(own_settings: Option<Arc<Settings>>, skills: SkillFilter) -> Self {
         Self {
-            frontend,
             own_settings,
+            skills,
         }
     }
 }
@@ -204,25 +223,52 @@ impl Tool for ExecuteJavascript {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<String, Infallible> {
-        let timeout = Duration::from_secs(
-            args.timeout_seconds
-                .unwrap_or(DEFAULT_TIMEOUT_SECS)
-                .clamp(1, MAX_TIMEOUT_SECS),
-        );
-        let hosts = normalize(args.hosts.as_deref());
-        let settings = self.own_settings.clone().unwrap_or_else(settings);
-        if self.own_settings.is_some()
-            && let Some(refusal) = refuse_hosts(&hosts, &settings)
-        {
-            return Ok(refusal);
+        Ok(execute(args, self.own_settings.clone(), self.skills.clone()).await)
+    }
+}
+
+/// Runs a call. A call that declares hosts outside a run's own settings is refused.
+async fn execute(
+    args: ExecuteJavascriptParameters,
+    own_settings: Option<Arc<Settings>>,
+    skills: SkillFilter,
+) -> String {
+    let timeout = Duration::from_secs(
+        args.timeout_seconds
+            .unwrap_or(DEFAULT_TIMEOUT_SECS)
+            .clamp(1, MAX_TIMEOUT_SECS),
+    );
+    let hosts = normalize(args.hosts.as_deref());
+    let settings = own_settings.clone().unwrap_or_else(settings);
+    if own_settings.is_some()
+        && let Some(refusal) = refuse_hosts(&hosts, &settings)
+    {
+        return refusal;
+    }
+    // A run's own settings only let a writing call through when the run allows writes. The
+    // call may still have been approved by the global configuration, which a run overrides.
+    if own_settings.is_some() && args.writes == Some(true) && !settings.allow_writes {
+        return "error\nstderr:\nthis run may not change data without the user's approval".to_owned();
+    }
+    run(args.code, hosts, args.writes == Some(true), timeout, settings, skills)
+        .await
+        .unwrap_or_else(|e| format!("error\nstderr:\n{e}"))
+}
+
+/// Runs a call the user approved later (a parked webhook run) with `settings`, the run's own:
+/// it may change data, but only on those settings' hosts.
+pub async fn run_approved(
+    args: rig_core::serde_json::Value,
+    settings: Settings,
+    skills: SkillFilter,
+) -> String {
+    match rig_core::serde_json::from_value::<ExecuteJavascriptParameters>(args) {
+        Ok(args) => {
+            let args = ExecuteJavascriptParameters { writes: Some(true), ..args };
+            let settings = Settings { allow_writes: true, ..settings };
+            execute(args, Some(Arc::new(settings)), skills).await
         }
-        // A call the user approved as a whole (some host is not allowed) needs no more
-        // questions; on allowed hosts, writes ask unless the configuration waves them through.
-        let all_allowed = hosts.iter().all(|h| settings.allowed_hosts.contains(h));
-        let confirm_writes = (all_allowed && !settings.allow_writes).then(|| self.frontend.clone());
-        Ok(run(args.code, hosts, confirm_writes, timeout, settings)
-            .await
-            .unwrap_or_else(|e| format!("error\nstderr:\n{e}")))
+        Err(e) => format!("error\nstderr:\ninvalid arguments: {e}"),
     }
 }
 
@@ -230,32 +276,58 @@ impl Tool for ExecuteJavascript {
 async fn run(
     code: String,
     hosts: Vec<String>,
-    confirm_writes: Option<Arc<dyn Frontend>>,
+    writes: bool,
     timeout: Duration,
     settings: Arc<Settings>,
+    skills: SkillFilter,
 ) -> Result<String, tokio::task::JoinError> {
     let handle = Handle::current();
     let outcome = tokio::task::spawn_blocking(move || {
-        runtime::run(&code, hosts, confirm_writes, timeout, settings, handle)
+        runtime::run(&code, hosts, writes, timeout, settings, skills, handle)
     })
     .await?;
-    Ok(format_output(
+    let mut output = format_output(
         &outcome.exit,
         outcome.stdout.as_bytes(),
         outcome.stderr.as_bytes(),
-    ))
+    );
+    output.push_str(&sent_section(&outcome.sent));
+    Ok(output)
+}
+
+/// At most this many of a call's data-changing requests are listed in its output.
+const MAX_SENT_LISTED: usize = 100;
+
+/// The output section that lists what a call changed: empty if it changed nothing.
+fn sent_section(sent: &[String]) -> String {
+    if sent.is_empty() {
+        return String::new();
+    }
+    let mut section = String::from("\nrequests that changed data:");
+    for line in sent.iter().take(MAX_SENT_LISTED) {
+        section.push_str(&format!("\n{line}"));
+    }
+    if sent.len() > MAX_SENT_LISTED {
+        section.push_str(&format!("\n... and {} more", sent.len() - MAX_SENT_LISTED));
+    }
+    section
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rig_core::serde_json::json;
     use std::time::Instant;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    fn approval_of(args: &str, allowed: &[&str]) -> Approval {
+    fn approval_with(args: &str, allowed: &[&str], allow_writes: bool) -> Approval {
         let args = rig_core::serde_json::from_str(args).unwrap();
         let allowed: Vec<String> = allowed.iter().map(|h| h.to_string()).collect();
-        approval(&args, &allowed)
+        approval(&args, &allowed, allow_writes)
+    }
+
+    fn approval_of(args: &str, allowed: &[&str]) -> Approval {
+        approval_with(args, allowed, false)
     }
 
     #[test]
@@ -268,6 +340,22 @@ mod tests {
         assert!(approval_of(github, &[]).ask);
         let both = r#"{"code":"1","hosts":["api.github.com","evil.com"]}"#;
         assert!(approval_of(both, &allowed).ask);
+    }
+
+    #[test]
+    fn a_writing_call_asks_unless_writes_and_all_hosts_are_allowed() {
+        let writes = r#"{"code":"1","hosts":["api.github.com"],"writes":true}"#;
+        let allowed = ["api.github.com"];
+        assert!(approval_with(writes, &allowed, false).ask);
+        assert!(!approval_with(writes, &allowed, true).ask);
+        // A host that is not allowed asks anyway; one approval covers both.
+        assert!(approval_with(writes, &[], true).ask);
+        let no_hosts = r#"{"code":"1","writes":true}"#;
+        assert!(approval_with(no_hosts, &[], false).ask);
+        // `writes: false` is the same as leaving it out.
+        assert!(!approval_with(r#"{"code":"1","writes":false}"#, &[], false).ask);
+        let title = approval_with(writes, &[], false).title;
+        assert!(title.starts_with("execute_javascript that CHANGES DATA on api.github.com:\n"), "{title}");
     }
 
     #[test]
@@ -287,6 +375,33 @@ mod tests {
     }
 
     #[test]
+    fn the_output_lists_what_a_call_changed() {
+        assert_eq!(sent_section(&[]), "");
+        let sent: Vec<String> = (0..MAX_SENT_LISTED + 2).map(|i| format!("PATCH /d/{i} -> 200")).collect();
+        let section = sent_section(&sent);
+        assert!(section.starts_with("\nrequests that changed data:\nPATCH /d/0 -> 200\n"), "{section}");
+        assert!(section.ends_with(&format!("PATCH /d/{} -> 200\n... and 2 more", MAX_SENT_LISTED - 1)), "{section}");
+    }
+
+    #[test]
+    fn a_runs_own_settings_decide_its_approvals() {
+        let tool = |allow_writes| {
+            let own = settings_with(vec!["paperless.example".into()], allow_writes);
+            ExecuteJavascript::new(Some(Arc::new(own)), SkillFilter::All).instance_approval()
+        };
+        let args = |json: &str| rig_core::serde_json::from_str(json).unwrap();
+        let context = Context { isolated: false };
+        let read = args(r#"{"code":"1","hosts":["paperless.example"]}"#);
+        let write = args(r#"{"code":"1","hosts":["paperless.example"],"writes":true}"#);
+        // The run's hosts are allowed whatever the configuration says.
+        assert!(!tool(false)(&read, &context).ask);
+        // A writing call asks unless the run itself allows writes.
+        assert!(tool(false)(&write, &context).ask);
+        assert!(!tool(true)(&write, &context).ask);
+        assert!(tool(true)(&args(r#"{"code":"1","hosts":["other.example"],"writes":true}"#), &context).ask);
+    }
+
+    #[test]
     fn approval_does_not_depend_on_the_container() {
         let args = rig_core::serde_json::from_str(r#"{"code":"1","hosts":["x.com"]}"#).unwrap();
         for isolated in [true, false] {
@@ -302,6 +417,15 @@ mod tests {
     }
 
     async fn js_with(code: &str, hosts: &[&str], secrets: &[(&str, Secret)], secs: u64) -> String {
+        js_run(code, hosts, secrets, secs, false).await
+    }
+
+    /// Like `js_with` for a call with `writes: true`.
+    async fn js_writing(code: &str, hosts: &[&str], secrets: &[(&str, Secret)]) -> String {
+        js_run(code, hosts, secrets, 10, true).await
+    }
+
+    async fn js_run(code: &str, hosts: &[&str], secrets: &[(&str, Secret)], secs: u64, writes: bool) -> String {
         let settings = Settings {
             secrets: secrets
                 .iter()
@@ -313,42 +437,66 @@ mod tests {
         run(
             code.to_owned(),
             hosts,
-            None,
+            writes,
             Duration::from_secs(secs),
             Arc::new(settings),
+            SkillFilter::All,
         )
         .await
         .unwrap()
     }
 
     #[tokio::test]
-    async fn changing_requests_on_allowed_hosts_ask_and_a_denial_throws() {
+    async fn a_script_is_read_only_unless_the_call_says_writes() {
         let code = r#"
             for (const method of ["GET", "POST", "DELETE"]) {
                 try { await fetch("http://localhost:1/x", { method }); }
                 catch (e) { console.log(method, String(e.message ?? e)); }
             }
+            try { await fetch("http://localhost:1/x", { method: "POST", form: { a: "b" } }); }
+            catch (e) { console.log("form", String(e.message ?? e)); }
         "#;
-        let frontend: Arc<dyn Frontend> = Arc::new(crate::frontend::Silent);
-        let out = run(
-            code.to_owned(),
-            vec!["localhost".to_owned()],
-            Some(frontend),
-            Duration::from_secs(10),
-            Arc::new(Settings::default()),
-        )
-        .await
-        .unwrap();
-        // Silent denies every approval: the GET is not asked (it fails to connect instead).
-        assert!(!out.contains("GET the user denied"), "{out}");
-        assert!(
-            out.contains("POST the user denied the POST request"),
-            "{out}"
-        );
-        assert!(
-            out.contains("DELETE the user denied the DELETE request"),
-            "{out}"
-        );
+        let run = |writes| {
+            run(
+                code.to_owned(),
+                vec!["localhost".to_owned()],
+                writes,
+                Duration::from_secs(10),
+                Arc::new(Settings::default()),
+                SkillFilter::All,
+            )
+        };
+        let out = run(false).await.unwrap();
+        // The GET is not refused (it fails to connect instead).
+        assert!(!out.contains("GET this call is read-only"), "{out}");
+        for method in ["POST", "DELETE"] {
+            assert!(out.contains(&format!("{method} this call is read-only")), "{out}");
+        }
+        assert!(out.contains("form this call is read-only"), "{out}");
+        assert!(out.contains("writes: true"), "{out}");
+        // With writes the requests are sent (and fail to connect here).
+        let out = run(true).await.unwrap();
+        assert!(!out.contains("read-only"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn run_approved_may_write_but_only_on_the_runs_hosts() {
+        let settings = || settings_with(vec!["localhost".into()], false);
+        let call = |hosts: &str| {
+            json!({"code": "try { await fetch('http://localhost:1/', {method: 'POST'}); } catch (e) { console.log(e.message); }", "hosts": [hosts]})
+        };
+        let out = run_approved(call("localhost"), settings(), SkillFilter::All).await;
+        assert!(!out.contains("read-only"), "{out}");
+        let out = run_approved(call("evil.com"), settings(), SkillFilter::All).await;
+        assert!(out.contains("evil.com is not allowed"), "{out}");
+        // A writing call in a run that doesn't allow writes is refused, whoever approved it.
+        let own = Some(Arc::new(Settings::default()));
+        let args = |writes: bool| ExecuteJavascriptParameters { code: "1".into(), hosts: None, timeout_seconds: None, writes: Some(writes) };
+        let out = execute(args(true), own.clone(), SkillFilter::All).await;
+        assert!(out.contains("may not change data"), "{out}");
+        assert!(execute(args(false), own, SkillFilter::All).await.starts_with("ok"));
+        let out = run_approved(json!({"hosts": 3}), settings(), SkillFilter::All).await;
+        assert!(out.contains("invalid arguments"), "{out}");
     }
 
     #[test]
@@ -617,9 +765,12 @@ mod tests {
             console.log(r.status, r.ok, r.headers["x-reply"], JSON.stringify(await r.json()));
         "#
         );
-        let out = js_with(&code, &["127.0.0.1"], &secrets, 10).await;
+        let out = js_writing(&code, &["127.0.0.1"], &secrets).await;
         let request = server.await.unwrap().to_lowercase();
-        assert_eq!(out, "ok\nstdout:\n201 true yes {\"ok\":true}");
+        assert_eq!(
+            out,
+            format!("ok\nstdout:\n201 true yes {{\"ok\":true}}\nrequests that changed data:\nPOST http://127.0.0.1:{port}/v1/items -> 201")
+        );
         assert!(!out.contains("s3cret"), "{out}");
         assert!(request.starts_with("post /v1/items http/1.1"), "{request}");
         assert!(
@@ -685,10 +836,13 @@ mod tests {
             console.log(r.status, await r.json());
         "#
         );
-        let out = js_with(&code, &["127.0.0.1"], &[], 10).await;
+        let out = js_writing(&code, &["127.0.0.1"], &[]).await;
         let request = server.await.unwrap();
         let _ = std::fs::remove_dir_all(&on_disk);
-        assert_eq!(out, "ok\nstdout:\n200 task-uuid");
+        assert_eq!(
+            out,
+            format!("ok\nstdout:\n200 task-uuid\nrequests that changed data:\nPOST http://127.0.0.1:{port}/upload/ -> 200")
+        );
         let text = String::from_utf8_lossy(&request);
         assert!(
             text.contains("content-type: multipart/form-data; boundary="),

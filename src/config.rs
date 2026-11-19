@@ -32,7 +32,7 @@ const SECRET_PREFIX: &str = "AGENT_SECRET_";
 pub struct Var {
     pub name: &'static str,
     /// How the settings page edits it: `text`, `number`, `bool`, `list` (comma separated),
-    /// `tools`, `choice:<a>,<b>`, `secret` (never shown again once saved) or `secret-host`
+    /// `tools`, `skills`, `choice:<a>,<b>`, `secret` (never shown again once saved) or `secret-host`
     /// (`<host> <value>`: only the host is shown again).
     pub kind: &'static str,
     pub example: &'static str,
@@ -99,6 +99,12 @@ pub const VARS: &[Var] = &[
         kind: "tools",
         example: "",
         doc: "Comma-separated tools to enable (execute, use_skill, agent, ask_user, execute_javascript, view_image); empty enables all",
+    },
+    Var {
+        name: "AGENT_DISABLED_SKILLS",
+        kind: "skills",
+        example: "",
+        doc: "Comma-separated skills to switch off by default (a chat can change that); empty keeps all skills on",
     },
     Var {
         name: "AGENT_JS_ALLOWED_HOSTS",
@@ -372,6 +378,16 @@ impl Config {
         (!list.is_empty()).then_some(list)
     }
 
+    /// The skills switched off in `AGENT_DISABLED_SKILLS` (comma separated).
+    pub fn disabled_skills(&self) -> Vec<String> {
+        self.get("AGENT_DISABLED_SKILLS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+            .collect()
+    }
+
     /// The context window set in `AGENT_CONTEXT_WINDOW`; `None` leaves it to the model catalog.
     pub fn context_window(&self) -> Result<Option<u64>, String> {
         let Some(value) = self.get("AGENT_CONTEXT_WINDOW") else {
@@ -535,6 +551,15 @@ mod tests {
         for var in VARS {
             assert!(example.contains(&format!("\n{}=", var.name)), "{example}");
         }
+    }
+
+    #[test]
+    fn disabled_skills_list() {
+        assert!(config(&[]).disabled_skills().is_empty());
+        assert_eq!(
+            config(&[("AGENT_DISABLED_SKILLS", " paperless, ,other ")]).disabled_skills(),
+            ["paperless", "other"]
+        );
     }
 
     #[test]
