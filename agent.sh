@@ -11,7 +11,7 @@ set -eu
 repo=$(cd "$(dirname "$0")" && pwd)
 rt=${AGENT_RUNTIME:-$(command -v podman >/dev/null && echo podman || echo docker)}
 image=agent
-hash=$(cd "$repo" && find Dockerfile Cargo.toml Cargo.lock src builtin_skills -type f | sort | xargs cksum | cksum | cut -d' ' -f1)
+hash=$(cd "$repo" && find Dockerfile Cargo.toml Cargo.lock build.rs src builtin_skills web -type f -not -path "web/node_modules/*" -not -path "web/dist/*" | sort | xargs cksum | cksum | cut -d' ' -f1)
 built=$("$rt" image inspect -f '{{index .Config.Labels "agent.hash"}}' "$image" 2>/dev/null || true)
 if [ "$built" != "$hash" ]; then
     # To stderr: in ACP mode stdout belongs to the protocol.

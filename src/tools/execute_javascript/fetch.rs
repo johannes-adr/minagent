@@ -1,12 +1,14 @@
 //! `fetch` of `execute_javascript`: HTTP requests to the hosts the call declared.
 
 use super::{Secret, Settings, fs};
+use crate::frontend::{Event, Frontend, ToolCall};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use reqwest::multipart::{Form, Part};
 use reqwest::{Method, Url, redirect};
 use rig_core::serde_json::{self, Map, Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tokio::runtime::Handle;
 
@@ -18,6 +20,9 @@ const MAX_FILE_BYTES: usize = 100 * 1024 * 1024;
 pub(super) struct Fetch {
     /// Normalized hostnames the script may contact (the `hosts` argument).
     pub hosts: Vec<String>,
+    /// Set when requests that change data (not GET/HEAD/OPTIONS) need the user's approval:
+    /// the call was auto-approved because its hosts are allowed. The frontend asks.
+    pub confirm_writes: Option<Arc<dyn Frontend>>,
     pub settings: Arc<Settings>,
     /// The end of the run; requests don't outlive it.
     pub deadline: Instant,
@@ -202,6 +207,7 @@ impl Fetch {
         let (url, secret) = self.authorize(url, options.secret.as_deref())?;
         let method = Method::from_bytes(options.method.to_ascii_uppercase().as_bytes())
             .map_err(|_| format!("invalid method {:?}", options.method))?;
+        let approved = self.confirm(&method, &url, &options)?;
         let headers = request_headers(&options.headers, secret)?;
         // Check the target before sending, so a bad path does not cost a request.
         let save_to = options
@@ -214,9 +220,84 @@ impl Fetch {
             (None, None) => Payload::None,
         };
         let remaining = self.deadline.saturating_duration_since(Instant::now());
-        self.handle
-            .block_on(send(url, method, headers, payload, save_to, remaining))
+        let result = self
+            .handle
+            .block_on(send(url, method, headers, payload, save_to, remaining));
+        if let Some((frontend, call)) = approved {
+            let (output, failed) = match &result {
+                Ok(json) => (summary(json), false),
+                Err(error) => (error.clone(), true),
+            };
+            frontend.emit(Event::ToolFinished {
+                id: call.id,
+                kind: call.kind,
+                output,
+                failed,
+            });
+        }
+        result
     }
+
+    /// Asks the user before a request that changes data, if the call needs that. Returns
+    /// what to report to the frontend once the request is done; `Err` if the user declined.
+    fn confirm(
+        &self,
+        method: &Method,
+        url: &Url,
+        options: &Options,
+    ) -> Result<Option<(Arc<dyn Frontend>, ToolCall)>, String> {
+        let Some(frontend) = &self.confirm_writes else {
+            return Ok(None);
+        };
+        if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+            return Ok(None);
+        }
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let mut title = format!("{method} {url}");
+        match (&options.body, &options.form) {
+            (Some(body), _) => title.push_str(&format!("\n{}", clip(body))),
+            (None, Some(form)) => {
+                let names: Vec<_> = form.iter().map(|(name, _)| name.as_str()).collect();
+                title.push_str(&format!("\nmultipart form: {}", names.join(", ")));
+            }
+            (None, None) => {}
+        }
+        let call = ToolCall {
+            id: format!("js-request-{}", COUNTER.fetch_add(1, Ordering::Relaxed)),
+            name: "execute_javascript".to_owned(),
+            kind: "fetch",
+            title,
+            ask: true,
+            args: json!({ "method": method.as_str(), "url": url.as_str() }),
+            agent: None,
+        };
+        if self.handle.block_on(frontend.approve(&call)) {
+            frontend.emit(Event::ToolStarted(call.clone()));
+            Ok(Some((frontend.clone(), call)))
+        } else {
+            frontend.emit(Event::ToolDenied(call));
+            Err(format!(
+                "the user denied the {method} request to {url}; do not retry it"
+            ))
+        }
+    }
+}
+
+/// The start of a request body, for the approval prompt.
+fn clip(body: &str) -> String {
+    const MAX: usize = 1000;
+    match body.char_indices().nth(MAX) {
+        Some((end, _)) => format!("{}... ({} more bytes)", &body[..end], body.len() - end),
+        None => body.to_owned(),
+    }
+}
+
+/// `HTTP <status>` from the JSON `send` returns.
+fn summary(json: &str) -> String {
+    serde_json::from_str::<Value>(json)
+        .ok()
+        .and_then(|v| v["status"].as_u64())
+        .map_or_else(|| "done".to_owned(), |status| format!("HTTP {status}"))
 }
 
 /// The headers of the script plus the secret's `Authorization`, which replaces any the
@@ -316,6 +397,7 @@ mod tests {
             .collect();
         Fetch {
             hosts: hosts.iter().map(|h| h.to_string()).collect(),
+            confirm_writes: None,
             settings: Arc::new(Settings {
                 secrets,
                 ..Settings::default()

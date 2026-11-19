@@ -77,7 +77,9 @@ const template = fs.readText("skill:github/assets/template.md");
 ## How a call runs
 
 1. **Approval** (`mod.rs`): if every host in `hosts` is listed in `AGENT_JS_ALLOWED_HOSTS`
-   (or `hosts` is empty), the call runs without asking. Otherwise the user approves it, and
+   (or `hosts` is empty), the call runs without asking. Then `fetch` asks the frontend
+   (`Frontend::approve`, with method, URL and body) before each request that is not
+   GET/HEAD/OPTIONS, unless `AGENT_JS_ALLOW_WRITES=1`; a refusal makes `fetch` throw. Otherwise the user approves it, and
    sees the hosts and the full code.
 2. **Run** (`runtime.rs`): the runtime is synchronous and runs on a blocking thread. `fetch`
    blocks until the response is complete, then returns an already-resolved promise. Without
@@ -119,6 +121,7 @@ const template = fs.readText("skill:github/assets/template.md");
 
 ```sh
 AGENT_JS_ALLOWED_HOSTS=api.github.com,example.com   # calls to these hosts run without asking
+AGENT_JS_ALLOW_WRITES=1                             # ...and may POST/PUT/PATCH/DELETE there without asking too
 AGENT_SECRET_GITHUB=api.github.com Bearer ghp_xxx   # used as fetch(url, { secret: "GITHUB" })
 ```
 

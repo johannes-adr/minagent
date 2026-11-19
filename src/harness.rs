@@ -33,7 +33,7 @@ use rig_core::serde_json::{self, Value};
 use rig_core::tool::{Tool, ToolOutput};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex};
 
 /// How often the model may retry after calling a tool that doesn't exist, per prompt.
 pub const INVALID_TOOL_CALL_RETRIES: usize = 3;
@@ -66,13 +66,9 @@ impl Approval {
     }
 }
 
-/// The tools enabled by `AGENT_TOOLS`; unset means all tools.
-static ENABLED_TOOLS: OnceLock<Vec<String>> = OnceLock::new();
-
-/// Restricts agents to the tools in `names`. Call once at startup, before creating a
-/// [`Session`]. Fails on a name that is not a tool.
-pub fn enable_only(names: Vec<String>) -> Result<(), String> {
-    let known = [
+/// The names of all tools.
+pub fn tool_names() -> Vec<&'static str> {
+    vec![
         Execute::NAME,
         UseSkill::NAME,
         Subagent::NAME,
@@ -81,22 +77,73 @@ pub fn enable_only(names: Vec<String>) -> Result<(), String> {
         ExecuteJavascript::NAME,
         #[cfg(feature = "image")]
         ViewImage::NAME,
-    ];
-    if let Some(unknown) = names.iter().find(|n| !known.contains(&n.as_str())) {
-        return Err(format!(
-            "unknown tool {unknown:?} in AGENT_TOOLS; use {}",
-            known.join(", ")
-        ));
-    }
-    let _ = ENABLED_TOOLS.set(names);
-    Ok(())
+    ]
 }
 
-/// Whether the tool `name` is enabled (see [`enable_only`]).
-pub fn enabled(name: &str) -> bool {
-    ENABLED_TOOLS
-        .get()
-        .is_none_or(|names| names.iter().any(|n| n == name))
+/// Fails on a name that is not a tool.
+pub fn validate_tools(names: &[String]) -> Result<(), String> {
+    let known = tool_names();
+    match names.iter().find(|n| !known.contains(&n.as_str())) {
+        Some(unknown) => Err(format!(
+            "unknown tool {unknown:?}; use {}",
+            known.join(", ")
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The tools an agent may have (all of them, or only those named) and, for a run that
+/// needs it, its own `execute_javascript` settings instead of the configured ones.
+#[derive(Clone, Default)]
+pub struct Toolset {
+    names: Option<Arc<Vec<String>>>,
+    #[cfg(feature = "javascript")]
+    js: Option<Arc<crate::tools::execute_javascript::Settings>>,
+}
+
+// Not derived: the JavaScript settings hold secrets.
+impl std::fmt::Debug for Toolset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Toolset").field(&self.names).finish()
+    }
+}
+
+impl PartialEq for Toolset {
+    fn eq(&self, other: &Self) -> bool {
+        self.names == other.names
+    }
+}
+
+impl Toolset {
+    /// `None` enables all tools.
+    pub fn only(names: Option<Vec<String>>) -> Self {
+        Self {
+            names: names.map(Arc::new),
+            ..Self::default()
+        }
+    }
+
+    /// Runs `execute_javascript` under `settings` and refuses hosts they don't allow.
+    #[cfg(feature = "javascript")]
+    pub fn with_js(mut self, settings: crate::tools::execute_javascript::Settings) -> Self {
+        self.js = Some(Arc::new(settings));
+        self
+    }
+
+    pub fn allows(&self, name: &str) -> bool {
+        self.names
+            .as_ref()
+            .is_none_or(|names| names.iter().any(|n| n == name))
+    }
+
+    /// The names of the enabled tools.
+    pub fn names(&self) -> Vec<String> {
+        tool_names()
+            .into_iter()
+            .filter(|name| self.allows(name))
+            .map(str::to_owned)
+            .collect()
+    }
 }
 
 /// What the harness tells its tools about the environment it runs in.
@@ -143,6 +190,7 @@ fn decide<T: ToolPolicy>(args: &str, context: &Context) -> Option<Approval> {
 /// An agent under construction together with the policies of its tools.
 struct Tools {
     builder: AgentBuilder,
+    enabled: Toolset,
     context: Context,
     /// The system prompt: the base preamble plus the [`ToolPolicy::prompt`] of each tool.
     preamble: String,
@@ -151,7 +199,7 @@ struct Tools {
 
 impl Tools {
     fn add<T: ToolPolicy>(mut self, tool: T) -> Self {
-        if !enabled(T::NAME) {
+        if !self.enabled.allows(T::NAME) {
             return self;
         }
         let policy = Policy {
@@ -182,9 +230,15 @@ impl Tools {
 }
 
 /// The tools every agent (main agent and subagents) has. Add new tools here.
-fn tools(model: &DynModel<Completion>, preamble: &str) -> Tools {
+fn tools(
+    model: &DynModel<Completion>,
+    preamble: &str,
+    enabled: &Toolset,
+    #[cfg_attr(not(feature = "javascript"), allow(unused_variables))] frontend: &Arc<dyn Frontend>,
+) -> Tools {
     let tools = Tools {
         builder: AgentBuilder::new(model.clone()),
+        enabled: enabled.clone(),
         context: Context::from_env(),
         preamble: preamble.to_owned(),
         policies: HashMap::new(),
@@ -192,7 +246,7 @@ fn tools(model: &DynModel<Completion>, preamble: &str) -> Tools {
     .add(Execute)
     .add(UseSkill);
     #[cfg(feature = "javascript")]
-    let tools = tools.add(ExecuteJavascript);
+    let tools = tools.add(ExecuteJavascript::new(frontend.clone(), enabled.js.clone()));
     #[cfg(feature = "image")]
     let tools = tools.add(ViewImage);
     tools
@@ -203,16 +257,27 @@ pub fn main_agent(
     model: DynModel<Completion>,
     preamble: &str,
     frontend: Arc<dyn Frontend>,
+    enabled: &Toolset,
 ) -> Agent {
-    tools(&model, preamble)
-        .add(Subagent::new(model.clone(), preamble, frontend.clone()))
+    tools(&model, preamble, enabled, &frontend)
+        .add(Subagent::new(
+            model.clone(),
+            preamble,
+            frontend.clone(),
+            enabled.clone(),
+        ))
         .add(AskUser::new(frontend.clone()))
         .build(frontend, MAX_TURNS)
 }
 
 /// A subagent: the same tools without `agent`, so subagents can't nest.
-pub fn subagent(model: DynModel<Completion>, preamble: &str, frontend: Arc<dyn Frontend>) -> Agent {
-    tools(&model, preamble).build(frontend, SUBAGENT_MAX_TURNS)
+pub fn subagent(
+    model: DynModel<Completion>,
+    preamble: &str,
+    frontend: Arc<dyn Frontend>,
+    enabled: &Toolset,
+) -> Agent {
+    tools(&model, preamble, enabled, &frontend).build(frontend, SUBAGENT_MAX_TURNS)
 }
 
 /// Reports tool calls to the frontend and asks it for approval where the tool's
@@ -357,6 +422,16 @@ pub struct Report<'a> {
     pub frontend: &'a dyn Frontend,
     /// The model's context window, if known.
     pub context_window: Option<u64>,
+    /// Collects what the run did so far, so a stopped run can still be remembered.
+    pub partial: Option<&'a Mutex<String>>,
+}
+
+/// Shortens `text` to at most `max` characters for the stopped-run digest.
+fn clip(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((end, _)) => format!("{}… [cut]", &text[..end]),
+        None => text.to_string(),
+    }
 }
 
 /// Drives `stream` to its final response, reporting to `report` if given.
@@ -371,7 +446,32 @@ pub async fn run_stream(
                 ..
             })) => {
                 if let Some(report) = &report {
+                    if let Some(partial) = report.partial {
+                        partial.lock().unwrap().push_str(&text);
+                    }
                     report.frontend.emit(Event::Text(text));
+                }
+            }
+            MultiTurnStreamItem::ToolCall { tool_call } => {
+                if let Some(partial) = report.as_ref().and_then(|r| r.partial) {
+                    let call = &tool_call.function;
+                    partial.lock().unwrap().push_str(&format!(
+                        "\n[tool call `{}`: {}]\n",
+                        call.name,
+                        clip(
+                            &serde_json::to_string(&call.arguments).unwrap_or_default(),
+                            1000
+                        )
+                    ));
+                }
+            }
+            MultiTurnStreamItem::ToolResult { tool_result } => {
+                if let Some(partial) = report.as_ref().and_then(|r| r.partial) {
+                    let result = serde_json::to_string(&tool_result.content).unwrap_or_default();
+                    partial
+                        .lock()
+                        .unwrap()
+                        .push_str(&format!("[tool result: {}]\n", clip(&result, 2000)));
                 }
             }
             MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Reasoning {
@@ -413,21 +513,37 @@ fn catalog_context_window(model: &DynModel<Completion>) -> Option<u64> {
 /// A conversation with the main agent.
 pub struct Session {
     agent: Agent,
+    model: DynModel<Completion>,
+    preamble: String,
+    /// The tools the configuration enables, and the ones this conversation uses instead.
+    default_tools: Toolset,
+    tools_override: Option<Toolset>,
     history: Vec<Message>,
     frontend: Arc<dyn Frontend>,
+    /// The window set in the configuration; it wins over the model catalog's.
+    window_override: Option<u64>,
     context_window: Option<u64>,
     /// The `think` value sent with every request, if one was chosen.
     think: Option<Value>,
+    /// The prompt being run and what it has done so far.
+    running: Option<(String, Arc<Mutex<String>>)>,
 }
 
 impl Session {
     pub fn new(model: DynModel<Completion>, preamble: &str, frontend: Arc<dyn Frontend>) -> Self {
+        let enabled = Toolset::default();
         Self {
             context_window: catalog_context_window(&model),
-            agent: main_agent(model, preamble, frontend.clone()),
+            agent: main_agent(model.clone(), preamble, frontend.clone(), &enabled),
+            model,
+            preamble: preamble.to_owned(),
+            default_tools: enabled,
+            tools_override: None,
+            window_override: None,
             history: Vec::new(),
             frontend,
             think: None,
+            running: None,
         }
     }
 
@@ -439,8 +555,78 @@ impl Session {
 
     /// Uses `tokens` as the model's context window instead of the catalog's, if given.
     pub fn with_context_window(mut self, tokens: Option<u64>) -> Self {
+        self.window_override = tokens;
         self.context_window = tokens.or(self.context_window);
         self
+    }
+
+    /// Restricts the agent to the tools in `names`; `None` enables all.
+    pub fn with_tools(mut self, names: Option<Vec<String>>) -> Self {
+        self.default_tools = Toolset::only(names);
+        self.rebuild();
+        self
+    }
+
+    /// The tools this conversation has: its own choice, else the configured ones.
+    pub fn enabled_tools(&self) -> Toolset {
+        self.tools_override
+            .clone()
+            .unwrap_or_else(|| self.default_tools.clone())
+    }
+
+    /// Gives this conversation its own set of tools; `None` goes back to the configured ones.
+    pub fn set_tools(&mut self, names: Option<Vec<String>>) {
+        self.tools_override = names.map(|names| Toolset::only(Some(names)));
+        self.rebuild();
+    }
+
+    /// Applies a changed configuration: the model, its context window and the configured
+    /// tools. The conversation continues with the new agent.
+    pub fn reconfigure(
+        &mut self,
+        model: DynModel<Completion>,
+        window: Option<u64>,
+        tools: Option<Vec<String>>,
+    ) {
+        self.context_window = window.or(catalog_context_window(&model));
+        self.window_override = window;
+        self.model = model;
+        self.default_tools = Toolset::only(tools);
+        self.rebuild();
+    }
+
+    /// A new conversation on the same model with `tools` and `frontend`, for a run that
+    /// has nobody at the keyboard. `note` is added to the system prompt.
+    pub fn fork(&self, frontend: Arc<dyn Frontend>, tools: Toolset, note: &str) -> Session {
+        let preamble = format!("{}\n\n{note}", self.preamble);
+        Session {
+            agent: main_agent(self.model.clone(), &preamble, frontend.clone(), &tools),
+            model: self.model.clone(),
+            preamble,
+            default_tools: tools,
+            tools_override: None,
+            history: Vec::new(),
+            frontend,
+            window_override: self.window_override,
+            context_window: self.context_window,
+            think: None,
+            running: None,
+        }
+    }
+
+    /// Rebuilds the agent with the same settings, e.g. so that its system prompt lists
+    /// skills that were added or changed.
+    pub fn refresh(&mut self) {
+        self.rebuild();
+    }
+
+    fn rebuild(&mut self) {
+        self.agent = main_agent(
+            self.model.clone(),
+            &self.preamble,
+            self.frontend.clone(),
+            &self.enabled_tools(),
+        );
     }
 
     /// The conversation so far, as the model sees it.
@@ -450,12 +636,43 @@ impl Session {
 
     /// Continues another conversation from `history`.
     pub fn set_history(&mut self, history: Vec<Message>) {
+        self.running = None;
         self.history = history;
     }
 
     /// Runs one prompt to the end; on success it becomes part of the history.
-    /// Dropping the future cancels the prompt and leaves the history unchanged.
+    /// Dropping the future cancels the prompt; call [`Session::commit_stopped`] after
+    /// that (the next prompt does it too) so the history keeps the prompt's input and
+    /// a digest of what the agent did before it was stopped.
     pub async fn prompt(&mut self, input: String) -> Result<(), String> {
+        self.commit_stopped();
+        let partial = Arc::new(Mutex::new(String::new()));
+        self.running = Some((input.clone(), partial.clone()));
+        let result = self.run_prompt(input, &partial).await;
+        self.running = None;
+        result
+    }
+
+    /// Remembers a prompt that was cancelled before it finished: the user's input, then
+    /// what the agent had said and done as plain text (the results of the tool batch
+    /// that was running are not known). Does nothing when no prompt was cancelled.
+    pub fn commit_stopped(&mut self) {
+        let Some((input, partial)) = self.running.take() else {
+            return;
+        };
+        let done = partial.lock().unwrap().trim().to_string();
+        let mut digest = String::from("[This answer was stopped by the user before it finished.");
+        if done.is_empty() {
+            digest.push_str(" Nothing had been done yet.]");
+        } else {
+            digest.push_str(" What I had said and done so far:]\n");
+            digest.push_str(&done);
+        }
+        self.history.push(Message::user(input));
+        self.history.push(Message::assistant(digest));
+    }
+
+    async fn run_prompt(&mut self, input: String, partial: &Mutex<String>) -> Result<(), String> {
         let mut request = self.agent.prompt(input);
         if let Some(think) = &self.think {
             let mut params = serde_json::Map::new();
@@ -469,6 +686,7 @@ impl Session {
         let report = Report {
             frontend: &*self.frontend,
             context_window: self.context_window,
+            partial: Some(partial),
         };
         let response = run_stream(&mut stream, Some(report)).await?;
         drop(stream);
@@ -506,7 +724,12 @@ mod tests {
 
     fn approve_hook() -> Approve {
         let model = MockCompletionModel::from_stream_turns(Vec::<Vec<MockStreamEvent>>::new());
-        let tools = tools(&model.into(), "");
+        let tools = tools(
+            &model.into(),
+            "",
+            &Toolset::default(),
+            &(Arc::new(Silent) as Arc<dyn Frontend>),
+        );
         Approve {
             frontend: Arc::new(Silent),
             context: Context { isolated: true },
@@ -516,9 +739,43 @@ mod tests {
     #[test]
     fn tools_add_their_sentences_to_the_system_prompt() {
         let model = MockCompletionModel::from_stream_turns(Vec::<Vec<MockStreamEvent>>::new());
-        let preamble = tools(&model.into(), "BASE").preamble;
+        let preamble = tools(
+            &model.into(),
+            "BASE",
+            &Toolset::default(),
+            &(Arc::new(Silent) as Arc<dyn Frontend>),
+        )
+        .preamble;
         assert!(preamble.starts_with("BASE\n\n"), "{preamble}");
         assert!(preamble.contains("Use the `execute` tool"), "{preamble}");
+    }
+
+    #[test]
+    fn a_conversation_can_have_its_own_tools() {
+        let model = MockCompletionModel::from_stream_turns(Vec::<Vec<MockStreamEvent>>::new());
+        let mut session = Session::new(model.into(), "", Arc::new(Silent))
+            .with_tools(Some(vec!["execute".into(), "agent".into()]));
+        assert_eq!(session.enabled_tools().names(), ["execute", "agent"]);
+        session.set_tools(Some(vec!["use_skill".into()]));
+        assert_eq!(session.enabled_tools().names(), ["use_skill"]);
+        session.set_tools(None); // back to the configured ones
+        assert_eq!(session.enabled_tools().names(), ["execute", "agent"]);
+        assert!(validate_tools(&["nope".into()]).is_err());
+    }
+
+    #[test]
+    fn disabled_tools_leave_the_system_prompt() {
+        let model = MockCompletionModel::from_stream_turns(Vec::<Vec<MockStreamEvent>>::new());
+        let enabled = Toolset::only(Some(vec!["use_skill".into()]));
+        let tools = tools(
+            &model.into(),
+            "BASE",
+            &enabled,
+            &(Arc::new(Silent) as Arc<dyn Frontend>),
+        );
+        assert!(!tools.preamble.contains("Use the `execute` tool"), "{}", tools.preamble);
+        assert!(tools.policies.contains_key("use_skill"));
+        assert!(!tools.policies.contains_key("execute"));
     }
 
     #[test]
@@ -650,6 +907,26 @@ mod tests {
             window: Some(4_000),
         };
         assert_eq!(reported, [at(1_050), at(1_300)]);
+    }
+
+    /// A stopped prompt must not be forgotten: the next request still sees the input and
+    /// what the agent had said.
+    #[tokio::test]
+    async fn stopped_prompt_stays_in_the_history() {
+        let model = MockCompletionModel::from_stream_turns([vec![
+            MockStreamEvent::text("partial answer"),
+            MockStreamEvent::final_response_with_total_tokens(1),
+        ]]);
+        let mut session = Session::new(model.into(), "", Arc::new(Silent));
+        // Cancel after the model has produced its text but before the run settles.
+        let partial = Arc::new(Mutex::new("partial answer".to_string()));
+        session.running = Some(("do the thing".into(), partial));
+        session.commit_stopped();
+        assert_eq!(session.history().len(), 2);
+        assert!(format!("{:?}", session.history()[1]).contains("partial answer"));
+        // Committing twice adds nothing.
+        session.commit_stopped();
+        assert_eq!(session.history().len(), 2);
     }
 
     /// The window comes from rig's model catalog; models it lists without one (most

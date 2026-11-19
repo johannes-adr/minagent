@@ -9,12 +9,13 @@ mod fs;
 mod modules;
 mod runtime;
 
+use crate::frontend::Frontend;
 use crate::harness::{Approval, Context, ToolPolicy};
 use crate::tools::process::format_output;
-use rig_agent::rig_tool;
-use rig_core::tool::ToolExecutionError;
+use rig_core::tool::{Tool, ToolContext};
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::convert::Infallible;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::runtime::Handle;
 
@@ -23,6 +24,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 30;
 const MAX_TIMEOUT_SECS: u64 = 300;
 
 /// A credential bound to one host (`AGENT_SECRET_<NAME>=<host> <header value>`).
+#[derive(Clone)]
 pub struct Secret {
     pub host: String,
     /// The `Authorization` header value, e.g. `Bearer ghp_xxx`.
@@ -30,23 +32,48 @@ pub struct Secret {
 }
 
 /// What the configuration gives the tool.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Settings {
     /// Hosts whose calls run without asking (`AGENT_JS_ALLOWED_HOSTS`), lowercase.
     pub allowed_hosts: Vec<String>,
+    /// Whether calls to allowed hosts may also change data (POST, PUT, PATCH, DELETE)
+    /// without asking (`AGENT_JS_ALLOW_WRITES`). Otherwise each such request asks.
+    pub allow_writes: bool,
     /// Secrets by name (the `<NAME>` of `AGENT_SECRET_<NAME>`).
     pub secrets: HashMap<String, Secret>,
 }
 
-static SETTINGS: OnceLock<Arc<Settings>> = OnceLock::new();
+static SETTINGS: RwLock<Option<Arc<Settings>>> = RwLock::new(None);
 
-/// Sets the tool's configuration. Call once at startup, before creating a session.
+/// Sets the tool's configuration. It reaches agents built afterwards: call it before
+/// creating a session, and rebuild the session's agent after changing it.
 pub fn configure(settings: Settings) {
-    let _ = SETTINGS.set(Arc::new(settings));
+    *SETTINGS.write().unwrap() = Some(Arc::new(settings));
 }
 
 fn settings() -> Arc<Settings> {
-    SETTINGS.get_or_init(Default::default).clone()
+    SETTINGS.read().unwrap().clone().unwrap_or_default()
+}
+
+/// The output for a call that declares a host the run doesn't allow (a webhook run's own
+/// settings; the configured ones ask the user instead).
+fn refuse_hosts(hosts: &[String], settings: &Settings) -> Option<String> {
+    let host = hosts.iter().find(|h| !settings.allowed_hosts.contains(h))?;
+    let allowed = match settings.allowed_hosts.as_slice() {
+        [] => "none".to_owned(),
+        list => list.join(", "),
+    };
+    Some(format!("error\nstderr:\nthe host {host} is not allowed in this run (allowed: {allowed})"))
+}
+
+/// The configured settings with other hosts and write permission, for a webhook run. The
+/// configured secrets stay available; they only work for the hosts they are bound to.
+pub fn settings_with(allowed_hosts: Vec<String>, allow_writes: bool) -> Settings {
+    Settings {
+        allowed_hosts,
+        allow_writes,
+        ..(*settings()).clone()
+    }
 }
 
 /// Trimmed, lowercase, non-empty hostnames.
@@ -60,7 +87,8 @@ fn normalize(hosts: Option<&[String]>) -> Vec<String> {
 }
 
 /// Calls that only contact allowed hosts (or none) run without asking; the rest needs
-/// approval. The container is irrelevant: the script's capabilities are what is checked.
+/// approval. On allowed hosts, requests that change data (anything but GET/HEAD/OPTIONS)
+/// are approved one by one while the script runs, unless `AGENT_JS_ALLOW_WRITES` is set. The container is irrelevant: the script's capabilities are what is checked.
 impl ToolPolicy for ExecuteJavascript {
     const KIND: &'static str = "execute";
 
@@ -94,7 +122,9 @@ Each call starts fresh; only files in `work` persist between calls. There are no
 timers, no `require`, no npm packages, no `import` except `import {{ f }} from \"skill:<name>/<path>.js\"` of the \
 JavaScript modules a skill documents (read-only; relative imports work inside the skill), no process or environment access and no way to start a process. \
 `fetch` only reaches `https://` and `http://` URLs of hosts you list in \
-the `hosts` argument (the user must approve hosts that are not pre-approved). \
+the `hosts` argument (the user must approve hosts that are not pre-approved). On pre-approved hosts \
+requests that change data (POST, PUT, PATCH, DELETE, uploads) may still ask the user for approval while \
+the script runs; if they decline, `fetch` throws. \
 `secret: \"NAME\"` makes `fetch` add the `Authorization` header from the configured secret; the script never \
 sees its value, and it only works for the host the secret is bound to. {secrets} \
 Print results with `console.log`; thrown errors are returned as output."
@@ -121,43 +151,94 @@ fn approval(args: &ExecuteJavascriptParameters, allowed: &[String]) -> Approval 
     ))
 }
 
-/// Run a JavaScript (ES module) script in a sandboxed in-process runtime and return its
-/// console output and, if it threw, the error. For workflow automation: calling APIs
-/// with `fetch` and transforming data. Only `console`, `fetch`, `fs` and `runScript` exist; there is
-/// no `require`, no npm and no process access. `import` works only for skill modules
-/// (`import { f } from "skill:<name>/<path>.js"`), and the `fs` read functions also accept
-/// read-only `skill:<name>/<path>` paths.
-#[rig_tool(params(
-    code = "The script (ES module; top-level await works). Print results with console.log.",
-    hosts = "Hostnames the script will contact with fetch, e.g. [\"api.github.com\"]. fetch to any other host fails; omit when the script does no network access.",
-    timeout_seconds = "Stop the script after this many seconds (default 30, max 300)."
-))]
-pub(crate) async fn execute_javascript(
+const DESCRIPTION: &str = "Run a JavaScript (ES module) script in a sandboxed in-process runtime and return its console output and, if it threw, the error. For workflow automation: calling APIs with `fetch` and transforming data. Only `console`, `fetch`, `fs` and `runScript` exist; there is no `require`, no npm and no process access. `import` works only for skill modules (`import { f } from \"skill:<name>/<path>.js\"`), and the `fs` read functions also accept read-only `skill:<name>/<path>` paths.";
+
+#[derive(rig_core::serde::Deserialize, rig_core::schemars::JsonSchema)]
+#[serde(crate = "rig_core::serde")]
+#[schemars(crate = "rig_core::schemars")]
+pub(crate) struct ExecuteJavascriptParameters {
+    /// The script (ES module; top-level await works). Print results with console.log.
     code: String,
+    /// Hostnames the script will contact with fetch, e.g. ["api.github.com"]. fetch to any other host fails; omit when the script does no network access.
+    #[serde(default)]
     hosts: Option<Vec<String>>,
+    /// Stop the script after this many seconds (default 30, max 300).
+    #[serde(default)]
     timeout_seconds: Option<u64>,
-) -> Result<String, ToolExecutionError> {
-    let timeout = Duration::from_secs(
-        timeout_seconds
-            .unwrap_or(DEFAULT_TIMEOUT_SECS)
-            .clamp(1, MAX_TIMEOUT_SECS),
-    );
-    run(code, normalize(hosts.as_deref()), timeout, settings())
-        .await
-        .map_err(ToolExecutionError::from_error)
+}
+
+/// Runs scripts. It cannot be a `#[rig_tool]` function because it needs the frontend, to
+/// ask the user about requests that change data while a script runs.
+pub(crate) struct ExecuteJavascript {
+    frontend: Arc<dyn Frontend>,
+    /// Settings of this run instead of the configured ones; scripts may then only declare
+    /// the hosts they allow.
+    own_settings: Option<Arc<Settings>>,
+}
+
+impl ExecuteJavascript {
+    pub(crate) fn new(frontend: Arc<dyn Frontend>, own_settings: Option<Arc<Settings>>) -> Self {
+        Self {
+            frontend,
+            own_settings,
+        }
+    }
+}
+
+impl Tool for ExecuteJavascript {
+    const NAME: &'static str = "execute_javascript";
+    type Args = ExecuteJavascriptParameters;
+    type Output = String;
+    type Error = Infallible;
+
+    fn description(&self) -> String {
+        DESCRIPTION.to_string()
+    }
+
+    fn parameters(&self) -> rig_core::serde_json::Value {
+        rig_core::schemars::schema_for!(ExecuteJavascriptParameters).to_value()
+    }
+
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<String, Infallible> {
+        let timeout = Duration::from_secs(
+            args.timeout_seconds
+                .unwrap_or(DEFAULT_TIMEOUT_SECS)
+                .clamp(1, MAX_TIMEOUT_SECS),
+        );
+        let hosts = normalize(args.hosts.as_deref());
+        let settings = self.own_settings.clone().unwrap_or_else(settings);
+        if self.own_settings.is_some()
+            && let Some(refusal) = refuse_hosts(&hosts, &settings)
+        {
+            return Ok(refusal);
+        }
+        // A call the user approved as a whole (some host is not allowed) needs no more
+        // questions; on allowed hosts, writes ask unless the configuration waves them through.
+        let all_allowed = hosts.iter().all(|h| settings.allowed_hosts.contains(h));
+        let confirm_writes = (all_allowed && !settings.allow_writes).then(|| self.frontend.clone());
+        Ok(run(args.code, hosts, confirm_writes, timeout, settings)
+            .await
+            .unwrap_or_else(|e| format!("error\nstderr:\n{e}")))
+    }
 }
 
 /// Runs the script on a blocking thread and formats its outcome like `execute`'s output.
 async fn run(
     code: String,
     hosts: Vec<String>,
+    confirm_writes: Option<Arc<dyn Frontend>>,
     timeout: Duration,
     settings: Arc<Settings>,
 ) -> Result<String, tokio::task::JoinError> {
     let handle = Handle::current();
-    let outcome =
-        tokio::task::spawn_blocking(move || runtime::run(&code, hosts, timeout, settings, handle))
-            .await?;
+    let outcome = tokio::task::spawn_blocking(move || {
+        runtime::run(&code, hosts, confirm_writes, timeout, settings, handle)
+    })
+    .await?;
     Ok(format_output(
         &outcome.exit,
         outcome.stdout.as_bytes(),
@@ -232,11 +313,54 @@ mod tests {
         run(
             code.to_owned(),
             hosts,
+            None,
             Duration::from_secs(secs),
             Arc::new(settings),
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn changing_requests_on_allowed_hosts_ask_and_a_denial_throws() {
+        let code = r#"
+            for (const method of ["GET", "POST", "DELETE"]) {
+                try { await fetch("http://localhost:1/x", { method }); }
+                catch (e) { console.log(method, String(e.message ?? e)); }
+            }
+        "#;
+        let frontend: Arc<dyn Frontend> = Arc::new(crate::frontend::Silent);
+        let out = run(
+            code.to_owned(),
+            vec!["localhost".to_owned()],
+            Some(frontend),
+            Duration::from_secs(10),
+            Arc::new(Settings::default()),
+        )
+        .await
+        .unwrap();
+        // Silent denies every approval: the GET is not asked (it fails to connect instead).
+        assert!(!out.contains("GET the user denied"), "{out}");
+        assert!(
+            out.contains("POST the user denied the POST request"),
+            "{out}"
+        );
+        assert!(
+            out.contains("DELETE the user denied the DELETE request"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_runs_own_settings_refuse_other_hosts() {
+        let settings = settings_with(vec!["api.x.com".into()], false);
+        let hosts = |h: &[&str]| h.iter().map(|h| h.to_string()).collect::<Vec<_>>();
+        assert_eq!(refuse_hosts(&hosts(&["api.x.com"]), &settings), None);
+        assert_eq!(refuse_hosts(&hosts(&[]), &settings), None);
+        let refusal = refuse_hosts(&hosts(&["api.x.com", "evil.com"]), &settings).unwrap();
+        assert!(refusal.contains("evil.com") && refusal.contains("allowed: api.x.com"), "{refusal}");
+        let none = settings_with(vec![], false);
+        assert!(refuse_hosts(&hosts(&["a.com"]), &none).unwrap().contains("allowed: none"));
     }
 
     async fn js(code: &str) -> String {

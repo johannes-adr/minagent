@@ -33,10 +33,10 @@ docker run --rm -i  -v "$PWD:$PWD" -w "$PWD" agent --acp  # ACP (no -t, it would
 Notes:
 
 - The workspace is mounted under its host path, so the client's `cwd` exists in the container. The client must start the agent in the project directory.
-- Config comes from `.env` in the workspace (or `-e LLM_BACKEND=... -e ANTHROPIC_API_KEY=...` without the script).
+- Config comes from `config.json` (written by the web UI's settings page), `.env` in the workspace or the environment (`-e LLM_BACKEND=... -e ANTHROPIC_API_KEY=...` without the script); see [Settings](#settings-web-ui).
 - Ollama on the host: `OLLAMA_API_BASE_URL=http://host.docker.internal:11434` (podman: `host.containers.internal`).
 - Podman: add `--userns=keep-id` so files keep your user (the script does). Docker on Linux: add `--user "$(id -u):$(id -g)"`.
-- The container has full network access, and commands in it can read `.env`. Use keys with minimal scope.
+- The container has full network access, and commands in it can read `.env` and `config.json`. Use keys with minimal scope.
 
 ## `AGENTS.md`
 
@@ -49,9 +49,18 @@ If the working directory contains an [`AGENTS.md`](https://agents.md), its conte
 
 - The agent can run commands, so the API requires the random token printed at startup (the page keeps it in `sessionStorage` and removes it from the address bar). The script publishes the port on `127.0.0.1` only; `AGENT_WEB_PORT=9000` changes it.
 - Without the script: `agent --web [addr]` (default `127.0.0.1:8080`). In a container use `agent --web 0.0.0.0:8080` with `-p 127.0.0.1:8080:8080`.
-- The page is a single file without external resources ([`src/frontend/web.html`](src/frontend/web.html)), so it works offline.
+- The page is a [Svelte](https://svelte.dev) app in [`web/`](web/) without external resources, so it works offline. Vite builds it to static files (`web/dist`) that are embedded in the binary and served by the agent; Node is only needed to build. `cargo build` works without it but then serves a placeholder page: run `npm install && npm run build` in `web/` first (`agent.sh` and the Dockerfile do this for you). For UI development run `npm run dev` in `web/` (hot reload, forwards `/api` to a running `agent --web`; `AGENT_URL` changes the target). Debug builds of the agent read `web/dist` from disk, so rebuilt UI files show up without recompiling.
 
-## Context usage
+### Settings (web UI)
+
+The gear button opens a settings page with every option of `.env.example` (the list in `src/config.rs` drives both). Saving writes `config.json` in the workspace (`AGENT_CONFIG` names another file; mode 0600, git-ignored) and applies it to the next message without a restart: model, API keys, context window, tools and the `execute_javascript` hosts and secrets. The order of priority is `config.json`, then the environment, then `.env`; "Reset" removes a value from the file so the environment's applies again. Secrets (API keys, `AGENT_SECRET_*`) are never sent back to the page, which only shows whether they are set (and a secret's host); new secrets can be added under "Secrets". Without an API key the web UI still starts, so the key can be entered there. Settings can only be saved while the agent is not working.
+
+The "Tools" menu in the chat header turns tools on and off for the current chat only (it overrides `AGENT_TOOLS` / the default from the settings page, is saved with the session, and "Reset" goes back to the default). Subagents get the same tools as their parent, except `agent`.
+
+### Files (web UI)
+
+The 🗂 button opens a file browser on two areas: `skills/` and the agent's working directory `work/` (nothing else, such as `.env` or the sources, is reachable; paths with `..` and symbolic links are refused). Text files up to 1 MiB open in an editor (Ctrl/Cmd+S saves); files and folders can be added, renamed, moved and deleted. "+ Skill" creates `skills/<name>/SKILL.md` from a template. The files of built-in skills are rewritten on every start, so they are read-only (a lock in the list); add your own files next to them or copy a skill under another name. After skills were changed, the agent is rebuilt before the next message so its system prompt lists them.
+
 
 After each model call of the main agent the UIs show how full its context is, e.g. `42k / 200k tokens (21%)`: the terminal UI at the right of the status line (yellow from 80 %, red from 95 %), the browser UI in the header, and ACP clients get a `usage_update` session update (`used`, `size`). The tokens are the input and output of the latest call as the provider reports them, i.e. what the next request sends again. Subagents have their own context and are not counted.
 
@@ -97,5 +106,5 @@ Each call runs in a fresh runtime with a 256 MB memory limit and a timeout (`tim
 
 Configuration in `.env`:
 
-- `AGENT_JS_ALLOWED_HOSTS=api.github.com,example.com`: calls whose `hosts` are all in this list (or empty) run without asking; any other host needs the user's approval. This does not depend on `AGENT_ISOLATED`.
+- `AGENT_JS_ALLOWED_HOSTS=api.github.com,example.com`: calls whose `hosts` are all in this list (or empty) run without asking. While such a script runs, each request that changes data (POST/PUT/PATCH/DELETE, uploads) still asks the user for approval, unless `AGENT_JS_ALLOW_WRITES=1` is set; GET/HEAD/OPTIONS never ask. Any other host needs approval for the whole call. This does not depend on `AGENT_ISOLATED`.
 - `AGENT_SECRET_<NAME>=<host> <Authorization header value>`, e.g. `AGENT_SECRET_GITHUB=api.github.com Bearer ghp_xxx`: `fetch(url, {secret: "GITHUB"})` makes the harness add that `Authorization` header. The script never sees the value, and the secret is only sent to its host. A server that echoes request headers in its response can still reveal it.

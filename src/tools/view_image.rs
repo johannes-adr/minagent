@@ -16,9 +16,7 @@ const MAX_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
 /// Only PNG, JPEG, GIF and WebP files up to 5 MiB work (the type is read from the file's
 /// content, not its name); anything else is rejected. The file's content is sent to the
 /// model provider.
-#[rig_tool(params(
-    path = "Path of the image file, relative to the `work` directory or absolute."
-))]
+#[rig_tool(params(path = "Path of the image file, relative to the `work` directory or absolute."))]
 pub(crate) async fn view_image(path: String) -> Result<ToolOutput, ToolExecutionError> {
     load(&path).await
 }

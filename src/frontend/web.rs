@@ -1,8 +1,9 @@
 //! Web frontend: `agent --web [addr]` serves a chat page (default `127.0.0.1:8080`).
 //!
-//! The page ([`web.html`](web.html)) is one self-contained file. It gets the session as a
-//! stream of JSON events over server-sent events (`GET /events`) and talks back with
-//! `POST /prompt`, `POST /approve`, `POST /answer` and `POST /cancel`. Like the terminal UI there is one
+//! The page is a Svelte app (`web/`), built to static files that are embedded in the binary
+//! and served from `/`. The API lives under `/api`: the page gets the session as a stream of
+//! JSON events over server-sent events (`GET /api/events`) and talks back with
+//! `POST /api/prompt`, `POST /api/approve`, `POST /api/answer` and `POST /api/cancel`. Like the terminal UI there is one
 //! session; every browser tab shows it, and a reloaded tab gets the whole transcript replayed.
 //!
 //! Whoever can call the API can make the agent run commands, so all of it needs the random
@@ -10,31 +11,44 @@
 //! static page is served without it.
 
 use crate::frontend::{ContextUsage, Event, Frontend, Question, ToolCall};
-use crate::harness::Session;
+use crate::config::Config;
+use crate::frontend::files::{Area, FileError};
+use crate::frontend::hook_run::{self, Job};
+use crate::hooks::{self, Fields, Hooks};
+use crate::harness::{self, Context, Session, Toolset};
 use crate::sessions::{self, Store};
 use crate::thinking::{self, Thinking};
-use axum::extract::{Request, State};
-use axum::http::StatusCode;
+use axum::body::Bytes;
+use axum::extract::{Path, RawQuery, Request, State};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{self, KeepAlive, Sse};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::future::BoxFuture;
 use futures::{Stream, StreamExt};
-use rig_core::serde_json::{Value, json};
-use std::collections::HashMap;
+use rig_core::serde_json::{self, Value, json};
+use rust_embed::RustEmbed;
+use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;
 use std::io::{self, Read};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{Notify, broadcast, mpsc, oneshot};
 
 /// The receiving end of what the browser asks for, see [`Web::new`].
 pub type Inbox = mpsc::UnboundedReceiver<Command>;
 
-const PAGE: &str = include_str!("web.html");
+/// The built UI (`npm run build` in `web/`), embedded into the binary. Debug builds read
+/// the folder from disk instead, so a rebuilt UI shows up without recompiling.
+#[derive(RustEmbed)]
+#[folder = "web/dist"]
+struct Assets;
+
 pub const DEFAULT_ADDR: &str = "127.0.0.1:8080";
 /// Tool output sent to the browser is cut to this many bytes (the model still gets all of it).
 const MAX_OUTPUT: usize = 20_000;
@@ -52,8 +66,14 @@ struct Inner {
     context: Option<Value>,
     /// The stored session being shown; assigned when its first prompt runs.
     session_id: Option<String>,
+    /// The thinking levels the model offers, if it offers any.
+    thinking: Option<Thinking>,
     /// The thinking level the user picked; `None` leaves it to the model's default.
     think: Option<String>,
+    /// The tools the configuration enables (`None`: all) and the ones the shown session
+    /// uses instead, if it has its own choice.
+    default_tools: Option<Vec<String>>,
+    tools: Option<Vec<String>>,
 }
 
 /// What the worker does, one at a time.
@@ -62,6 +82,10 @@ pub enum Command {
     /// Shows a stored session, or a new one for `None`.
     Switch(Option<String>),
     Delete(String),
+    /// Gives the shown session its own tools; `None` goes back to the configured ones.
+    SetTools(Option<Vec<String>>),
+    /// Applies a changed configuration (already saved to the settings file).
+    Reload(Box<Config>),
 }
 
 /// The web frontend's state, shared by the harness side ([`Frontend`]) and the HTTP handlers.
@@ -73,24 +97,42 @@ pub struct Web {
     commands: mpsc::UnboundedSender<Command>,
     store: Store,
     cancel: Notify,
-    /// The thinking levels the model offers, if it offers any.
-    thinking: Option<Thinking>,
+    /// The settings file the settings page edits.
+    config_path: PathBuf,
+    /// Set when skills were edited: the agent is rebuilt before the next prompt, so that
+    /// its system prompt lists them.
+    skills_dirty: AtomicBool,
+    /// The webhooks (`hooks.json` next to the settings file) and the runs waiting for the worker.
+    hooks: Mutex<Hooks>,
+    jobs: Mutex<VecDeque<Job>>,
+    jobs_ready: Notify,
 }
 
 impl Web {
     /// Returns the frontend and the receiving end of the prompts the browser submits,
     /// which [`run`] feeds to the session.
-    pub fn new(store: Store, thinking: Option<Thinking>) -> io::Result<(Arc<Self>, Inbox)> {
+    pub fn new(
+        store: Store,
+        thinking: Option<Thinking>,
+        config_path: PathBuf,
+    ) -> io::Result<(Arc<Self>, Inbox)> {
         let (commands, inbox) = mpsc::unbounded_channel();
         let web = Self {
             token: random_token()?,
-            inner: Mutex::default(),
+            inner: Mutex::new(Inner {
+                thinking,
+                ..Inner::default()
+            }),
             live: broadcast::channel(4096).0,
             busy: AtomicBool::new(false),
             commands,
             store,
             cancel: Notify::new(),
-            thinking,
+            config_path: config_path.clone(),
+            skills_dirty: AtomicBool::new(false),
+            hooks: Mutex::new(Hooks::load(hooks::path_for(&config_path)).map_err(io::Error::other)?),
+            jobs: Mutex::default(),
+            jobs_ready: Notify::new(),
         };
         Ok((Arc::new(web), inbox))
     }
@@ -98,29 +140,14 @@ impl Web {
     /// Records `event` and sends it to the connected browsers.
     fn push(&self, event: Value) {
         let mut inner = self.inner.lock().unwrap();
-        if matches!(event["type"].as_str(), Some("text" | "reasoning"))
-            && let Some(last) = inner.log.last_mut()
-            && last["type"] == event["type"]
-            && last["agent"] == event["agent"]
-            && let Some(Value::String(text)) = last.get_mut("text")
-        {
-            text.push_str(event["text"].as_str().unwrap_or_default());
-        } else {
-            inner.log.push(event.clone());
-        }
+        append(&mut inner.log, &event);
         // Sent under the lock so that `subscribe` sees each event exactly once.
         let _ = self.live.send(event);
     }
 
     /// Sends the context usage to the connected browsers and keeps it for later ones.
     fn set_context(&self, usage: ContextUsage) {
-        let event = json!({
-            "type": "context",
-            "tokens": usage.tokens,
-            "window": usage.window,
-            "percent": usage.percent(),
-            "text": usage.to_string(),
-        });
+        let event = context_event(usage);
         let mut inner = self.inner.lock().unwrap();
         inner.context = Some(event.clone());
         let _ = self.live.send(event);
@@ -128,13 +155,32 @@ impl Web {
 
     /// The thinking slider's state, if the model has levels.
     fn thinking_event(&self, inner: &Inner) -> Option<Value> {
-        let thinking = self.thinking.as_ref()?;
+        let thinking = inner.thinking.as_ref()?;
         Some(json!({
             "type": "thinking",
             "levels": thinking.levels,
             "default": thinking.default,
             "current": inner.think.as_deref().unwrap_or(&thinking.default),
         }))
+    }
+
+    /// The tools of the shown session, for the page's tool menu.
+    fn tools_event(inner: &Inner) -> Value {
+        let enabled = Toolset::only(inner.tools.clone().or_else(|| inner.default_tools.clone()));
+        json!({
+            "type": "tools",
+            "available": harness::tool_names(),
+            "enabled": enabled.names(),
+            "default": Toolset::only(inner.default_tools.clone()).names(),
+            "custom": inner.tools.is_some(),
+        })
+    }
+
+    /// Sets the tools the configuration enables, for sessions without their own choice.
+    pub fn set_default_tools(&self, tools: Option<Vec<String>>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.default_tools = tools;
+        let _ = self.live.send(Self::tools_event(&inner));
     }
 
     /// The `think` value for the next prompt; `None` while the user hasn't chosen.
@@ -148,18 +194,27 @@ impl Web {
         let inner = self.inner.lock().unwrap();
         let mut events = vec![session_event(&inner.session_id)];
         events.extend(self.thinking_event(&inner));
+        events.push(Self::tools_event(&inner));
         events.extend(inner.log.clone());
         events.extend(inner.context.clone());
         (events, self.live.subscribe())
     }
 
     /// Shows another session: the open pages clear their transcript and get this one.
-    fn replace(&self, id: Option<String>, log: Vec<Value>, context: Option<Value>) {
+    fn replace(
+        &self,
+        id: Option<String>,
+        log: Vec<Value>,
+        context: Option<Value>,
+        tools: Option<Vec<String>>,
+    ) {
         let mut inner = self.inner.lock().unwrap();
         inner.session_id = id;
         inner.log = log;
         inner.context = context;
+        inner.tools = tools;
         let _ = self.live.send(session_event(&inner.session_id));
+        let _ = self.live.send(Self::tools_event(&inner));
         for event in inner.log.iter().chain(&inner.context) {
             let _ = self.live.send(event.clone());
         }
@@ -172,7 +227,7 @@ impl Web {
 
     /// Writes the current session to disk (without busy markers, which are only live).
     fn save(&self, history: &[rig_core::message::Message]) -> Result<(), String> {
-        let (id, log, context) = {
+        let (id, log, context, tools) = {
             let mut inner = self.inner.lock().unwrap();
             let id = inner
                 .session_id
@@ -184,10 +239,10 @@ impl Web {
                 .filter(|e| e["type"] != "status")
                 .cloned()
                 .collect();
-            (id, log, inner.context.clone())
+            (id, log, inner.context.clone(), inner.tools.clone())
         };
         self.store
-            .save(&id, history, &log, context.as_ref())
+            .save(&id, history, &log, context.as_ref(), tools.as_deref())
             .map_err(|e| format!("could not save session {id}: {e}"))
     }
 
@@ -202,7 +257,9 @@ impl Web {
         let reply = self.inner.lock().unwrap().questions.remove(id);
         let sent = reply.is_some_and(|reply| reply.send(answer.to_owned()).is_ok());
         if sent {
-            self.push(json!({"type": "question", "id": id, "status": "answered", "answer": answer}));
+            self.push(
+                json!({"type": "question", "id": id, "status": "answered", "answer": answer}),
+            );
         }
         sent
     }
@@ -246,14 +303,14 @@ fn settle(log: &mut [Value]) {
 }
 
 /// 128 random bits as hex, from the operating system.
-fn random_token() -> io::Result<String> {
+pub(super) fn random_token() -> io::Result<String> {
     let mut bytes = [0u8; 16];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 /// Cuts `text` to [`MAX_OUTPUT`] bytes at a character boundary.
-fn clip(mut text: String) -> String {
+pub(super) fn clip(mut text: String) -> String {
     if text.len() > MAX_OUTPUT {
         let mut end = MAX_OUTPUT;
         while !text.is_char_boundary(end) {
@@ -280,7 +337,7 @@ fn clip_args(args: &Value) -> Value {
 }
 
 /// The event describing `call`; the page merges events with the same `id`.
-fn tool_event(call: &ToolCall, status: &str) -> Value {
+pub(super) fn tool_event(call: &ToolCall, status: &str) -> Value {
     json!({
         "type": "tool",
         "id": call.id,
@@ -296,52 +353,85 @@ fn tool_event(call: &ToolCall, status: &str) -> Value {
     })
 }
 
+/// Adds `event` to a transcript; adjacent answer or reasoning fragments of the same agent
+/// are merged.
+pub(super) fn append(log: &mut Vec<Value>, event: &Value) {
+    if matches!(event["type"].as_str(), Some("text" | "reasoning"))
+        && let Some(last) = log.last_mut()
+        && last["type"] == event["type"]
+        && last["agent"] == event["agent"]
+        && let Some(Value::String(text)) = last.get_mut("text")
+    {
+        text.push_str(event["text"].as_str().unwrap_or_default());
+    } else {
+        log.push(event.clone());
+    }
+}
+
+/// The page's event for a context usage.
+pub(super) fn context_event(usage: ContextUsage) -> Value {
+    json!({
+        "type": "context",
+        "tokens": usage.tokens,
+        "window": usage.window,
+        "percent": usage.percent(),
+        "text": usage.to_string(),
+    })
+}
+
+/// The page's event for what the harness reports; `None` for context usage (see
+/// [`context_event`]) and for the parts of a subagent's report the page doesn't show.
+pub(super) fn event_json(event: Event) -> Option<Value> {
+    Some(match event {
+        Event::Text(text) => json!({"type": "text", "text": text}),
+        Event::Reasoning(text) => json!({"type": "reasoning", "text": text}),
+        Event::Note(text) => json!({"type": "note", "text": text}),
+        Event::ToolStarted(call) => tool_event(&call, "running"),
+        Event::ToolDenied(call) => tool_event(&call, "denied"),
+        Event::ToolFinished {
+            id, output, failed, ..
+        } => json!({
+            "type": "tool",
+            "id": id,
+            "status": if failed { "failed" } else { "done" },
+            "output": clip(output),
+        }),
+        Event::Context(_) => return None,
+        Event::SubagentStarted {
+            agent,
+            description,
+            prompt,
+        } => json!({
+            "type": "subagent",
+            "agent": agent,
+            "description": description,
+            "prompt": clip(prompt),
+            "status": "running",
+        }),
+        Event::SubagentFinished { agent, failed } => json!({
+            "type": "subagent",
+            "agent": agent,
+            "status": if failed { "failed" } else { "done" },
+        }),
+        // The subagent's context is not the one the header shows.
+        Event::Sub { agent, event } => match *event {
+            Event::Text(text) => json!({"type": "text", "agent": agent, "text": text}),
+            Event::Reasoning(text) => json!({"type": "reasoning", "agent": agent, "text": text}),
+            Event::Note(text) => json!({"type": "note", "agent": agent, "text": text}),
+            _ => return None,
+        },
+    })
+}
+
 impl Frontend for Web {
     fn emit(&self, event: Event) {
         match event {
-            Event::Text(text) => self.push(json!({"type": "text", "text": text})),
-            Event::Reasoning(text) => self.push(json!({"type": "reasoning", "text": text})),
-            Event::Note(text) => self.push(json!({"type": "note", "text": text})),
-            Event::ToolStarted(call) => self.push(tool_event(&call, "running")),
-            Event::ToolDenied(call) => self.push(tool_event(&call, "denied")),
-            Event::ToolFinished {
-                id, output, failed, ..
-            } => self.push(json!({
-                "type": "tool",
-                "id": id,
-                "status": if failed { "failed" } else { "done" },
-                "output": clip(output),
-            })),
             Event::Context(usage) => self.set_context(usage),
-            Event::SubagentStarted {
-                agent,
-                description,
-                prompt,
-            } => self.push(json!({
-                "type": "subagent",
-                "agent": agent,
-                "description": description,
-                "prompt": clip(prompt),
-                "status": "running",
-            })),
-            Event::SubagentFinished { agent, failed } => self.push(json!({
-                "type": "subagent",
-                "agent": agent,
-                "status": if failed { "failed" } else { "done" },
-            })),
-            // The subagent's context is not the one the header shows.
-            Event::Sub { agent, event } => match *event {
-                Event::Text(text) => {
-                    self.push(json!({"type": "text", "agent": agent, "text": text}))
+            event => {
+                if let Some(json) = event_json(event) {
+                    self.push(json);
                 }
-                Event::Reasoning(text) => {
-                    self.push(json!({"type": "reasoning", "agent": agent, "text": text}))
-                }
-                Event::Note(text) => {
-                    self.push(json!({"type": "note", "agent": agent, "text": text}))
-                }
-                _ => {}
-            },
+            }
         }
     }
 
@@ -404,8 +494,34 @@ async fn authorize(State(web): State<Arc<Web>>, request: Request, next: Next) ->
     }
 }
 
-async fn page() -> Html<&'static str> {
-    Html(PAGE)
+/// Serves the built UI. Paths without a file extension fall back to `index.html`, so the
+/// UI can have routes of its own.
+async fn static_file(uri: Uri) -> Response {
+    let path = match uri.path().trim_start_matches('/') {
+        "" => "index.html",
+        path => path,
+    };
+    let file = Assets::get(path).or_else(|| {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        (!name.contains('.')).then(|| Assets::get("index.html")).flatten()
+    });
+    let Some(file) = file else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    // Built assets have the hash of their content in the name; the page itself must be refetched.
+    let cache = if path.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    (
+        [
+            (header::CONTENT_TYPE, file.metadata.mimetype().to_owned()),
+            (header::CACHE_CONTROL, cache.to_owned()),
+        ],
+        file.data.into_owned(),
+    )
+        .into_response()
 }
 
 async fn events(
@@ -463,20 +579,289 @@ async fn answer(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> StatusC
 
 /// `{"level": "xhigh"}` picks the thinking level for the next prompts.
 async fn set_thinking(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> StatusCode {
-    let Some(thinking) = &web.thinking else {
+    let level = body["level"].as_str().unwrap_or_default();
+    let mut inner = web.inner.lock().unwrap();
+    let Some(thinking) = &inner.thinking else {
         return StatusCode::NOT_FOUND;
     };
-    let level = body["level"].as_str().unwrap_or_default();
     if !thinking.levels.iter().any(|l| l == level) {
         return StatusCode::BAD_REQUEST;
     }
-    let mut inner = web.inner.lock().unwrap();
     inner.think = Some(level.to_owned());
     // Sent under the lock like the other state events.
     if let Some(event) = web.thinking_event(&inner) {
         let _ = web.live.send(event);
     }
     StatusCode::NO_CONTENT
+}
+
+/// `{"tools": ["execute", ...]}` gives the shown session its own tools, `{"tools": null}`
+/// goes back to the configured ones.
+async fn set_tools(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> StatusCode {
+    let tools = match &body["tools"] {
+        Value::Null => None,
+        Value::Array(names) => {
+            let names: Option<Vec<String>> =
+                names.iter().map(|n| n.as_str().map(str::to_owned)).collect();
+            match names {
+                Some(names) if harness::validate_tools(&names).is_ok() => Some(names),
+                _ => return StatusCode::BAD_REQUEST,
+            }
+        }
+        _ => return StatusCode::BAD_REQUEST,
+    };
+    queue(&web, Command::SetTools(tools))
+}
+
+/// Runs a file operation on the area named by the body's `root` (`skills` or `work`).
+fn file_op(
+    web: &Web,
+    body: &Value,
+    changes: bool,
+    op: impl FnOnce(&Area, &Value) -> Result<Value, FileError>,
+) -> Response {
+    let root = body["root"].as_str().unwrap_or_default();
+    let Some(area) = Area::named(root) else {
+        return error(StatusCode::BAD_REQUEST, "root must be skills or work");
+    };
+    match op(&area, body) {
+        Ok(value) => {
+            if changes && root == "skills" {
+                web.skills_dirty.store(true, Ordering::SeqCst);
+            }
+            Json(value).into_response()
+        }
+        Err(e) => error(
+            StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            e.message(),
+        ),
+    }
+}
+
+fn path_of(body: &Value) -> &str {
+    body["path"].as_str().unwrap_or_default()
+}
+
+/// `{"root": "skills", "path": "dir"}`: the entries of a directory.
+async fn files_list(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> Response {
+    file_op(&web, &body, false, |area, body| {
+        Ok(json!({"entries": area.list(path_of(body))?}))
+    })
+}
+
+/// `{"root", "path"}`: the text of a file, and whether it is read-only.
+async fn files_read(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> Response {
+    file_op(&web, &body, false, |area, body| {
+        let (content, readonly) = area.read(path_of(body))?;
+        Ok(json!({"content": content, "readonly": readonly}))
+    })
+}
+
+/// `{"root", "path", "content"}` writes a file, creating missing directories.
+async fn files_write(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> Response {
+    file_op(&web, &body, true, |area, body| {
+        let content = body["content"].as_str().ok_or_else(|| FileError::Invalid("content must be text".into()))?;
+        area.write(path_of(body), content)?;
+        Ok(json!({}))
+    })
+}
+
+async fn files_mkdir(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> Response {
+    file_op(&web, &body, true, |area, body| {
+        area.mkdir(path_of(body))?;
+        Ok(json!({}))
+    })
+}
+
+async fn files_delete(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> Response {
+    file_op(&web, &body, true, |area, body| {
+        area.remove(path_of(body))?;
+        Ok(json!({}))
+    })
+}
+
+/// `{"root", "from", "to"}` moves or renames a file or directory.
+async fn files_rename(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> Response {
+    file_op(&web, &body, true, |area, body| {
+        let part = |key: &str| body[key].as_str().unwrap_or_default().to_owned();
+        area.rename(&part("from"), &part("to"))?;
+        Ok(json!({}))
+    })
+}
+
+/// Queues a run of `hook` for `prompt`. The session exists at once, as "queued", so the
+/// caller can be told its id. `Err` when too many runs are waiting.
+fn enqueue(web: &Web, hook: hooks::Hook, prompt: String) -> Result<(String, usize), StatusCode> {
+    let mut jobs = web.jobs.lock().unwrap();
+    if jobs.len() >= hooks::MAX_QUEUE {
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    let session_id = web.store.new_id();
+    let log = hook_run::queued_log(&hook, &prompt, "queued");
+    web.store
+        .save(&session_id, &[], &log, None, None)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    jobs.push_back(Job {
+        hook,
+        session_id: session_id.clone(),
+        prompt,
+    });
+    let position = jobs.len();
+    drop(jobs);
+    web.jobs_ready.notify_one();
+    web.sessions_changed();
+    Ok((session_id, position))
+}
+
+/// The token of a webhook request: `Authorization: Bearer <token>`, `X-Hook-Token` or `?token=`.
+fn hook_token(headers: &HeaderMap, query: Option<&str>) -> String {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+    header("authorization")
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .or_else(|| header("x-hook-token"))
+        .or_else(|| query?.split('&').find_map(|pair| pair.strip_prefix("token=")))
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
+}
+
+/// `POST /hooks/<name>`: an outside service starts the agent. Needs the hook's own token,
+/// not the page's. Answers `202 {"session": id, "queued": n}`; the result is the session's
+/// (and goes to the hook's callback URL, if it has one). `429` when too many runs wait.
+async fn trigger_hook(
+    State(web): State<Arc<Web>>,
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let token = hook_token(&headers, query.as_deref());
+    let hook = web.hooks.lock().unwrap().get(&name).cloned();
+    // An unknown hook and a wrong token look the same.
+    let Some(hook) = hook.filter(|h| h.check_token(&token)) else {
+        return error(StatusCode::UNAUTHORIZED, "unknown hook or wrong token");
+    };
+    if !hook.enabled {
+        return error(StatusCode::FORBIDDEN, "this hook is switched off");
+    }
+    let raw = String::from_utf8_lossy(&body);
+    let json: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+    // The token itself must never reach the model.
+    let shown: Vec<(String, String)> = headers
+        .iter()
+        .filter(|(n, _)| !matches!(n.as_str(), "authorization" | "x-hook-token" | "cookie"))
+        .filter_map(|(n, v)| Some((n.as_str().to_owned(), v.to_str().ok()?.to_owned())))
+        .collect();
+    let prompt = hooks::render(
+        &hook.template,
+        &hooks::Request {
+            hook: &hook.name,
+            raw: &raw,
+            body: &json,
+            headers: &shown,
+        },
+    );
+    match enqueue(&web, hook, prompt) {
+        Ok((session, queued)) => (
+            StatusCode::ACCEPTED,
+            Json(json!({"session": session, "queued": queued})),
+        )
+            .into_response(),
+        Err(status) => error(status, "too many runs are waiting"),
+    }
+}
+
+/// The hooks and what the form needs to know (never the tokens).
+async fn hooks_list(State(web): State<Arc<Web>>) -> Json<Value> {
+    let hooks = web.hooks.lock().unwrap();
+    Json(json!({
+        "hooks": hooks.list().iter().map(hooks::Hook::to_public).collect::<Vec<_>>(),
+        "isolated": Context::from_env().isolated,
+        "tools": harness::tool_names().into_iter().filter(|t| *t != "ask_user").collect::<Vec<_>>(),
+        "queued": web.jobs.lock().unwrap().len(),
+        "max_queue": hooks::MAX_QUEUE,
+    }))
+}
+
+/// Creates a hook (`"create": true`, answers with its token once) or changes one's settings.
+async fn hooks_save(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> Response {
+    let fields = match Fields::parse(&body, Context::from_env().isolated) {
+        Ok(fields) => fields,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e),
+    };
+    let mut hooks = web.hooks.lock().unwrap();
+    let exists = fields.name.as_deref().is_some_and(|n| hooks.get(n).is_some());
+    if body["create"] == true && exists {
+        return error(StatusCode::CONFLICT, "a hook with this name exists");
+    }
+    if body["create"] != true && !exists {
+        return error(StatusCode::NOT_FOUND, "no such hook");
+    }
+    let new_token = || random_token().unwrap_or_default();
+    match hooks.upsert(fields, new_token) {
+        Ok((hook, token)) => Json(json!({"hook": hook.to_public(), "token": token})).into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+/// Gives a hook a new token; the old one stops working.
+async fn hooks_token(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> Response {
+    let name = body["name"].as_str().unwrap_or_default();
+    let token = random_token().unwrap_or_default();
+    match web.hooks.lock().unwrap().renew_token(name, token) {
+        Ok(token) => Json(json!({"token": token})).into_response(),
+        Err(e) => error(StatusCode::NOT_FOUND, e),
+    }
+}
+
+async fn hooks_delete(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> Response {
+    let name = body["name"].as_str().unwrap_or_default();
+    match web.hooks.lock().unwrap().remove(name) {
+        Ok(()) => Json(json!({})).into_response(),
+        Err(e) => error(StatusCode::NOT_FOUND, e),
+    }
+}
+
+fn config_json(web: &Web, config: &Config) -> Value {
+    json!({
+        "path": web.config_path.display().to_string(),
+        "entries": config.entries(),
+        "problems": config.problems(),
+        "tools": harness::tool_names(),
+    })
+}
+
+fn error(status: StatusCode, message: impl Into<String>) -> Response {
+    (status, Json(json!({"error": message.into()}))).into_response()
+}
+
+/// Every setting with its value (secrets only as "is set"), and what is wrong with them.
+async fn get_config(State(web): State<Arc<Web>>) -> Response {
+    match Config::load_from(&web.config_path) {
+        Ok(config) => Json(config_json(&web, &config)).into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+/// `{"LLM_MODEL": "x", "OPENAI_API_KEY": null}` saves those settings to the settings file
+/// (`null` removes one) and applies them to the agent, which takes effect for the next
+/// prompt. Refused while the agent works, and for an invalid configuration.
+async fn put_config(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> Response {
+    let Some(changes) = body.as_object() else {
+        return error(StatusCode::BAD_REQUEST, "expected a JSON object");
+    };
+    if web.busy.load(Ordering::SeqCst) {
+        return error(StatusCode::CONFLICT, "wait for the agent to finish");
+    }
+    let config = match Config::save_changes(&web.config_path, changes) {
+        Ok(config) => config,
+        Err(e) => return error(StatusCode::BAD_REQUEST, e),
+    };
+    let json = config_json(&web, &config);
+    match queue(&web, Command::Reload(Box::new(config))) {
+        StatusCode::ACCEPTED => Json(json).into_response(),
+        other => error(other, "saved, but the agent was busy: restart it to apply"),
+    }
 }
 
 async fn list_sessions(State(web): State<Arc<Web>>) -> Json<Value> {
@@ -529,61 +914,151 @@ fn router(web: Arc<Web>) -> Router {
         .route("/answer", post(answer))
         .route("/cancel", post(cancel))
         .route("/thinking", post(set_thinking))
+        .route("/tools", post(set_tools))
+        .route("/config", get(get_config).put(put_config))
+        .route("/hooks", get(hooks_list))
+        .route("/hooks/save", post(hooks_save))
+        .route("/hooks/token", post(hooks_token))
+        .route("/hooks/delete", post(hooks_delete))
+        .route("/files/list", post(files_list))
+        .route("/files/read", post(files_read))
+        .route("/files/write", post(files_write))
+        .route("/files/mkdir", post(files_mkdir))
+        .route("/files/delete", post(files_delete))
+        .route("/files/rename", post(files_rename))
         .route("/sessions", get(list_sessions))
         .route("/session", post(open_session))
         .route("/session/delete", post(delete_session))
         .layer(middleware::from_fn_with_state(web.clone(), authorize))
-        .with_state(web);
-    Router::new().route("/", get(page)).merge(api)
+        .with_state(web.clone());
+    Router::new()
+        .nest("/api", api)
+        // Outside the page's token: a hook has its own.
+        .route("/hooks/{name}", post(trigger_hook).with_state(web))
+        .fallback(static_file)
 }
 
-/// Runs what the browser asks for, one at a time. A cancelled prompt is dropped
-/// and leaves the session's history unchanged.
+/// Runs what the browser asks for, one at a time. A cancelled prompt stays in
+/// the session's history as its input plus a digest of what it did.
 async fn worker(web: Arc<Web>, mut session: Session, mut inbox: Inbox) {
-    while let Some(command) = inbox.recv().await {
-        match command {
-            Command::Prompt(input) => {
-                session.set_thinking(web.think_param());
+    loop {
+        // What the user asks for comes before waiting webhook runs.
+        let command = match inbox.try_recv() {
+            Ok(command) => command,
+            Err(TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Empty) => {
+                let job = web.jobs.lock().unwrap().pop_front();
+                if let Some(job) = job {
+                    hook_run::execute(&session, &web.store, job, Context::from_env().isolated).await;
+                    web.sessions_changed();
+                    continue;
+                }
                 tokio::select! {
-                    result = session.prompt(input) => {
-                        if let Err(error) = result {
-                            web.push(json!({"type": "error", "text": error}));
-                        }
-                    }
-                    _ = web.cancel.notified() => {
-                        web.cancel_approvals();
-                        web.push(json!({"type": "note", "text": "stopped"}));
-                    }
+                    command = inbox.recv() => match command {
+                        Some(command) => command,
+                        None => break,
+                    },
+                    _ = web.jobs_ready.notified() => continue,
                 }
-                if let Err(error) = web.save(session.history()) {
-                    web.push(json!({"type": "error", "text": error}));
-                }
-                web.sessions_changed();
             }
-            Command::Switch(id) => switch(&web, &mut session, id),
-            Command::Delete(id) => {
-                let current = web.inner.lock().unwrap().session_id.clone();
-                match web.store.delete(&id) {
-                    Ok(()) if current.as_deref() == Some(id.as_str()) => {
-                        switch(&web, &mut session, None)
+        };
+        run_command(&web, &mut session, command).await;
+    }
+}
+
+/// Runs one thing the browser asked for.
+async fn run_command(web: &Arc<Web>, session: &mut Session, command: Command) {
+    match command {
+        Command::Prompt(input) => {
+            if web.skills_dirty.swap(false, Ordering::SeqCst) {
+                session.refresh();
+            }
+            session.set_thinking(web.think_param());
+            tokio::select! {
+                result = session.prompt(input) => {
+                    if let Err(error) = result {
+                        web.push(json!({"type": "error", "text": error}));
                     }
-                    Ok(()) => {}
-                    Err(error) => web.push(
-                        json!({"type": "error", "text": format!("could not delete {id}: {error}")}),
-                    ),
                 }
-                web.sessions_changed();
+                _ = web.cancel.notified() => {
+                    session.commit_stopped();
+                    web.cancel_approvals();
+                    web.push(json!({"type": "note", "text": "stopped"}));
+                }
+            }
+            if let Err(error) = web.save(session.history()) {
+                web.push(json!({"type": "error", "text": error}));
+            }
+            web.sessions_changed();
+        }
+        Command::Switch(id) => switch(web, session, id),
+        Command::SetTools(tools) => {
+            session.set_tools(tools.clone());
+            let saved = {
+                let mut inner = web.inner.lock().unwrap();
+                inner.tools = tools;
+                let _ = web.live.send(Web::tools_event(&inner));
+                inner.session_id.is_some()
+            };
+            // A conversation that has not started has nothing to save yet.
+            if saved && let Err(error) = web.save(session.history()) {
+                web.push(json!({"type": "error", "text": error}));
             }
         }
-        web.set_busy(false);
+        Command::Reload(config) => reload(web, session, &config).await,
+        Command::Delete(id) => {
+            let current = web.inner.lock().unwrap().session_id.clone();
+            match web.store.delete(&id) {
+                Ok(()) if current.as_deref() == Some(id.as_str()) => {
+                    switch(web, session, None)
+                }
+                Ok(()) => {}
+                Err(error) => web.push(
+                    json!({"type": "error", "text": format!("could not delete {id}: {error}")}),
+                ),
+            }
+            web.sessions_changed();
+        }
     }
+    web.set_busy(false);
+}
+
+/// Applies a changed configuration: JavaScript settings, model, tools, thinking levels.
+async fn reload(web: &Web, session: &mut Session, config: &Config) {
+    #[cfg(feature = "javascript")]
+    if let Ok(settings) = config.javascript() {
+        crate::tools::execute_javascript::configure(settings);
+    }
+    match config.model_unchecked() {
+        Ok(model) => session.reconfigure(
+            model,
+            config.context_window().ok().flatten(),
+            config.tools(),
+        ),
+        Err(error) => return web.push(json!({"type": "error", "text": error})),
+    }
+    // The levels belong to the model, so the choice of the old one is dropped.
+    let thinking = match config.ollama() {
+        Some((url, key, model)) => Thinking::discover(&url, key.as_deref(), &model).await,
+        None => None,
+    };
+    let mut inner = web.inner.lock().unwrap();
+    inner.thinking = thinking;
+    inner.think = None;
+    inner.default_tools = config.tools();
+    let event = web
+        .thinking_event(&inner)
+        .unwrap_or_else(|| json!({"type": "thinking", "levels": []}));
+    let _ = web.live.send(event);
+    let _ = web.live.send(Web::tools_event(&inner));
 }
 
 /// Makes `id` (or a fresh session) the one the agent continues and the pages show.
 fn switch(web: &Web, session: &mut Session, id: Option<String>) {
     let Some(id) = id else {
         session.set_history(Vec::new());
-        web.replace(None, Vec::new(), None);
+        session.set_tools(None);
+        web.replace(None, Vec::new(), None, None);
         return;
     };
     match web.store.load(&id) {
@@ -591,7 +1066,8 @@ fn switch(web: &Web, session: &mut Session, id: Option<String>) {
             let mut log = saved.log;
             settle(&mut log);
             session.set_history(saved.history);
-            web.replace(Some(id), log, saved.context);
+            session.set_tools(saved.tools.clone());
+            web.replace(Some(id), log, saved.context, saved.tools);
         }
         Err(error) => web.push(json!({"type": "error", "text": error})),
     }
@@ -639,7 +1115,7 @@ mod tests {
     }
 
     async fn start_with(model: MockCompletionModel) -> (Arc<Web>, SocketAddr) {
-        let (web, inbox) = Web::new(temp_store(), None).unwrap();
+        let (web, inbox) = Web::new(temp_store(), None, PathBuf::from("unused.json")).unwrap();
         let session = Session::new(model.into(), "", web.clone());
         tokio::spawn(worker(web.clone(), session, inbox));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -682,7 +1158,7 @@ mod tests {
 
     #[test]
     fn adjacent_text_is_merged_in_the_log_only() {
-        let (web, _inbox) = Web::new(temp_store(), None).unwrap();
+        let (web, _inbox) = Web::new(temp_store(), None, PathBuf::from("unused.json")).unwrap();
         let (_, mut live) = web.subscribe();
         web.emit(Event::Text("hel".into()));
         web.emit(Event::Text("lo".into()));
@@ -698,7 +1174,7 @@ mod tests {
     /// Every update goes to the open pages; a page that connects later gets only the latest.
     #[test]
     fn only_the_latest_context_usage_is_replayed() {
-        let (web, _inbox) = Web::new(temp_store(), None).unwrap();
+        let (web, _inbox) = Web::new(temp_store(), None, PathBuf::from("unused.json")).unwrap();
         let (_, mut live) = web.subscribe();
         let usage = |tokens| ContextUsage {
             tokens,
@@ -721,14 +1197,9 @@ mod tests {
             })
         );
         let (replayed, _) = web.subscribe();
-        assert_eq!(
-            replayed,
-            [
-                json!({"type": "session", "id": null}),
-                json!({"type": "text", "text": "hi"}),
-                latest
-            ]
-        );
+        let types: Vec<&str> = replayed.iter().filter_map(|e| e["type"].as_str()).collect();
+        assert_eq!(types, ["session", "tools", "text", "context"]);
+        assert_eq!(replayed.last(), Some(&latest));
         // Without a window the page shows only the tokens.
         web.emit(Event::Context(ContextUsage {
             tokens: 5,
@@ -791,13 +1262,322 @@ mod tests {
             page.starts_with("HTTP/1.1 200") && page.contains("<title>"),
             "{page}"
         );
-        let denied = request(addr, "POST /prompt", None, r#"{"text":"hi"}"#).await;
+        let denied = request(addr, "POST /api/prompt", None, r#"{"text":"hi"}"#).await;
         assert!(denied.starts_with("HTTP/1.1 401"), "{denied}");
-        let wrong = request(addr, "POST /prompt", Some("nope"), r#"{"text":"hi"}"#).await;
+        let wrong = request(addr, "POST /api/prompt", Some("nope"), r#"{"text":"hi"}"#).await;
         assert!(wrong.starts_with("HTTP/1.1 401"), "{wrong}");
-        let empty = request(addr, "POST /prompt", Some(&web.token), r#"{"text":"  "}"#).await;
+        let empty = request(addr, "POST /api/prompt", Some(&web.token), r#"{"text":"  "}"#).await;
         assert!(empty.starts_with("HTTP/1.1 400"), "{empty}");
         assert!(log(&web).is_empty());
+    }
+
+    #[tokio::test]
+    async fn pages_fall_back_to_the_index_but_missing_files_do_not() {
+        let (_web, addr) = start(vec![]).await;
+        let route = request(addr, "GET /settings", None, "").await;
+        assert!(route.starts_with("HTTP/1.1 200") && route.contains("<title>"), "{route}");
+        let missing = request(addr, "GET /assets/nope.js", None, "").await;
+        assert!(missing.starts_with("HTTP/1.1 404"), "{missing}");
+        let api = request(addr, "GET /api/sessions", None, "").await;
+        assert!(api.starts_with("HTTP/1.1 401"), "{api}");
+    }
+
+    /// A server whose settings file is `path`; Anthropic with a key builds without network.
+    async fn start_with_config(path: PathBuf) -> (Arc<Web>, SocketAddr) {
+        let (web, inbox) = Web::new(temp_store(), None, path).unwrap();
+        let model = MockCompletionModel::from_stream_turns(Vec::<Vec<MockStreamEvent>>::new());
+        let session = Session::new(model.into(), "", web.clone());
+        tokio::spawn(worker(web.clone(), session, inbox));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(axum::serve(listener, router(web.clone())).into_future());
+        (web, addr)
+    }
+
+    #[tokio::test]
+    async fn settings_are_read_and_saved_through_the_api() {
+        let dir = std::env::temp_dir().join(format!("agent_web_cfg_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let (web, addr) = start_with_config(path.clone()).await;
+        let token = Some(web.token.as_str());
+
+        let denied = request(addr, "GET /api/config", None, "").await;
+        assert!(denied.starts_with("HTTP/1.1 401"), "{denied}");
+        let listed = request(addr, "GET /api/config", token, "").await;
+        assert!(listed.starts_with("HTTP/1.1 200") && listed.contains("LLM_BACKEND"), "{listed}");
+
+        let body = r#"{"LLM_BACKEND":"anthropic","ANTHROPIC_API_KEY":"sk-ant-secret","LLM_MODEL":"m"}"#;
+        let saved = request(addr, "PUT /api/config", token, body).await;
+        assert!(saved.starts_with("HTTP/1.1 200"), "{saved}");
+        assert!(!saved.contains("sk-ant-secret"), "{saved}");
+        let file = std::fs::read_to_string(&path).unwrap();
+        assert!(file.contains("sk-ant-secret") && file.contains("anthropic"), "{file}");
+
+        let bad = request(addr, "PUT /api/config", token, r#"{"LLM_BACKEND":"gemini"}"#).await;
+        assert!(bad.starts_with("HTTP/1.1 400") && bad.contains("gemini"), "{bad}");
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("gemini"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn tools_are_chosen_per_conversation_and_remembered_with_it() {
+        let (web, addr) = start(vec![turn(MockStreamEvent::text("hi"))]).await;
+        let token = Some(web.token.as_str());
+        let enabled = |web: &Web| Web::tools_event(&web.inner.lock().unwrap())["enabled"].clone();
+        assert!(enabled(&web).as_array().unwrap().len() > 2);
+
+        let bad = request(addr, "POST /api/tools", token, r#"{"tools":["nope"]}"#).await;
+        assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+        let ok = request(addr, "POST /api/tools", token, r#"{"tools":["execute"]}"#).await;
+        assert!(ok.starts_with("HTTP/1.1 202"), "{ok}");
+        wait_for(&web, |e| e["type"] == "status" && e["busy"] == false).await;
+        assert_eq!(enabled(&web), json!(["execute"]));
+
+        // The choice is saved with the conversation, and a new one starts without it.
+        request(addr, "POST /api/prompt", token, r#"{"text":"hello"}"#).await;
+        wait_for(&web, |e| e["type"] == "text").await;
+        let id = web.inner.lock().unwrap().session_id.clone().unwrap();
+        assert_eq!(web.store.load(&id).unwrap().tools, Some(vec!["execute".to_owned()]));
+        request(addr, "POST /api/session", token, "{}").await;
+        for _ in 0..100 {
+            if web.inner.lock().unwrap().tools.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(enabled(&web).as_array().unwrap().len() > 2);
+    }
+
+    #[tokio::test]
+    async fn the_file_api_is_confined_and_skills_changes_refresh_the_agent() {
+        let (web, addr) = start(vec![]).await;
+        let token = Some(web.token.as_str());
+        let dir = format!("test-files-{}", std::process::id());
+        let post = |path: &'static str, body: String| async move {
+            request(addr, &format!("POST /api/files/{path}"), token, &body).await
+        };
+
+        let denied = request(addr, "POST /api/files/list", None, r#"{"root":"work"}"#).await;
+        assert!(denied.starts_with("HTTP/1.1 401"), "{denied}");
+        let unknown = post("list", r#"{"root":"src","path":""}"#.into()).await;
+        assert!(unknown.starts_with("HTTP/1.1 400"), "{unknown}");
+        let escape = post("write", r#"{"root":"work","path":"../x.txt","content":"x"}"#.into()).await;
+        assert!(escape.starts_with("HTTP/1.1 400"), "{escape}");
+
+        let wrote = post("write", format!(r#"{{"root":"work","path":"{dir}/a.md","content":"hi"}}"#)).await;
+        assert!(wrote.starts_with("HTTP/1.1 200"), "{wrote}");
+        let read = post("read", format!(r#"{{"root":"work","path":"{dir}/a.md"}}"#)).await;
+        assert!(read.contains(r#""content":"hi""#), "{read}");
+        let listed = post("list", format!(r#"{{"root":"work","path":"{dir}"}}"#)).await;
+        assert!(listed.contains("a.md"), "{listed}");
+        post("delete", format!(r#"{{"root":"work","path":"{dir}"}}"#)).await;
+        assert!(!crate::tools::workdir().join(&dir).exists());
+
+        // Work files don't touch the skill list; changes to skills do, and built-in ones are refused.
+        assert!(!web.skills_dirty.load(Ordering::SeqCst));
+        let builtin = post("write", r#"{"root":"skills","path":"creating-skills/SKILL.md","content":"x"}"#.into()).await;
+        assert!(builtin.starts_with("HTTP/1.1 403"), "{builtin}");
+        assert!(!web.skills_dirty.load(Ordering::SeqCst));
+        let name = format!("zz-test-{}", std::process::id());
+        let skill = post("write", format!(r#"{{"root":"skills","path":"{name}/SKILL.md","content":"x"}}"#)).await;
+        assert!(skill.starts_with("HTTP/1.1 200"), "{skill}");
+        assert!(web.skills_dirty.load(Ordering::SeqCst));
+        post("delete", format!(r#"{{"root":"skills","path":"{name}"}}"#)).await;
+    }
+
+    /// A server with a worker whose model answers with `turns`; its settings (and hooks) live
+    /// in a fresh directory.
+    async fn start_hooks(turns: Vec<Vec<MockStreamEvent>>) -> (Arc<Web>, SocketAddr) {
+        let dir = std::env::temp_dir().join(format!("agent_web_hooks_{}_{}", std::process::id(), temp_store_n()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (web, inbox) = Web::new(temp_store(), None, dir.join("config.json")).unwrap();
+        let model = MockCompletionModel::from_stream_turns(turns);
+        let session = Session::new(model.into(), "", web.clone());
+        tokio::spawn(worker(web.clone(), session, inbox));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(axum::serve(listener, router(web.clone())).into_future());
+        (web, addr)
+    }
+
+    fn temp_store_n() -> usize {
+        use std::sync::atomic::AtomicUsize;
+        static N: AtomicUsize = AtomicUsize::new(0);
+        N.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Creates a hook through the API and returns its token.
+    async fn create_hook(web: &Web, addr: SocketAddr, fields: &str) -> String {
+        let response = request(addr, "POST /api/hooks/save", Some(&web.token), fields).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let body = response.split("\r\n\r\n").nth(1).unwrap();
+        let value: Value = serde_json::from_str(body.trim()).unwrap();
+        value["token"].as_str().unwrap().to_owned()
+    }
+
+    /// POSTs to a hook with the token in a header; returns the response.
+    async fn trigger(addr: SocketAddr, name: &str, token: &str, body: &str) -> String {
+        let head = format!(
+            "POST /hooks/{name} HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {token}\r\nX-Event: issues\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream.write_all(head.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    }
+
+    fn session_of(response: &str) -> String {
+        let body = response.split("\r\n\r\n").nth(1).unwrap();
+        let value: Value = serde_json::from_str(body.trim()).unwrap();
+        value["session"].as_str().unwrap().to_owned()
+    }
+
+    /// The saved session once its run has produced an answer.
+    async fn finished(web: &Web, id: &str) -> sessions::Saved {
+        for _ in 0..250 {
+            if let Ok(saved) = web.store.load(id)
+                && saved.log.iter().any(|e| e["type"] == "text")
+                && !saved.log.iter().any(|e| e["type"] == "note" && e["text"] == "running")
+            {
+                return saved;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the run did not finish");
+    }
+
+    #[tokio::test]
+    async fn a_hook_runs_the_agent_in_a_session_of_its_own() {
+        let (web, addr) = start_hooks(vec![turn(MockStreamEvent::text("handled"))]).await;
+        let token = create_hook(
+            &web,
+            addr,
+            r#"{"create":true,"name":"gh","template":"Issue: {{body.issue.title}} ({{headers.x-event}}) {{headers.authorization}}","tools":["use_skill"]}"#,
+        )
+        .await;
+
+        // The hook's own token is needed, and the page's is not enough.
+        let none = trigger(addr, "gh", "wrong", "{}").await;
+        assert!(none.starts_with("HTTP/1.1 401"), "{none}");
+        let ui = trigger(addr, "gh", &web.token, "{}").await;
+        assert!(ui.starts_with("HTTP/1.1 401"), "{ui}");
+        let unknown = trigger(addr, "nope", &token, "{}").await;
+        assert!(unknown.starts_with("HTTP/1.1 401"), "{unknown}");
+
+        let response = trigger(addr, "gh", &token, r#"{"issue":{"title":"Crash"}}"#).await;
+        assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+        let saved = finished(&web, &session_of(&response)).await;
+        let prompt = saved.log.iter().find(|e| e["type"] == "user").unwrap()["text"].as_str().unwrap();
+        // The token is not offered to the template.
+        assert_eq!(prompt, "Issue: Crash (issues) ");
+        assert!(saved.log.iter().any(|e| e["type"] == "text" && e["text"] == "handled"));
+        assert_eq!(saved.tools, Some(vec!["use_skill".to_owned()]));
+        assert_eq!(saved.history.len(), 2);
+        // It is listed under the hook's name, and the open chat was not touched.
+        let listed = web.store.list();
+        assert_eq!(listed[0]["title"], "hook: gh");
+        assert!(log(&web).is_empty());
+
+        // A switched-off hook refuses.
+        request(addr, "POST /api/hooks/save", Some(&web.token), r#"{"name":"gh","template":"x","enabled":false}"#).await;
+        let off = trigger(addr, "gh", &token, "{}").await;
+        assert!(off.starts_with("HTTP/1.1 403"), "{off}");
+    }
+
+    #[tokio::test]
+    async fn runs_go_one_after_the_other_and_a_failed_tool_is_reported_to_the_model() {
+        // `execute` is not among the hook's tools, so the model is told it doesn't exist.
+        let (web, addr) = start_hooks(vec![
+            turn(MockStreamEvent::tool_call("t1", "execute", json!({"command": "ls"}))),
+            turn(MockStreamEvent::text("first done")),
+            turn(MockStreamEvent::text("second done")),
+        ])
+        .await;
+        let token = create_hook(&web, addr, r#"{"create":true,"name":"q","template":"go {{body.n}}"}"#).await;
+        let a = trigger(addr, "q", &token, r#"{"n":1}"#).await;
+        let b = trigger(addr, "q", &token, r#"{"n":2}"#).await;
+        let (first, second) = (session_of(&a), session_of(&b));
+        assert_ne!(first, second);
+        let one = finished(&web, &first).await;
+        let two = finished(&web, &second).await;
+        assert!(one.log.iter().any(|e| e["type"] == "text" && e["text"] == "first done"), "{:?}", one.log);
+        assert!(two.log.iter().any(|e| e["type"] == "text" && e["text"] == "second done"));
+        assert!(one.log.iter().any(|e| e["type"] == "note"), "the unknown tool is noted: {:?}", one.log);
+    }
+
+    #[tokio::test]
+    async fn the_result_goes_to_the_callback_url() {
+        let callback = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/cb", callback.local_addr().unwrap());
+        let received = tokio::spawn(async move {
+            let (mut stream, _) = callback.accept().await.unwrap();
+            let mut buffer = vec![0u8; 8192];
+            let n = stream.read(&mut buffer).await.unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
+            String::from_utf8_lossy(&buffer[..n]).into_owned()
+        });
+        let (web, addr) = start_hooks(vec![turn(MockStreamEvent::text("the result"))]).await;
+        let token = create_hook(
+            &web,
+            addr,
+            &format!(r#"{{"create":true,"name":"cb","template":"x","callback_url":"{url}"}}"#),
+        )
+        .await;
+        let response = trigger(addr, "cb", &token, "{}").await;
+        let id = session_of(&response);
+        let request = tokio::time::timeout(Duration::from_secs(5), received).await.unwrap().unwrap();
+        assert!(request.starts_with("POST /cb"), "{request}");
+        assert!(request.contains(r#""status":"done""#) && request.contains("the result"), "{request}");
+        assert!(request.contains(&id), "{request}");
+    }
+
+    #[tokio::test]
+    async fn too_many_waiting_runs_are_refused() {
+        // No worker: nothing is taken from the queue.
+        let dir = std::env::temp_dir().join(format!("agent_web_limit_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (web, _inbox) = Web::new(temp_store(), None, dir.join("config.json")).unwrap();
+        let fields = Fields::parse(&json!({"name": "f", "template": "t"}), false).unwrap();
+        let (hook, _) = web.hooks.lock().unwrap().upsert(fields, || "tok".into()).unwrap();
+        for n in 1..=hooks::MAX_QUEUE {
+            assert_eq!(enqueue(&web, hook.clone(), "p".into()).unwrap().1, n);
+        }
+        assert_eq!(enqueue(&web, hook, "p".into()).unwrap_err(), StatusCode::TOO_MANY_REQUESTS);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn hook_settings_are_validated_and_tokens_never_listed() {
+        let (web, addr) = start_hooks(vec![]).await;
+        let token = Some(web.token.as_str());
+        let denied = request(addr, "GET /api/hooks", None, "").await;
+        assert!(denied.starts_with("HTTP/1.1 401"), "{denied}");
+        for bad in [
+            r#"{"create":true,"name":"a","template":"x","tools":["ask_user"]}"#,
+            r#"{"create":true,"name":"a","template":"x","tools":["execute"]}"#,
+            r#"{"create":true,"name":"A b","template":"x"}"#,
+            r#"{"create":true,"name":"a","template":""}"#,
+        ] {
+            let response = request(addr, "POST /api/hooks/save", token, bad).await;
+            assert!(response.starts_with("HTTP/1.1 400"), "{bad}: {response}");
+        }
+        let secret = create_hook(&web, addr, r#"{"create":true,"name":"a","template":"x"}"#).await;
+        let again = request(addr, "POST /api/hooks/save", token, r#"{"create":true,"name":"a","template":"x"}"#).await;
+        assert!(again.starts_with("HTTP/1.1 409"), "{again}");
+        let listed = request(addr, "GET /api/hooks", token, "").await;
+        assert!(listed.contains(r#""name":"a""#) && !listed.contains(&secret), "{listed}");
+        // A new token replaces the old one.
+        let renewed = request(addr, "POST /api/hooks/token", token, r#"{"name":"a"}"#).await;
+        assert!(renewed.starts_with("HTTP/1.1 200") && !renewed.contains(&secret), "{renewed}");
+        let old = trigger(addr, "a", &secret, "{}").await;
+        assert!(old.starts_with("HTTP/1.1 401"), "{old}");
+        let gone = request(addr, "POST /api/hooks/delete", token, r#"{"name":"a"}"#).await;
+        assert!(gone.starts_with("HTTP/1.1 200"), "{gone}");
     }
 
     /// The slider only exists for models that list levels, and only those can be picked.
@@ -807,7 +1587,7 @@ mod tests {
             levels: vec!["off".into(), "low".into(), "xhigh".into()],
             default: "low".into(),
         };
-        let (web, _inbox) = Web::new(temp_store(), Some(thinking)).unwrap();
+        let (web, _inbox) = Web::new(temp_store(), Some(thinking), PathBuf::from("unused.json")).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(axum::serve(listener, router(web.clone())).into_future());
@@ -823,7 +1603,7 @@ mod tests {
 
         let unknown = request(
             addr,
-            "POST /thinking",
+            "POST /api/thinking",
             Some(&web.token),
             r#"{"level":"max"}"#,
         )
@@ -831,7 +1611,7 @@ mod tests {
         assert!(unknown.starts_with("HTTP/1.1 400"), "{unknown}");
         let ok = request(
             addr,
-            "POST /thinking",
+            "POST /api/thinking",
             Some(&web.token),
             r#"{"level":"xhigh"}"#,
         )
@@ -840,7 +1620,7 @@ mod tests {
         assert_eq!(web.think_param(), Some(json!("xhigh")));
         let off = request(
             addr,
-            "POST /thinking",
+            "POST /api/thinking",
             Some(&web.token),
             r#"{"level":"off"}"#,
         )
@@ -856,7 +1636,7 @@ mod tests {
         assert!(web.subscribe().0.iter().all(|e| e["type"] != "thinking"));
         let denied = request(
             addr,
-            "POST /thinking",
+            "POST /api/thinking",
             Some(&web.token),
             r#"{"level":"low"}"#,
         )
@@ -870,7 +1650,7 @@ mod tests {
         let (web, addr) = start(vec![]).await;
         web.emit(Event::Text("before".into()));
         let head = format!(
-            "GET /events?token={} HTTP/1.1\r\nHost: x\r\n\r\n",
+            "GET /api/events?token={} HTTP/1.1\r\nHost: x\r\n\r\n",
             web.token
         );
         let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -897,7 +1677,7 @@ mod tests {
     #[tokio::test]
     async fn prompt_streams_the_answer() {
         let (web, addr) = start(vec![turn(MockStreamEvent::text("hello"))]).await;
-        let response = request(addr, "POST /prompt", Some(&web.token), r#"{"text":"hi"}"#).await;
+        let response = request(addr, "POST /api/prompt", Some(&web.token), r#"{"text":"hi"}"#).await;
         assert!(response.starts_with("HTTP/1.1 202"), "{response}");
         wait_for(&web, |e| e["type"] == "text" && e["text"] == "hello").await;
         wait_for(&web, |e| e["type"] == "status" && e["busy"] == false).await;
@@ -915,12 +1695,15 @@ mod tests {
         ]);
         let recorded = model.clone();
         let (web, addr) = start_with(model).await;
-        request(addr, "POST /prompt", Some(&web.token), r#"{"text":"go"}"#).await;
-        wait_for(&web, |e| e["type"] == "question" && e["status"] == "pending").await;
+        request(addr, "POST /api/prompt", Some(&web.token), r#"{"text":"go"}"#).await;
+        wait_for(&web, |e| {
+            e["type"] == "question" && e["status"] == "pending"
+        })
+        .await;
         let body = r#"{"id":"q0","answer":"blue"}"#;
-        let ok = request(addr, "POST /answer", Some(&web.token), body).await;
+        let ok = request(addr, "POST /api/answer", Some(&web.token), body).await;
         assert!(ok.starts_with("HTTP/1.1 204"), "{ok}");
-        let again = request(addr, "POST /answer", Some(&web.token), body).await;
+        let again = request(addr, "POST /api/answer", Some(&web.token), body).await;
         assert!(again.starts_with("HTTP/1.1 404"), "{again}");
         wait_for(&web, |e| e["type"] == "text" && e["text"] == "done").await;
         let followup = format!("{:?}", recorded.requests()[1].chat_history);
@@ -935,20 +1718,20 @@ mod tests {
             turn(MockStreamEvent::text("done")),
         ])
         .await;
-        request(addr, "POST /prompt", Some(&web.token), r#"{"text":"run"}"#).await;
+        request(addr, "POST /api/prompt", Some(&web.token), r#"{"text":"run"}"#).await;
         wait_for(&web, |e| e["id"] == "t1" && e["status"] == "pending").await;
         let busy = request(
             addr,
-            "POST /prompt",
+            "POST /api/prompt",
             Some(&web.token),
             r#"{"text":"again"}"#,
         )
         .await;
         assert!(busy.starts_with("HTTP/1.1 409"), "{busy}");
         let body = r#"{"id":"t1","allow":true}"#;
-        let answered = request(addr, "POST /approve", Some(&web.token), body).await;
+        let answered = request(addr, "POST /api/approve", Some(&web.token), body).await;
         assert!(answered.starts_with("HTTP/1.1 204"), "{answered}");
-        let unknown = request(addr, "POST /approve", Some(&web.token), body).await;
+        let unknown = request(addr, "POST /api/approve", Some(&web.token), body).await;
         assert!(unknown.starts_with("HTTP/1.1 404"), "{unknown}");
         wait_for(&web, |e| {
             e["id"] == "t1"
@@ -974,7 +1757,7 @@ mod tests {
             turn(MockStreamEvent::text("done")),
         ])
         .await;
-        request(addr, "POST /prompt", Some(&web.token), r#"{"text":"go"}"#).await;
+        request(addr, "POST /api/prompt", Some(&web.token), r#"{"text":"go"}"#).await;
         wait_for(&web, |e| {
             e["type"] == "subagent" && e["status"] == "running"
         })
@@ -990,7 +1773,7 @@ mod tests {
         );
         assert_eq!(id, format!("{agent}/t1"));
         let body = json!({"id": id, "allow": true}).to_string();
-        request(addr, "POST /approve", Some(&web.token), &body).await;
+        request(addr, "POST /api/approve", Some(&web.token), &body).await;
         wait_for(&web, |e| e["id"] == id && e["status"] == "done").await;
         wait_for(&web, |e| {
             e["type"] == "text" && e["agent"] == agent && e["text"] == "report"
@@ -1017,11 +1800,11 @@ mod tests {
             turn(MockStreamEvent::text("ok")),
         ])
         .await;
-        request(addr, "POST /prompt", Some(&web.token), r#"{"text":"run"}"#).await;
+        request(addr, "POST /api/prompt", Some(&web.token), r#"{"text":"run"}"#).await;
         wait_for(&web, |e| e["id"] == "t1" && e["status"] == "pending").await;
         request(
             addr,
-            "POST /approve",
+            "POST /api/approve",
             Some(&web.token),
             r#"{"id":"t1","allow":false}"#,
         )
@@ -1040,9 +1823,9 @@ mod tests {
             turn(MockStreamEvent::text("second")),
         ])
         .await;
-        request(addr, "POST /prompt", Some(&web.token), r#"{"text":"run"}"#).await;
+        request(addr, "POST /api/prompt", Some(&web.token), r#"{"text":"run"}"#).await;
         wait_for(&web, |e| e["id"] == "t1" && e["status"] == "pending").await;
-        request(addr, "POST /cancel", Some(&web.token), "").await;
+        request(addr, "POST /api/cancel", Some(&web.token), "").await;
         wait_for(&web, |e| e["id"] == "t1" && e["status"] == "cancelled").await;
         wait_for(&web, |e| e["type"] == "note" && e["text"] == "stopped").await;
         wait_for(&web, |e| e["type"] == "status" && e["busy"] == false).await;
@@ -1058,15 +1841,15 @@ mod tests {
         ])
         .await;
         let token = Some(web.token.as_str());
-        request(addr, "POST /prompt", token, r#"{"text":"first chat"}"#).await;
+        request(addr, "POST /api/prompt", token, r#"{"text":"first chat"}"#).await;
         wait_for(&web, |e| e["type"] == "status" && e["busy"] == false).await;
-        let listed = request(addr, "GET /sessions", token, "").await;
+        let listed = request(addr, "GET /api/sessions", token, "").await;
         assert!(listed.contains("first chat"), "{listed}");
         let id = web.inner.lock().unwrap().session_id.clone().unwrap();
         assert!(web.store.dir().join(format!("{id}.json")).exists());
 
         // A new session starts empty ...
-        let started = request(addr, "POST /session", token, "{}").await;
+        let started = request(addr, "POST /api/session", token, "{}").await;
         assert!(started.starts_with("HTTP/1.1 202"), "{started}");
         for _ in 0..500 {
             if log(&web).iter().all(|e| e["type"] == "status") {
@@ -1075,20 +1858,20 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(web.inner.lock().unwrap().session_id.is_none());
-        request(addr, "POST /prompt", token, r#"{"text":"second chat"}"#).await;
+        request(addr, "POST /api/prompt", token, r#"{"text":"second chat"}"#).await;
         wait_for(&web, |e| e["type"] == "text" && e["text"] == "two").await;
         wait_for(&web, |e| e["type"] == "status" && e["busy"] == false).await;
         assert_eq!(web.store.list().len(), 2);
 
         // ... and the first one can be opened again with its transcript.
         let body = format!(r#"{{"id":"{id}"}}"#);
-        request(addr, "POST /session", token, &body).await;
+        request(addr, "POST /api/session", token, &body).await;
         wait_for(&web, |e| e["type"] == "text" && e["text"] == "one").await;
         assert!(!log(&web).iter().any(|e| e["text"] == "two"));
-        let bad = request(addr, "POST /session", token, r#"{"id":"../x"}"#).await;
+        let bad = request(addr, "POST /api/session", token, r#"{"id":"../x"}"#).await;
         assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
 
-        request(addr, "POST /session/delete", token, &body).await;
+        request(addr, "POST /api/session/delete", token, &body).await;
         for _ in 0..500 {
             if web.store.list().len() == 1 {
                 break;

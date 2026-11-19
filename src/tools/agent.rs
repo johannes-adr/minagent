@@ -2,7 +2,7 @@
 //! only the subagent's final report. Blocking: the call waits until the subagent is done.
 
 use crate::frontend::{Event, Frontend, Scoped};
-use crate::harness::{self, Approval, Context, INVALID_TOOL_CALL_RETRIES, ToolPolicy};
+use crate::harness::{self, Approval, Context, Toolset, INVALID_TOOL_CALL_RETRIES, ToolPolicy};
 use rig_core::DynModel;
 use rig_core::operation::Completion;
 use rig_core::tool::{Tool, ToolContext};
@@ -46,6 +46,8 @@ pub(crate) struct Subagent {
     model: DynModel<Completion>,
     preamble: String,
     frontend: Arc<dyn Frontend>,
+    /// The tools of the caller; the subagent gets the same ones (except `agent`).
+    enabled: Toolset,
 }
 
 impl Subagent {
@@ -53,11 +55,13 @@ impl Subagent {
         model: DynModel<Completion>,
         preamble: &str,
         frontend: Arc<dyn Frontend>,
+        enabled: Toolset,
     ) -> Self {
         Self {
             model,
             preamble: format!("{preamble}{SUBAGENT_NOTE}"),
             frontend,
+            enabled,
         }
     }
 
@@ -66,7 +70,12 @@ impl Subagent {
     async fn run(&self, id: &str, prompt: &str) -> Result<String, String> {
         let frontend: Arc<dyn Frontend> =
             Arc::new(Scoped::new(self.frontend.clone(), id.to_owned()));
-        let agent = harness::subagent(self.model.clone(), &self.preamble, frontend.clone());
+        let agent = harness::subagent(
+            self.model.clone(),
+            &self.preamble,
+            frontend.clone(),
+            &self.enabled,
+        );
         let mut stream = agent
             .prompt(prompt)
             .max_invalid_tool_call_retries(INVALID_TOOL_CALL_RETRIES)
@@ -74,6 +83,7 @@ impl Subagent {
         let report = harness::Report {
             frontend: &*frontend,
             context_window: None,
+            partial: None,
         };
         let response = harness::run_stream(&mut stream, Some(report)).await?;
         Ok(response.output())
@@ -196,7 +206,7 @@ mod tests {
             prompt: "y".into(),
         };
         let mut context = ToolContext::new();
-        Subagent::new(model.into(), "BASE", Arc::new(Silent))
+        Subagent::new(model.into(), "BASE", Arc::new(Silent), Toolset::default())
             .call(&mut context, args)
             .await
             .unwrap()

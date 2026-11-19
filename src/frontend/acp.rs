@@ -7,7 +7,7 @@
 //! tokens in context after each model call (only when the context window is known, as the
 //! update requires its size). `ask_user` questions are put to the client as a permission
 //! request with the suggested answers as options (ACP has no free-text question, so a
-//! question without options goes unanswered). A cancelled prompt is dropped from the session's history.
+//! question without options goes unanswered). A cancelled prompt stays in the session's history as its input plus a digest of what it did.
 
 use crate::frontend::{Event, Frontend, Question, ToolCall};
 use crate::harness::Session;
@@ -366,7 +366,10 @@ async fn serve_io(
                     let mut session = state.session.lock().await;
                     let result = tokio::select! {
                         result = session.prompt(text) => result.map(|()| "end_turn"),
-                        () = state.cancel.notified() => Ok("cancelled"),
+                        () = state.cancel.notified() => {
+                            session.commit_stopped();
+                            Ok("cancelled")
+                        }
                     };
                     let result = result
                         .map(|reason| json!({"stopReason": reason}))

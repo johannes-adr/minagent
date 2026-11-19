@@ -9,7 +9,11 @@ rig-core = { version = "0.46.0", features = ["reqwest"] }
 tokio = { version = "1.54.1", features = ["full"] }
 # The web frontend (`--web`).
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+# The built web UI (web/dist), embedded into the binary.
+rust-embed = { version = "8", features = ["mime-guess"] }
 dotenvy = "0.15"
+# Webhook tokens are stored as hashes.
+sha2 = "0.10"
 futures = "0.3"
 ratatui = "0.30.2"
 crossterm = { version = "0.29.0", features = ["event-stream"] }

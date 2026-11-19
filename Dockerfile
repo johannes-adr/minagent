@@ -1,7 +1,16 @@
+# The web UI: static files that the binary embeds.
+FROM node:22-slim AS web
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci
+COPY web ./
+RUN npm run build
+
 FROM rust:1-slim-bookworm AS builder
 WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src ./src
+COPY --from=web /web/dist ./web/dist
 # Built-in skills are embedded into the binary with include_str!.
 COPY builtin_skills ./builtin_skills
 # Cache mounts keep the registry and compiled dependencies between builds, so a code

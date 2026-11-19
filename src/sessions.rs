@@ -18,6 +18,8 @@ pub struct Saved {
     pub history: Vec<Message>,
     pub log: Vec<Value>,
     pub context: Option<Value>,
+    /// The tools this conversation uses instead of the configured ones, if it has its own.
+    pub tools: Option<Vec<String>>,
 }
 
 /// The sessions directory.
@@ -41,8 +43,12 @@ pub fn valid_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// The first user message, shortened, as the session's name.
+/// The session's name: a `title` event if the log has one (webhook runs name themselves
+/// after their hook), else the first user message, shortened.
 fn title(log: &[Value]) -> String {
+    if let Some(named) = log.iter().find(|e| e["type"] == "title").and_then(|e| e["text"].as_str()) {
+        return named.to_owned();
+    }
     let text = log
         .iter()
         .find(|e| e["type"] == "user")
@@ -85,9 +91,13 @@ impl Store {
         history: &[Message],
         log: &[Value],
         context: Option<&Value>,
+        tools: Option<&[String]>,
     ) -> io::Result<()> {
         if !valid_id(id) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad session id"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bad session id",
+            ));
         }
         fs::create_dir_all(&self.dir)?;
         let created = self
@@ -102,6 +112,7 @@ impl Store {
             "history": history,
             "log": log,
             "context": context,
+            "tools": tools,
         });
         let tmp = self.dir.join(format!(".{id}.json.tmp"));
         fs::write(&tmp, serde_json::to_vec_pretty(&file)?)?;
@@ -127,16 +138,21 @@ impl Store {
             _ => Vec::new(),
         };
         let context = Some(file["context"].take()).filter(|c| !c.is_null());
+        let tools = serde_json::from_value(file["tools"].take()).ok();
         Ok(Saved {
             history,
             log,
             context,
+            tools,
         })
     }
 
     pub fn delete(&self, id: &str) -> io::Result<()> {
         if !valid_id(id) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "bad session id"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "bad session id",
+            ));
         }
         fs::remove_file(self.path(id))
     }
@@ -150,7 +166,11 @@ impl Store {
             .flatten()
             .filter_map(|entry| {
                 let path = entry.path();
-                let id = path.file_name()?.to_str()?.strip_suffix(".json")?.to_owned();
+                let id = path
+                    .file_name()?
+                    .to_str()?
+                    .strip_suffix(".json")?
+                    .to_owned();
                 if !valid_id(&id) {
                     return None;
                 }
@@ -177,7 +197,8 @@ mod tests {
     use super::*;
 
     fn temp(name: &str) -> Store {
-        let dir = std::env::temp_dir().join(format!("agent_sessions_{name}_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("agent_sessions_{name}_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         Store::new(dir)
     }
@@ -189,17 +210,23 @@ mod tests {
         let id = store.new_id();
         let log = vec![json!({"type": "user", "text": "hello\nthere"})];
         let history = vec![Message::user("hello there")];
-        store.save(&id, &history, &log, Some(&json!({"tokens": 3}))).unwrap();
+        store
+            .save(&id, &history, &log, Some(&json!({"tokens": 3})), Some(&["execute".to_owned()]))
+            .unwrap();
         assert_ne!(store.new_id(), id);
 
         let list = store.list();
         assert_eq!(list.len(), 1);
-        assert_eq!((&list[0]["id"], &list[0]["title"]), (&json!(id), &json!("hello there")));
+        assert_eq!(
+            (&list[0]["id"], &list[0]["title"]),
+            (&json!(id), &json!("hello there"))
+        );
 
         let saved = store.load(&id).unwrap();
         assert_eq!(saved.history, history);
         assert_eq!(saved.log, log);
         assert_eq!(saved.context, Some(json!({"tokens": 3})));
+        assert_eq!(saved.tools, Some(vec!["execute".to_owned()]));
 
         store.delete(&id).unwrap();
         assert!(store.list().is_empty());
@@ -212,7 +239,7 @@ mod tests {
         for bad in ["", "../x", "a/b", "a.b", "x\0"] {
             assert!(!valid_id(bad), "{bad:?}");
             assert!(store.load(bad).is_err());
-            assert!(store.save(bad, &[], &[], None).is_err());
+            assert!(store.save(bad, &[], &[], None, None).is_err());
         }
     }
 }

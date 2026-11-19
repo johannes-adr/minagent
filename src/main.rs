@@ -1,6 +1,7 @@
 mod config;
 mod frontend;
 mod harness;
+mod hooks;
 mod sessions;
 mod thinking;
 mod tools;
@@ -72,40 +73,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let config = config::Config::load()?;
-    if let Some(tools) = config.tools()
-        && let Err(err) = harness::enable_only(tools)
-    {
-        // In ACP mode stdout belongs to the protocol.
+    // In ACP mode stdout belongs to the protocol.
+    if let Err(err) = config.validate() {
         eprintln!("{err}");
         return Err(err.into());
     }
     #[cfg(feature = "javascript")]
-    match config.javascript() {
-        Ok(settings) => tools::execute_javascript::configure(settings),
-        Err(err) => {
-            // In ACP mode stdout belongs to the protocol.
-            eprintln!("{err}");
-            return Err(err.into());
-        }
-    }
-    let context_window = match config.context_window() {
-        Ok(tokens) => tokens,
-        Err(err) => {
-            // In ACP mode stdout belongs to the protocol.
-            eprintln!("{err}");
-            return Err(err.into());
-        }
-    };
+    tools::execute_javascript::configure(config.javascript()?);
+    let context_window = config.context_window()?;
     let model = match config.model() {
         Ok(model) => model,
+        // The web UI starts anyway: the key can be entered on its settings page.
+        Err(err) if web_addr.is_some() => {
+            println!("{err}\nset it on the settings page of the web UI");
+            config.model_unchecked()?
+        }
         Err(err) => {
             // First start without config: create `.env.example` so the user knows what to configure.
             let mut note = err.clone();
             if !Path::new(".env.example").exists() {
                 std::fs::write(".env.example", config::env_example())?;
-                note += "\ncreated .env.example; copy it to .env, fill it in and start again";
+                note += "\ncreated .env.example; copy it to .env, fill it in and start again (or start with --web and use its settings page)";
             }
-            // In ACP mode stdout belongs to the protocol.
             if acp {
                 eprintln!("{note}");
             } else {
@@ -126,7 +115,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         today()
     );
     let new_session = |frontend| {
-        Session::new(model.clone(), &preamble, frontend).with_context_window(context_window)
+        Session::new(model.clone(), &preamble, frontend)
+            .with_context_window(context_window)
+            .with_tools(config.tools())
     };
     if acp {
         acp::serve(new_session).await?;
@@ -138,7 +129,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             None => None,
         };
-        let (frontend, inbox) = web::Web::new(sessions::Store::new(sessions::DIR), thinking)?;
+        let (frontend, inbox) = web::Web::new(
+            sessions::Store::new(sessions::DIR),
+            thinking,
+            config::config_path(),
+        )?;
+        frontend.set_default_tools(config.tools());
         let session = new_session(frontend.clone());
         web::run(frontend, inbox, session, addr).await?;
     } else {

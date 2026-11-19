@@ -38,6 +38,12 @@ const BUILTIN: &[(&str, &str)] = &[
     builtin!("paperless/references/rest-api.md"),
 ];
 
+/// Paths (below [`DIR`]) of the files of built-in skills. They are rewritten on startup, so
+/// edits to them would be lost.
+pub fn builtin_paths() -> impl Iterator<Item = &'static str> {
+    BUILTIN.iter().map(|(path, _)| *path)
+}
+
 /// Built-in skills of older versions; their directories are removed on startup.
 const REMOVED_BUILTIN: &[&str] = &["using-skills"];
 

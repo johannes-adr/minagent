@@ -2,10 +2,13 @@
 //! the terminal UI ([`tui`]), the Agent Client Protocol server ([`acp`]) and the
 //! browser UI ([`web`]).
 //!
-//! The harness (agent runs, approval hook) only talks to a [`Frontend`]; tools don't
-//! talk to frontends at all, their results are reported by the hook.
+//! The harness (agent runs, approval hook) only talks to a [`Frontend`]. Most tools don't
+//! talk to frontends at all, their results are reported by the hook; `ask_user`, `agent`
+//! and `execute_javascript` get one to ask the user or report mid-run.
 
 pub mod acp;
+mod files;
+mod hook_run;
 pub mod tui;
 pub mod web;
 

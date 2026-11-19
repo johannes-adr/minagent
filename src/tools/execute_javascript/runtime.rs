@@ -7,6 +7,7 @@
 
 use super::modules::{SkillLoader, SkillResolver, skills_root};
 use super::{Settings, fetch::Fetch, fs};
+use crate::frontend::Frontend;
 use rquickjs::{
     CatchResultExt, CaughtError, Context, Ctx, Error, Exception, Function, Module, Object, Result,
     Runtime,
@@ -57,6 +58,7 @@ impl Output {
 pub(super) fn run(
     code: &str,
     hosts: Vec<String>,
+    confirm_writes: Option<Arc<dyn Frontend>>,
     timeout: Duration,
     settings: Arc<Settings>,
     handle: Handle,
@@ -65,6 +67,7 @@ pub(super) fn run(
     let output = Rc::new(RefCell::new(Output::default()));
     let fetch = Fetch {
         hosts,
+        confirm_writes,
         settings,
         deadline,
         handle,
