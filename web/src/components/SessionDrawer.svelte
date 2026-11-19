@@ -12,6 +12,7 @@
       <div class="session" class:current={s.id === chat.current} onclick={() => openSession(s.id)} role="presentation">
         <div class="name">
           {s.title || "(empty)"}
+          {#if s.waiting}<span class="waiting" title="A webhook run is paused until you approve its write">waiting</span>{/if}
           <span class="when">{new Date(s.updated * 1000).toLocaleString()}</span>
         </div>
         <button class="del" title="Delete" onclick={(e) => { e.stopPropagation(); deleteSession(s.id); }}>✕</button>
@@ -32,6 +33,7 @@
   .session:hover { background: var(--code); }
   .session.current { background: var(--user); }
   .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .waiting { margin-left: 6px; padding: 0 6px; border: 1px solid var(--warn); border-radius: 9px; color: var(--warn); font-size: 11px; }
   .when { display: block; color: var(--muted); font-size: 11px; }
   .del { border: 0; background: none; color: var(--muted); padding: 2px 6px; border-radius: 6px; opacity: 0; }
   .session:hover .del { opacity: 1; }

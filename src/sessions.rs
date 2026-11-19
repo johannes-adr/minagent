@@ -28,6 +28,8 @@ pub struct Saved {
     pub log: Vec<Value>,
     pub context: Option<Value>,
     pub choices: Choices,
+    /// The tool call a webhook run is paused at, waiting for the user's decision.
+    pub pending: Option<Value>,
 }
 
 /// The sessions directory.
@@ -100,6 +102,7 @@ impl Store {
         log: &[Value],
         context: Option<&Value>,
         choices: &Choices,
+        pending: Option<&Value>,
     ) -> io::Result<()> {
         if !valid_id(id) {
             return Err(io::Error::new(
@@ -122,6 +125,7 @@ impl Store {
             "context": context,
             "tools": choices.tools,
             "skills_disabled": choices.skills_disabled,
+            "pending": pending,
         });
         let tmp = self.dir.join(format!(".{id}.json.tmp"));
         fs::write(&tmp, serde_json::to_vec_pretty(&file)?)?;
@@ -151,11 +155,13 @@ impl Store {
             tools: serde_json::from_value(file["tools"].take()).ok(),
             skills_disabled: serde_json::from_value(file["skills_disabled"].take()).ok(),
         };
+        let pending = Some(file["pending"].take()).filter(|p| !p.is_null());
         Ok(Saved {
             history,
             log,
             context,
             choices,
+            pending,
         })
     }
 
@@ -169,12 +175,12 @@ impl Store {
         fs::remove_file(self.path(id))
     }
 
-    /// `{id, title, updated}` of every stored session, newest first.
-    pub fn list(&self) -> Vec<Value> {
+    /// Every stored session file with its id.
+    fn files(&self) -> Vec<(String, Value)> {
         let Ok(entries) = fs::read_dir(&self.dir) else {
             return Vec::new();
         };
-        let mut sessions: Vec<Value> = entries
+        entries
             .flatten()
             .filter_map(|entry| {
                 let path = entry.path();
@@ -187,14 +193,39 @@ impl Store {
                     return None;
                 }
                 let file: Value = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
-                Some(json!({
+                Some((id, file))
+            })
+            .collect()
+    }
+
+    /// `{id, title, updated, waiting}` of every stored session, newest first. `waiting`:
+    /// a webhook run paused for the user's approval.
+    pub fn list(&self) -> Vec<Value> {
+        let mut sessions: Vec<Value> = self
+            .files()
+            .into_iter()
+            .map(|(id, file)| {
+                json!({
                     "id": id,
                     "title": file["title"],
                     "updated": file["updated"],
-                }))
+                    "waiting": !file["pending"].is_null(),
+                })
             })
             .collect();
         sessions.sort_by_key(|s| std::cmp::Reverse(s["updated"].as_u64().unwrap_or(0)));
+        sessions
+    }
+
+    /// `{id, updated, pending}` of the sessions waiting for approval, oldest first.
+    pub fn waiting(&self) -> Vec<Value> {
+        let mut sessions: Vec<Value> = self
+            .files()
+            .into_iter()
+            .filter(|(_, file)| !file["pending"].is_null())
+            .map(|(id, file)| json!({"id": id, "updated": file["updated"], "pending": file["pending"]}))
+            .collect();
+        sessions.sort_by_key(|s| s["updated"].as_u64().unwrap_or(0));
         sessions
     }
 
@@ -232,6 +263,7 @@ mod tests {
                     tools: Some(vec!["execute".to_owned()]),
                     skills_disabled: Some(vec!["paperless".to_owned()]),
                 },
+                None,
             )
             .unwrap();
         assert_ne!(store.new_id(), id);
@@ -249,9 +281,29 @@ mod tests {
         assert_eq!(saved.context, Some(json!({"tokens": 3})));
         assert_eq!(saved.choices.tools, Some(vec!["execute".to_owned()]));
         assert_eq!(saved.choices.skills_disabled, Some(vec!["paperless".to_owned()]));
+        assert_eq!(saved.pending, None);
+        assert_eq!(list[0]["waiting"], false);
+        assert!(store.waiting().is_empty());
 
         store.delete(&id).unwrap();
         assert!(store.list().is_empty());
+        let _ = fs::remove_dir_all(store.dir());
+    }
+
+    #[test]
+    fn a_pending_call_marks_the_session_as_waiting() {
+        let store = temp("pending");
+        let pending = json!({"hook": "h", "call": {"id": "c1"}});
+        store.save("a", &[], &[], None, &Choices::default(), Some(&pending)).unwrap();
+        store.save("b", &[], &[], None, &Choices::default(), None).unwrap();
+        assert_eq!(store.load("a").unwrap().pending, Some(pending.clone()));
+        let waiting = store.waiting();
+        assert_eq!((waiting.len(), &waiting[0]["id"], &waiting[0]["pending"]), (1, &json!("a"), &pending));
+        let waits = |id: &str| store.list().iter().find(|s| s["id"] == id).unwrap()["waiting"].clone();
+        assert_eq!((waits("a"), waits("b")), (json!(true), json!(false)));
+        // Saving without it ends the waiting.
+        store.save("a", &[], &[], None, &Choices::default(), None).unwrap();
+        assert!(store.waiting().is_empty());
         let _ = fs::remove_dir_all(store.dir());
     }
 
@@ -261,7 +313,7 @@ mod tests {
         for bad in ["", "../x", "a/b", "a.b", "x\0"] {
             assert!(!valid_id(bad), "{bad:?}");
             assert!(store.load(bad).is_err());
-            assert!(store.save(bad, &[], &[], None, &Choices::default()).is_err());
+            assert!(store.save(bad, &[], &[], None, &Choices::default(), None).is_err());
         }
     }
 }

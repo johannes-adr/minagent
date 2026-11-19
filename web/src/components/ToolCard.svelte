@@ -10,7 +10,7 @@
   const title = $derived(lines[0]);
   const rest = $derived(lines.slice(1));
   const chip = $derived(
-    { pending: "needs approval", running: "running", done: "done", failed: "failed", denied: "denied", cancelled: "cancelled" }[data.status] || data.status,
+    { pending: "needs approval", waiting: "waiting for approval", running: "running", done: "done", failed: "failed", denied: "denied", cancelled: "cancelled" }[data.status] || data.status,
   );
   // The title can be shortened by the tool (a script shows only its first line), so show
   // every argument as the model sent it.
@@ -62,8 +62,8 @@
   .chip { font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
   .tool[data-status=done] .chip { color: var(--ok); }
   .tool[data-status=failed] .chip, .tool[data-status=denied] .chip { color: var(--bad); }
-  .tool[data-status=pending] { border-color: var(--warn); }
-  .tool[data-status=pending] .chip { color: var(--warn); }
+  .tool[data-status=pending], .tool[data-status=waiting] { border-color: var(--warn); }
+  .tool[data-status=pending] .chip, .tool[data-status=waiting] .chip { color: var(--warn); }
   .spin::before { content: ""; width: 10px; height: 10px; border: 2px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
   .body { padding: 0 12px 12px; display: flex; flex-direction: column; gap: 8px; }
   .body pre { max-height: 520px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }

@@ -3,7 +3,9 @@
 //! The page is a Svelte app (`web/`), built to static files that are embedded in the binary
 //! and served from `/`. The API lives under `/api`: the page gets the session as a stream of
 //! JSON events over server-sent events (`GET /api/events`) and talks back with
-//! `POST /api/prompt`, `POST /api/approve`, `POST /api/answer` and `POST /api/cancel`. Like the terminal UI there is one
+//! `POST /api/prompt`, `POST /api/approve`, `POST /api/answer` and `POST /api/cancel`; webhook
+//! runs that wait for a write to be approved are listed by `GET /api/approvals` and decided by
+//! `POST /api/approvals/decide`. Like the terminal UI there is one
 //! session; every browser tab shows it, and a reloaded tab gets the whole transcript replayed.
 //!
 //! Whoever can call the API can make the agent run commands, so all of it needs the random
@@ -13,7 +15,7 @@
 use crate::frontend::{ContextUsage, Event, Frontend, Question, ToolCall};
 use crate::config::Config;
 use crate::frontend::files::{Area, FileError};
-use crate::frontend::hook_run::{self, Job};
+use crate::frontend::hook_run::{self, Job, Task};
 use crate::hooks::{self, Fields, Hooks};
 use crate::tools::skills;
 use crate::harness::{self, Context, Session, Toolset};
@@ -264,7 +266,8 @@ impl Web {
         let _ = self.live.send(json!({"type": "sessions"}));
     }
 
-    /// Writes the current session to disk (without busy markers, which are only live).
+    /// Writes the current session to disk (without busy markers, which are only live). A
+    /// webhook run that waited for approval stops waiting: whoever continues it here takes it over.
     fn save(&self, history: &[rig_core::message::Message]) -> Result<(), String> {
         let (id, log, context, choices) = {
             let mut inner = self.inner.lock().unwrap();
@@ -277,11 +280,17 @@ impl Web {
                 .iter()
                 .filter(|e| e["type"] != "status")
                 .cloned()
+                .map(|mut e| {
+                    if e["status"] == "waiting" {
+                        e["status"] = json!("cancelled");
+                    }
+                    e
+                })
                 .collect();
             (id, log, inner.context.clone(), inner.choices.clone())
         };
         self.store
-            .save(&id, history, &log, context.as_ref(), &choices)
+            .save(&id, history, &log, context.as_ref(), &choices, None)
             .map_err(|e| format!("could not save session {id}: {e}"))
     }
 
@@ -739,12 +748,12 @@ fn enqueue(web: &Web, hook: hooks::Hook, prompt: String) -> Result<(String, usiz
     let session_id = web.store.new_id();
     let log = hook_run::queued_log(&hook, &prompt, "queued");
     web.store
-        .save(&session_id, &[], &log, None, &Choices::default())
+        .save(&session_id, &[], &log, None, &Choices::default(), None)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     jobs.push_back(Job {
         hook,
         session_id: session_id.clone(),
-        prompt,
+        task: Task::Start(prompt),
     });
     let position = jobs.len();
     drop(jobs);
@@ -863,6 +872,77 @@ async fn hooks_delete(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> R
     }
 }
 
+/// The webhook runs waiting for the user's decision, oldest first, as the approvals page
+/// shows them. A run whose decision is queued no longer counts.
+async fn approvals_list(State(web): State<Arc<Web>>) -> Json<Value> {
+    let decided: Vec<String> = web
+        .jobs
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|job| matches!(job.task, Task::Resume { .. }))
+        .map(|job| job.session_id.clone())
+        .collect();
+    let approvals: Vec<Value> = web
+        .store
+        .waiting()
+        .into_iter()
+        .filter(|s| !decided.iter().any(|id| *id == s["id"]))
+        .map(|s| {
+            let (pending, call) = (&s["pending"], &s["pending"]["call"]);
+            json!({
+                "session": s["id"],
+                "hook": pending["hook"],
+                "time": s["updated"],
+                "message": pending["message"],
+                "title": call["title"],
+                "hosts": call["args"]["hosts"],
+                "code": call["args"]["code"],
+            })
+        })
+        .collect();
+    Json(json!({"approvals": approvals}))
+}
+
+/// `{"session": id, "approve": true, "comment": "..."}` decides on the call a webhook run
+/// waits at. The run goes on in the worker, not here. `404` for an unknown session, `409`
+/// if it isn't waiting (or already decided) or its hook is gone or switched off.
+async fn approvals_decide(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> Response {
+    let Some(approve) = body["approve"].as_bool() else {
+        return error(StatusCode::BAD_REQUEST, "approve must be true or false");
+    };
+    let comment = body["comment"].as_str().map(str::trim).filter(|c| !c.is_empty()).map(str::to_owned);
+    let Some(id) = body["session"].as_str().filter(|id| sessions::valid_id(id)) else {
+        return error(StatusCode::BAD_REQUEST, "a session id is needed");
+    };
+    let Ok(saved) = web.store.load(id) else {
+        return error(StatusCode::NOT_FOUND, "no such session");
+    };
+    let Some(pending) = saved.pending else {
+        return error(StatusCode::CONFLICT, "this session is not waiting for approval");
+    };
+    let name = pending["hook"].as_str().unwrap_or_default();
+    let hook = match web.hooks.lock().unwrap().get(name).cloned() {
+        None => return error(StatusCode::CONFLICT, format!("the hook {name} was deleted, so its run can't continue")),
+        Some(hook) if !hook.enabled => {
+            return error(StatusCode::CONFLICT, format!("the hook {name} is switched off: switch it on to decide"));
+        }
+        Some(hook) => hook,
+    };
+    let mut jobs = web.jobs.lock().unwrap();
+    if jobs.iter().any(|job| job.session_id == id) {
+        return error(StatusCode::CONFLICT, "this session was decided already");
+    }
+    if jobs.len() >= hooks::MAX_QUEUE {
+        return error(StatusCode::TOO_MANY_REQUESTS, "too many runs are waiting");
+    }
+    jobs.push_back(Job { hook, session_id: id.to_owned(), task: Task::Resume { pending, approve, comment } });
+    drop(jobs);
+    web.jobs_ready.notify_one();
+    web.sessions_changed();
+    (StatusCode::ACCEPTED, Json(json!({}))).into_response()
+}
+
 /// `{"disabled": ["paperless"]}` switches those skills off for the shown session,
 /// `{"disabled": null}` goes back to the configured ones.
 async fn set_skills(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> StatusCode {
@@ -977,6 +1057,8 @@ fn router(web: Arc<Web>) -> Router {
         .route("/hooks/save", post(hooks_save))
         .route("/hooks/token", post(hooks_token))
         .route("/hooks/delete", post(hooks_delete))
+        .route("/approvals", get(approvals_list))
+        .route("/approvals/decide", post(approvals_decide))
         .route("/files/list", post(files_list))
         .route("/files/read", post(files_read))
         .route("/files/write", post(files_write))
@@ -1561,6 +1643,136 @@ mod tests {
         request(addr, "POST /api/hooks/save", Some(&web.token), r#"{"name":"gh","template":"x","enabled":false}"#).await;
         let off = trigger(addr, "gh", &token, "{}").await;
         assert!(off.starts_with("HTTP/1.1 403"), "{off}");
+    }
+
+    #[cfg(feature = "javascript")]
+    /// A hook `w` with the given write mode whose model first says something and then calls
+    /// `execute_javascript` with `writes: true`; `later` are the model's following turns.
+    async fn start_writer(mode: &str, later: Vec<Vec<MockStreamEvent>>) -> (Arc<Web>, SocketAddr, String) {
+        let call = json!({"code": "console.log('wrote')", "writes": true});
+        let mut turns = vec![vec![
+            MockStreamEvent::text("I will write"),
+            MockStreamEvent::tool_call("t1", "execute_javascript", call),
+            MockStreamEvent::final_response_with_total_tokens(1),
+        ]];
+        turns.extend(later);
+        let (web, addr) = start_hooks(turns).await;
+        let fields = format!(r#"{{"create":true,"name":"w","template":"go","tools":["execute_javascript"],"writes":"{mode}"}}"#);
+        let token = create_hook(&web, addr, &fields).await;
+        let id = session_of(&trigger(addr, "w", &token, "{}").await);
+        (web, addr, id)
+    }
+
+    #[cfg(feature = "javascript")]
+    /// The saved session once `done` holds for it.
+    async fn wait_saved(web: &Web, id: &str, done: impl Fn(&sessions::Saved) -> bool) -> sessions::Saved {
+        for _ in 0..250 {
+            if let Ok(saved) = web.store.load(id)
+                && done(&saved)
+            {
+                return saved;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the session did not get there");
+    }
+
+    #[cfg(feature = "javascript")]
+    async fn decide(addr: SocketAddr, web: &Web, body: &str) -> String {
+        request(addr, "POST /api/approvals/decide", Some(&web.token), body).await
+    }
+
+    #[cfg(feature = "javascript")]
+    fn history_text(saved: &sessions::Saved) -> String {
+        format!("{:?}", saved.history)
+    }
+
+    #[cfg(feature = "javascript")]
+    #[tokio::test]
+    async fn a_write_pauses_the_run_until_the_user_approves() {
+        let (web, addr, id) = start_writer("approve", vec![turn(MockStreamEvent::text("all fine"))]).await;
+        let waiting = wait_saved(&web, &id, |s| s.pending.is_some()).await;
+        let pending = waiting.pending.clone().unwrap();
+        assert_eq!((pending["hook"].as_str(), pending["message"].as_str()), (Some("w"), Some("I will write")));
+        assert_eq!(pending["call"]["args"]["code"], "console.log('wrote')");
+        // The model saw no refusal: the history holds a digest, and the call shows as waiting.
+        assert!(history_text(&waiting).contains("Paused: waiting for the user's approval"), "{:?}", waiting.history);
+        assert!(waiting.log.iter().any(|e| e["id"] == "t1" && e["status"] == "waiting"), "{:?}", waiting.log);
+        assert!(!waiting.log.iter().any(|e| e["type"] == "text" && e["text"] == "all fine"));
+        assert_eq!(web.store.list()[0]["waiting"], true);
+
+        let listed = request(addr, "GET /api/approvals", Some(&web.token), "").await;
+        assert!(listed.contains(&id) && listed.contains("I will write") && listed.contains("console.log('wrote')"), "{listed}");
+        assert!(request(addr, "GET /api/approvals", None, "").await.starts_with("HTTP/1.1 401"));
+
+        let response = decide(addr, &web, &format!(r#"{{"session":"{id}","approve":true}}"#)).await;
+        assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+        let done = wait_saved(&web, &id, |s| s.log.iter().any(|e| e["type"] == "text" && e["text"] == "all fine")).await;
+        // The call ran with its output, which the model got back; nothing waits any more.
+        assert!(done.pending.is_none());
+        let tool = done.log.iter().rev().find(|e| e["id"] == "t1").unwrap();
+        assert_eq!(tool["status"], "done");
+        assert!(tool["output"].as_str().unwrap().contains("wrote"), "{tool}");
+        let history = history_text(&done);
+        assert!(history.contains("The user approved your execute_javascript call and it ran. Output:"), "{history}");
+        assert!(history.contains(r"Output:\nok\nstdout:\nwrote"), "{history}");
+        // Deciding again is too late.
+        let again = decide(addr, &web, &format!(r#"{{"session":"{id}","approve":true}}"#)).await;
+        assert!(again.starts_with("HTTP/1.1 409"), "{again}");
+        assert!(request(addr, "GET /api/approvals", Some(&web.token), "").await.contains(r#""approvals":[]"#));
+    }
+
+    #[cfg(feature = "javascript")]
+    #[tokio::test]
+    async fn a_declined_write_does_not_run_and_the_comment_reaches_the_model() {
+        let (web, addr, id) = start_writer("approve", vec![turn(MockStreamEvent::text("understood"))]).await;
+        wait_saved(&web, &id, |s| s.pending.is_some()).await;
+        let body = format!(r#"{{"session":"{id}","approve":false,"comment":"not on weekends"}}"#);
+        assert!(decide(addr, &web, &body).await.starts_with("HTTP/1.1 202"));
+        let done = wait_saved(&web, &id, |s| s.log.iter().any(|e| e["type"] == "text" && e["text"] == "understood")).await;
+        let history = history_text(&done);
+        assert!(history.contains("The user declined your execute_javascript call."), "{history}");
+        assert!(history.contains("Their comment: not on weekends"), "{history}");
+        assert!(!history.contains("Output:"), "{history}");
+        assert!(done.log.iter().any(|e| e["id"] == "t1" && e["status"] == "denied"), "{:?}", done.log);
+    }
+
+    #[cfg(feature = "javascript")]
+    #[tokio::test]
+    async fn decisions_need_a_waiting_session_and_a_usable_hook() {
+        let (web, addr, id) = start_writer("approve", vec![turn(MockStreamEvent::text("ok"))]).await;
+        wait_saved(&web, &id, |s| s.pending.is_some()).await;
+        let status = |response: String| response.lines().next().unwrap().to_owned();
+        assert!(status(decide(addr, &web, r#"{"session":"nope","approve":true}"#).await).contains("404"));
+        assert!(status(decide(addr, &web, r#"{"session":"../x","approve":true}"#).await).contains("400"));
+        assert!(status(decide(addr, &web, &format!(r#"{{"session":"{id}"}}"#)).await).contains("400"));
+        // A session that never waited.
+        let plain = web.store.new_id();
+        web.store.save(&plain, &[], &[], None, &Choices::default(), None).unwrap();
+        let response = decide(addr, &web, &format!(r#"{{"session":"{plain}","approve":true}}"#)).await;
+        assert!(response.starts_with("HTTP/1.1 409") && response.contains("not waiting"), "{response}");
+        // Its hook switched off, then deleted.
+        request(addr, "POST /api/hooks/save", Some(&web.token), r#"{"name":"w","template":"go","enabled":false}"#).await;
+        let response = decide(addr, &web, &format!(r#"{{"session":"{id}","approve":true}}"#)).await;
+        assert!(response.starts_with("HTTP/1.1 409") && response.contains("switched off"), "{response}");
+        request(addr, "POST /api/hooks/delete", Some(&web.token), r#"{"name":"w"}"#).await;
+        let response = decide(addr, &web, &format!(r#"{{"session":"{id}","approve":false}}"#)).await;
+        assert!(response.starts_with("HTTP/1.1 409") && response.contains("deleted"), "{response}");
+        // Nothing was decided: it still waits.
+        assert!(web.store.load(&id).unwrap().pending.is_some());
+    }
+
+    #[cfg(feature = "javascript")]
+    #[tokio::test]
+    async fn the_write_modes_deny_and_allow_never_wait() {
+        // deny: the model is told the call was declined and the run ends by itself.
+        let (web, _addr, id) = start_writer("deny", vec![turn(MockStreamEvent::text("gave up"))]).await;
+        let done = wait_saved(&web, &id, |s| s.log.iter().any(|e| e["type"] == "text" && e["text"] == "gave up")).await;
+        assert!(done.pending.is_none() && history_text(&done).contains("the user denied this tool call"), "{:?}", done.history);
+        // allow: the call runs at once.
+        let (web, _addr, id) = start_writer("allow", vec![turn(MockStreamEvent::text("written"))]).await;
+        let done = wait_saved(&web, &id, |s| s.log.iter().any(|e| e["type"] == "text" && e["text"] == "written")).await;
+        assert!(done.pending.is_none() && history_text(&done).contains(r"ok\nstdout:\nwrote"), "{:?}", done.history);
     }
 
     #[tokio::test]

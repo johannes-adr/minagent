@@ -2,6 +2,8 @@
 
 Each recipe is a sequence of `execute_javascript` calls. Start every script with
 `import { connect } from "skill:paperless/scripts/paperless.js"; const pl = connect();`.
+Calls that only read run as they are; every step that changes data goes into one call with
+`writes: true` (see the rules in `SKILL.md`).
 
 ## Inbox triage (classify new documents)
 
@@ -15,8 +17,8 @@ Each recipe is a sequence of `execute_javascript` calls. Start every script with
    names; collect proposed new ones.
 4. Show the user a table of the proposals (id, current title → new values), mark new objects,
    and ask for approval. Small, obvious cases may be applied directly if the user said so.
-5. Apply: `await pl.update(id, { ..., removeInboxTags: true })` for each document. Pass
-   `{ create: true }` only for approved new names.
+5. Apply in one call with `writes: true`: `await pl.update(id, { ..., removeInboxTags: true })`
+   for each document. Pass `{ create: true }` only for approved new names.
 6. Report what changed. Suggest matching rules (`references/automation.md`) for recurring
    correspondents so Paperless does it by itself next time.
 

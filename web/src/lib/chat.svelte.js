@@ -20,6 +20,7 @@ export const chat = $state({
   tools: null, // {available, enabled, default, custom}
   skills: null, // {available: [{name, description}], disabled, default, custom}
   sessions: [],
+  approvals: [], // webhook runs waiting for the user: {session, hook, time, message, title, hosts, code}
   current: null,
   drawer: false,
 });
@@ -88,7 +89,7 @@ function upsertTool(event) {
   Object.assign(tool.data, event);
   // Calls that need a decision, run or fail are shown open, so the whole call can be read;
   // finished ones fold away unless the user has opened or closed the card themselves.
-  if (!tool.touched) tool.open = ["pending", "running", "failed"].includes(event.status);
+  if (!tool.touched) tool.open = ["pending", "waiting", "running", "failed"].includes(event.status);
 }
 
 function upsertQuestion(event) {
@@ -157,6 +158,7 @@ function handle(event) {
       break;
     case "sessions":
       loadSessions();
+      loadApprovals();
       break;
   }
 }
@@ -187,6 +189,12 @@ export async function loadSessions() {
   const response = await get("/sessions");
   if (!response.ok) return;
   chat.sessions = (await response.json()).sessions;
+}
+
+export async function loadApprovals() {
+  const response = await get("/approvals");
+  if (!response.ok) return;
+  chat.approvals = (await response.json()).approvals;
 }
 
 /** Runs a request that is refused while the agent works; returns whether it was accepted. */
@@ -229,6 +237,7 @@ export function connect() {
   const source = new EventSource(eventsUrl());
   source.onopen = () => {
     chat.offline = false;
+    loadApprovals();
     queue = [];
     resetTranscript();
     setBusy(false);

@@ -193,18 +193,22 @@ pub trait ToolPolicy: Tool + 'static {
     fn instance_prompt(&self, context: &Context) -> String {
         Self::prompt(context)
     }
+    /// Like [`ToolPolicy::approval`], for a tool whose approval depends on how this instance
+    /// was set up (a webhook run's own `execute_javascript` settings).
+    fn instance_approval(&self) -> Approver<Self::Args> {
+        Arc::new(|args, context| Self::approval(args, context))
+    }
 }
 
-#[derive(Clone, Copy)]
+/// Decides how a call is shown and whether it needs approval.
+pub type Approver<A> = Arc<dyn Fn(&A, &Context) -> Approval + Send + Sync>;
+
+/// A tool's [`Approver`] on raw arguments: `None` when they don't parse.
+type Decide = Box<dyn Fn(&str, &Context) -> Option<Approval> + Send + Sync>;
+
 struct Policy {
     kind: &'static str,
-    /// `None` when the arguments don't parse.
-    decide: fn(&str, &Context) -> Option<Approval>,
-}
-
-fn decide<T: ToolPolicy>(args: &str, context: &Context) -> Option<Approval> {
-    let args = serde_json::from_str::<T::Args>(args).ok()?;
-    Some(T::approval(&args, context))
+    decide: Decide,
 }
 
 /// An agent under construction together with the policies of its tools.
@@ -222,9 +226,13 @@ impl Tools {
         if !self.enabled.allows(T::NAME) {
             return self;
         }
+        let approve = tool.instance_approval();
         let policy = Policy {
             kind: T::KIND,
-            decide: decide::<T>,
+            decide: Box::new(move |args, context| {
+                let args = serde_json::from_str::<T::Args>(args).ok()?;
+                Some(approve(&args, context))
+            }),
         };
         self.policies.insert(T::NAME, policy);
         let prompt = tool.instance_prompt(&self.context);
@@ -254,7 +262,6 @@ fn tools(
     model: &DynModel<Completion>,
     preamble: &str,
     enabled: &Toolset,
-    #[cfg_attr(not(feature = "javascript"), allow(unused_variables))] frontend: &Arc<dyn Frontend>,
 ) -> Tools {
     let tools = Tools {
         builder: AgentBuilder::new(model.clone()),
@@ -266,7 +273,7 @@ fn tools(
     .add(Execute)
     .add(UseSkill::new(enabled.skills.clone()));
     #[cfg(feature = "javascript")]
-    let tools = tools.add(ExecuteJavascript::new(frontend.clone(), enabled.js.clone(), enabled.skills.clone()));
+    let tools = tools.add(ExecuteJavascript::new(enabled.js.clone(), enabled.skills.clone()));
     #[cfg(feature = "image")]
     let tools = tools.add(ViewImage);
     tools
@@ -279,7 +286,7 @@ pub fn main_agent(
     frontend: Arc<dyn Frontend>,
     enabled: &Toolset,
 ) -> Agent {
-    tools(&model, preamble, enabled, &frontend)
+    tools(&model, preamble, enabled)
         .add(Subagent::new(
             model.clone(),
             preamble,
@@ -297,7 +304,7 @@ pub fn subagent(
     frontend: Arc<dyn Frontend>,
     enabled: &Toolset,
 ) -> Agent {
-    tools(&model, preamble, enabled, &frontend).build(frontend, SUBAGENT_MAX_TURNS)
+    tools(&model, preamble, enabled).build(frontend, SUBAGENT_MAX_TURNS)
 }
 
 /// Reports tool calls to the frontend and asks it for approval where the tool's
@@ -701,11 +708,17 @@ impl Session {
     /// what the agent had said and done as plain text (the results of the tool batch
     /// that was running are not known). Does nothing when no prompt was cancelled.
     pub fn commit_stopped(&mut self) {
+        self.commit_stopped_because("This answer was stopped by the user before it finished.");
+    }
+
+    /// Like [`Session::commit_stopped`], with `reason` as the first sentence of the digest
+    /// (e.g. a run that waits for the user's approval).
+    pub fn commit_stopped_because(&mut self, reason: &str) {
         let Some((input, partial)) = self.running.take() else {
             return;
         };
         let done = partial.lock().unwrap().trim().to_string();
-        let mut digest = String::from("[This answer was stopped by the user before it finished.");
+        let mut digest = format!("[{reason}");
         if done.is_empty() {
             digest.push_str(" Nothing had been done yet.]");
         } else {
@@ -772,7 +785,6 @@ mod tests {
             &model.into(),
             "",
             &Toolset::default(),
-            &(Arc::new(Silent) as Arc<dyn Frontend>),
         );
         Approve {
             frontend: Arc::new(Silent),
@@ -787,7 +799,6 @@ mod tests {
             &model.into(),
             "BASE",
             &Toolset::default(),
-            &(Arc::new(Silent) as Arc<dyn Frontend>),
         )
         .preamble;
         assert!(preamble.starts_with("BASE\n\n"), "{preamble}");
@@ -815,7 +826,6 @@ mod tests {
             &model.into(),
             "BASE",
             &enabled,
-            &(Arc::new(Silent) as Arc<dyn Frontend>),
         );
         assert!(!tools.preamble.contains("Use the `execute` tool"), "{}", tools.preamble);
         assert!(tools.policies.contains_key("use_skill"));
@@ -847,10 +857,9 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("SKILL.md"), format!("---\nname: {name}\ndescription: Only for the test.\n---\n")).unwrap();
         let model = MockCompletionModel::from_stream_turns(Vec::<Vec<MockStreamEvent>>::new());
-        let frontend = &(Arc::new(Silent) as Arc<dyn Frontend>);
-        let on = tools(&model.clone().into(), "B", &Toolset::default(), frontend).preamble;
+        let on = tools(&model.clone().into(), "B", &Toolset::default()).preamble;
         let off = Toolset::default().with_skills(SkillFilter::disabled([name.clone()]));
-        let off = tools(&model.into(), "B", &off, frontend).preamble;
+        let off = tools(&model.into(), "B", &off).preamble;
         let _ = fs::remove_dir_all(&dir);
         assert!(on.contains(&name), "{on}");
         assert!(!off.contains(&name), "{off}");
