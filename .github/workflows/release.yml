@@ -1,0 +1,154 @@
+name: Release
+
+# Every push to main: semantic-release works out the next version from the commit messages
+# (Conventional Commits). If there is one, binaries are built and a Docker image is published.
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Version and tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      published: ${{ steps.semrel.outputs.new_release_published }}
+      version: ${{ steps.semrel.outputs.new_release_version }}
+      tag: v${{ steps.semrel.outputs.new_release_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: semrel
+        uses: cycjimmy/semantic-release-action@v4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  binaries:
+    name: Binary (${{ matrix.name }})
+    needs: release
+    if: needs.release.outputs.published == 'true'
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-latest
+            target: aarch64-apple-darwin
+          - name: linux-x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build the web UI (embedded into the binary)
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # The version lives in the git tag, not in Cargo.toml: write it in before building,
+      # so that the binary reports it. (No `--locked`: the lockfile still pins every dependency.)
+      - name: Set the crate version
+        shell: bash
+        run: perl -0pi -e 's/^version = ".*?"/version = "${{ needs.release.outputs.version }}"/m' Cargo.toml
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          name="agent-${{ needs.release.outputs.tag }}-${{ matrix.name }}"
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/agent" dist/agent
+          tar -C dist -czf "$name.tar.gz" agent
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - name: Attach to the GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ needs.release.outputs.tag }}" agent-*.tar.gz agent-*.sha256 --clobber
+
+      - name: Keep the Linux binary for the image
+        if: matrix.name == 'linux-x86_64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-linux-x86_64
+          path: dist/agent
+          if-no-files-found: error
+
+  docker:
+    name: Docker image (ghcr.io)
+    needs: [release, binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: agent-linux-x86_64
+          path: ctx
+      - name: Assemble the build context
+        run: |
+          chmod +x ctx/agent
+          cp /etc/ssl/certs/ca-certificates.crt ctx/
+          mkdir -p ctx/workspace && touch ctx/workspace/.keep
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=${{ needs.release.outputs.version }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.version=${{ needs.release.outputs.version }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: ctx
+          file: Dockerfile.release
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

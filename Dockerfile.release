@@ -1,0 +1,14 @@
+# Release image: nothing but the statically linked (musl) binary and the CA certificates.
+# Built by .github/workflows/release.yml, which puts `agent`, `ca-certificates.crt` and
+# `workspace/` into the build context. For a build from source, use `Dockerfile`.
+FROM scratch
+COPY ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY agent /agent
+# An empty working directory the unprivileged user may write to.
+COPY --chown=65532:65532 workspace /workspace
+USER 65532:65532
+WORKDIR /workspace
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    AGENT_ISOLATED=1
+# No arguments: terminal UI (`docker run -it`); `--acp`: ACP over stdio (`docker run -i`).
+ENTRYPOINT ["/agent"]
