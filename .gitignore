@@ -1,5 +1,7 @@
 /target
 .env
+/work
 skills
-system_prompt
-.background-tasks
+/sessions
+config.json
+hooks.json

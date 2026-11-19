@@ -7,27 +7,41 @@ edition = "2024"
 rig-agent = "0.46.0"
 rig-core = { version = "0.46.0", features = ["reqwest"] }
 tokio = { version = "1.54.1", features = ["full"] }
-# Official AWS repo, pinned. The crates.io `llrt_modules` is an unofficial third-party republish.
-llrt_modules = { git = "https://github.com/awslabs/llrt", rev = "d25954463fde4b0c2f043eaec01092d510abaf01" }
-rquickjs = { version = "0.14", features = ["full-async"] }
+# The web frontend (`--web`).
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+# The built web UI (web/dist), embedded into the binary.
+rust-embed = { version = "8", features = ["mime-guess"] }
 dotenvy = "0.15"
+# Webhook tokens are stored as hashes.
+sha2 = "0.10"
 futures = "0.3"
 ratatui = "0.30.2"
 crossterm = { version = "0.29.0", features = ["event-stream"] }
 ratatui-textarea = "0.9.4"
 unicode-width = "0.2"
-# Same versions as rig-core uses (TLS features come from there); for `llm_proxy`.
-reqwest = { version = "0.13", default-features = false, features = ["stream"] }
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
-http-body-util = "0.1"
+# Only for the optional `execute_javascript` tool (feature `javascript`).
+rquickjs = { version = "0.14", features = ["loader"], optional = true }
+# Asks Ollama which thinking levels a model has, and `execute_javascript`'s `fetch`.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "multipart"] }
+# Content type of files a script uploads with `fetch(url, { form })`.
+mime_guess = { version = "2.0", optional = true, default-features = false }
+# Only for the optional `view_image` tool (feature `image`).
+base64 = { version = "0.22", optional = true }
 
-[profile.release]
-strip = true
-lto = true
-codegen-units = 1
-panic = "abort"
-opt-level = "z"
+[features]
+# Opt out with `--no-default-features`.
+default = ["javascript", "image"]
+# The `view_image` tool: shows an image file to the model.
+image = ["dep:base64"]
+# The `execute_javascript` tool: scripts in an in-process QuickJS with a small host API.
+javascript = ["dep:rquickjs", "dep:mime_guess"]
+
+# [profile.release]
+# strip = true
+# lto = true
+# codegen-units = 1
+# panic = "abort"
+# opt-level = "z"
 
 [dev-dependencies]
 rig-agent = { version = "0.46.0", features = ["test-utils"] }

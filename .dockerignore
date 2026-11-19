@@ -1,0 +1,7 @@
+target/
+.git/
+.env
+web/node_modules
+web/dist
+config.json
+hooks.json
