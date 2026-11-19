@@ -15,8 +15,9 @@ use crate::config::Config;
 use crate::frontend::files::{Area, FileError};
 use crate::frontend::hook_run::{self, Job};
 use crate::hooks::{self, Fields, Hooks};
+use crate::tools::skills;
 use crate::harness::{self, Context, Session, Toolset};
-use crate::sessions::{self, Store};
+use crate::sessions::{self, Choices, Store};
 use crate::thinking::{self, Thinking};
 use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, Request, State};
@@ -73,7 +74,10 @@ struct Inner {
     /// The tools the configuration enables (`None`: all) and the ones the shown session
     /// uses instead, if it has its own choice.
     default_tools: Option<Vec<String>>,
-    tools: Option<Vec<String>>,
+    /// The skills the configuration disables.
+    default_disabled_skills: Vec<String>,
+    /// What the shown session uses instead of the defaults.
+    choices: Choices,
 }
 
 /// What the worker does, one at a time.
@@ -84,6 +88,8 @@ pub enum Command {
     Delete(String),
     /// Gives the shown session its own tools; `None` goes back to the configured ones.
     SetTools(Option<Vec<String>>),
+    /// Gives the shown session its own set of disabled skills; `None` goes back to the configured ones.
+    SetSkills(Option<Vec<String>>),
     /// Applies a changed configuration (already saved to the settings file).
     Reload(Box<Config>),
 }
@@ -166,21 +172,52 @@ impl Web {
 
     /// The tools of the shown session, for the page's tool menu.
     fn tools_event(inner: &Inner) -> Value {
-        let enabled = Toolset::only(inner.tools.clone().or_else(|| inner.default_tools.clone()));
+        let enabled = Toolset::only(inner.choices.tools.clone().or_else(|| inner.default_tools.clone()));
         json!({
             "type": "tools",
             "available": harness::tool_names(),
             "enabled": enabled.names(),
             "default": Toolset::only(inner.default_tools.clone()).names(),
-            "custom": inner.tools.is_some(),
+            "custom": inner.choices.tools.is_some(),
         })
     }
 
-    /// Sets the tools the configuration enables, for sessions without their own choice.
-    pub fn set_default_tools(&self, tools: Option<Vec<String>>) {
+    /// The skills of the shown session, for the page's skill menu: every skill that exists
+    /// and which of them the session may not use.
+    fn skills_event(inner: &Inner) -> Value {
+        let available: Vec<Value> = skills::discover(std::path::Path::new(skills::DIR))
+            .skills
+            .into_iter()
+            .map(|s| json!({"name": s.name, "description": s.description}))
+            .collect();
+        let disabled = inner
+            .choices
+            .skills_disabled
+            .clone()
+            .unwrap_or_else(|| inner.default_disabled_skills.clone());
+        json!({
+            "type": "skills",
+            "available": available,
+            "disabled": disabled,
+            "default": inner.default_disabled_skills,
+            "custom": inner.choices.skills_disabled.is_some(),
+        })
+    }
+
+    /// Tells the pages which skills exist (after the file browser changed some).
+    fn skills_changed(&self) {
+        let inner = self.inner.lock().unwrap();
+        let _ = self.live.send(Self::skills_event(&inner));
+    }
+
+    /// Sets what the configuration enables, for sessions without their own choice: the
+    /// tools (`None`: all) and the skills that are switched off.
+    pub fn set_defaults(&self, tools: Option<Vec<String>>, disabled_skills: Vec<String>) {
         let mut inner = self.inner.lock().unwrap();
         inner.default_tools = tools;
+        inner.default_disabled_skills = disabled_skills;
         let _ = self.live.send(Self::tools_event(&inner));
+        let _ = self.live.send(Self::skills_event(&inner));
     }
 
     /// The `think` value for the next prompt; `None` while the user hasn't chosen.
@@ -195,6 +232,7 @@ impl Web {
         let mut events = vec![session_event(&inner.session_id)];
         events.extend(self.thinking_event(&inner));
         events.push(Self::tools_event(&inner));
+        events.push(Self::skills_event(&inner));
         events.extend(inner.log.clone());
         events.extend(inner.context.clone());
         (events, self.live.subscribe())
@@ -206,15 +244,16 @@ impl Web {
         id: Option<String>,
         log: Vec<Value>,
         context: Option<Value>,
-        tools: Option<Vec<String>>,
+        choices: Choices,
     ) {
         let mut inner = self.inner.lock().unwrap();
         inner.session_id = id;
         inner.log = log;
         inner.context = context;
-        inner.tools = tools;
+        inner.choices = choices;
         let _ = self.live.send(session_event(&inner.session_id));
         let _ = self.live.send(Self::tools_event(&inner));
+        let _ = self.live.send(Self::skills_event(&inner));
         for event in inner.log.iter().chain(&inner.context) {
             let _ = self.live.send(event.clone());
         }
@@ -227,7 +266,7 @@ impl Web {
 
     /// Writes the current session to disk (without busy markers, which are only live).
     fn save(&self, history: &[rig_core::message::Message]) -> Result<(), String> {
-        let (id, log, context, tools) = {
+        let (id, log, context, choices) = {
             let mut inner = self.inner.lock().unwrap();
             let id = inner
                 .session_id
@@ -239,10 +278,10 @@ impl Web {
                 .filter(|e| e["type"] != "status")
                 .cloned()
                 .collect();
-            (id, log, inner.context.clone(), inner.tools.clone())
+            (id, log, inner.context.clone(), inner.choices.clone())
         };
         self.store
-            .save(&id, history, &log, context.as_ref(), tools.as_deref())
+            .save(&id, history, &log, context.as_ref(), &choices)
             .map_err(|e| format!("could not save session {id}: {e}"))
     }
 
@@ -628,6 +667,7 @@ fn file_op(
         Ok(value) => {
             if changes && root == "skills" {
                 web.skills_dirty.store(true, Ordering::SeqCst);
+                web.skills_changed();
             }
             Json(value).into_response()
         }
@@ -699,7 +739,7 @@ fn enqueue(web: &Web, hook: hooks::Hook, prompt: String) -> Result<(String, usiz
     let session_id = web.store.new_id();
     let log = hook_run::queued_log(&hook, &prompt, "queued");
     web.store
-        .save(&session_id, &[], &log, None, None)
+        .save(&session_id, &[], &log, None, &Choices::default())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     jobs.push_back(Job {
         hook,
@@ -778,6 +818,7 @@ async fn hooks_list(State(web): State<Arc<Web>>) -> Json<Value> {
         "hooks": hooks.list().iter().map(hooks::Hook::to_public).collect::<Vec<_>>(),
         "isolated": Context::from_env().isolated,
         "tools": harness::tool_names().into_iter().filter(|t| *t != "ask_user").collect::<Vec<_>>(),
+        "skills": Web::skills_event(&web.inner.lock().unwrap())["available"].clone(),
         "queued": web.jobs.lock().unwrap().len(),
         "max_queue": hooks::MAX_QUEUE,
     }))
@@ -822,12 +863,27 @@ async fn hooks_delete(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> R
     }
 }
 
+/// `{"disabled": ["paperless"]}` switches those skills off for the shown session,
+/// `{"disabled": null}` goes back to the configured ones.
+async fn set_skills(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> StatusCode {
+    let disabled = match &body["disabled"] {
+        Value::Null => None,
+        Value::Array(names) => match names.iter().map(|n| n.as_str().map(str::to_owned)).collect::<Option<Vec<_>>>() {
+            Some(names) => Some(names),
+            None => return StatusCode::BAD_REQUEST,
+        },
+        _ => return StatusCode::BAD_REQUEST,
+    };
+    queue(&web, Command::SetSkills(disabled))
+}
+
 fn config_json(web: &Web, config: &Config) -> Value {
     json!({
         "path": web.config_path.display().to_string(),
         "entries": config.entries(),
         "problems": config.problems(),
         "tools": harness::tool_names(),
+        "skills": skills::discover(std::path::Path::new(skills::DIR)).skills.into_iter().map(|s| s.name).collect::<Vec<_>>(),
     })
 }
 
@@ -915,6 +971,7 @@ fn router(web: Arc<Web>) -> Router {
         .route("/cancel", post(cancel))
         .route("/thinking", post(set_thinking))
         .route("/tools", post(set_tools))
+        .route("/skills", post(set_skills))
         .route("/config", get(get_config).put(put_config))
         .route("/hooks", get(hooks_list))
         .route("/hooks/save", post(hooks_save))
@@ -996,11 +1053,23 @@ async fn run_command(web: &Arc<Web>, session: &mut Session, command: Command) {
             session.set_tools(tools.clone());
             let saved = {
                 let mut inner = web.inner.lock().unwrap();
-                inner.tools = tools;
+                inner.choices.tools = tools;
                 let _ = web.live.send(Web::tools_event(&inner));
                 inner.session_id.is_some()
             };
             // A conversation that has not started has nothing to save yet.
+            if saved && let Err(error) = web.save(session.history()) {
+                web.push(json!({"type": "error", "text": error}));
+            }
+        }
+        Command::SetSkills(disabled) => {
+            session.set_skills(disabled.clone());
+            let saved = {
+                let mut inner = web.inner.lock().unwrap();
+                inner.choices.skills_disabled = disabled;
+                let _ = web.live.send(Web::skills_event(&inner));
+                inner.session_id.is_some()
+            };
             if saved && let Err(error) = web.save(session.history()) {
                 web.push(json!({"type": "error", "text": error}));
             }
@@ -1034,6 +1103,7 @@ async fn reload(web: &Web, session: &mut Session, config: &Config) {
             model,
             config.context_window().ok().flatten(),
             config.tools(),
+            config.disabled_skills(),
         ),
         Err(error) => return web.push(json!({"type": "error", "text": error})),
     }
@@ -1046,11 +1116,13 @@ async fn reload(web: &Web, session: &mut Session, config: &Config) {
     inner.thinking = thinking;
     inner.think = None;
     inner.default_tools = config.tools();
+    inner.default_disabled_skills = config.disabled_skills();
     let event = web
         .thinking_event(&inner)
         .unwrap_or_else(|| json!({"type": "thinking", "levels": []}));
     let _ = web.live.send(event);
     let _ = web.live.send(Web::tools_event(&inner));
+    let _ = web.live.send(Web::skills_event(&inner));
 }
 
 /// Makes `id` (or a fresh session) the one the agent continues and the pages show.
@@ -1058,7 +1130,8 @@ fn switch(web: &Web, session: &mut Session, id: Option<String>) {
     let Some(id) = id else {
         session.set_history(Vec::new());
         session.set_tools(None);
-        web.replace(None, Vec::new(), None, None);
+        session.set_skills(None);
+        web.replace(None, Vec::new(), None, Choices::default());
         return;
     };
     match web.store.load(&id) {
@@ -1066,8 +1139,9 @@ fn switch(web: &Web, session: &mut Session, id: Option<String>) {
             let mut log = saved.log;
             settle(&mut log);
             session.set_history(saved.history);
-            session.set_tools(saved.tools.clone());
-            web.replace(Some(id), log, saved.context, saved.tools);
+            session.set_tools(saved.choices.tools.clone());
+            session.set_skills(saved.choices.skills_disabled.clone());
+            web.replace(Some(id), log, saved.context, saved.choices);
         }
         Err(error) => web.push(json!({"type": "error", "text": error})),
     }
@@ -1198,7 +1272,7 @@ mod tests {
         );
         let (replayed, _) = web.subscribe();
         let types: Vec<&str> = replayed.iter().filter_map(|e| e["type"].as_str()).collect();
-        assert_eq!(types, ["session", "tools", "text", "context"]);
+        assert_eq!(types, ["session", "tools", "skills", "text", "context"]);
         assert_eq!(replayed.last(), Some(&latest));
         // Without a window the page shows only the tokens.
         web.emit(Event::Context(ContextUsage {
@@ -1339,10 +1413,10 @@ mod tests {
         request(addr, "POST /api/prompt", token, r#"{"text":"hello"}"#).await;
         wait_for(&web, |e| e["type"] == "text").await;
         let id = web.inner.lock().unwrap().session_id.clone().unwrap();
-        assert_eq!(web.store.load(&id).unwrap().tools, Some(vec!["execute".to_owned()]));
+        assert_eq!(web.store.load(&id).unwrap().choices.tools, Some(vec!["execute".to_owned()]));
         request(addr, "POST /api/session", token, "{}").await;
         for _ in 0..100 {
-            if web.inner.lock().unwrap().tools.is_none() {
+            if web.inner.lock().unwrap().choices.tools.is_none() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1476,7 +1550,7 @@ mod tests {
         // The token is not offered to the template.
         assert_eq!(prompt, "Issue: Crash (issues) ");
         assert!(saved.log.iter().any(|e| e["type"] == "text" && e["text"] == "handled"));
-        assert_eq!(saved.tools, Some(vec!["use_skill".to_owned()]));
+        assert_eq!(saved.choices.tools, Some(vec!["use_skill".to_owned()]));
         assert_eq!(saved.history.len(), 2);
         // It is listed under the hook's name, and the open chat was not touched.
         let listed = web.store.list();
@@ -1578,6 +1652,39 @@ mod tests {
         assert!(old.starts_with("HTTP/1.1 401"), "{old}");
         let gone = request(addr, "POST /api/hooks/delete", token, r#"{"name":"a"}"#).await;
         assert!(gone.starts_with("HTTP/1.1 200"), "{gone}");
+    }
+
+    #[tokio::test]
+    async fn skills_are_switched_per_conversation_and_remembered_with_it() {
+        let (web, addr) = start(vec![turn(MockStreamEvent::text("hi"))]).await;
+        let token = Some(web.token.as_str());
+        let disabled = |web: &Web| Web::skills_event(&web.inner.lock().unwrap())["disabled"].clone();
+        assert_eq!(disabled(&web), json!([]));
+
+        let bad = request(addr, "POST /api/skills", token, r#"{"disabled":[1]}"#).await;
+        assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+        let ok = request(addr, "POST /api/skills", token, r#"{"disabled":["paperless"]}"#).await;
+        assert!(ok.starts_with("HTTP/1.1 202"), "{ok}");
+        wait_for(&web, |e| e["type"] == "status" && e["busy"] == false).await;
+        assert_eq!(disabled(&web), json!(["paperless"]));
+        assert_eq!(Web::skills_event(&web.inner.lock().unwrap())["custom"], true);
+
+        // Saved with the conversation; a new one goes back to the default.
+        request(addr, "POST /api/prompt", token, r#"{"text":"hello"}"#).await;
+        wait_for(&web, |e| e["type"] == "text").await;
+        let id = web.inner.lock().unwrap().session_id.clone().unwrap();
+        assert_eq!(
+            web.store.load(&id).unwrap().choices.skills_disabled,
+            Some(vec!["paperless".to_owned()])
+        );
+        request(addr, "POST /api/session", token, "{}").await;
+        for _ in 0..100 {
+            if web.inner.lock().unwrap().choices.skills_disabled.is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(disabled(&web), json!([]));
     }
 
     /// The slider only exists for models that list levels, and only those can be picked.

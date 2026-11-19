@@ -11,7 +11,7 @@ use crate::tools::ask_user::AskUser;
 use crate::tools::execute::Execute;
 #[cfg(feature = "javascript")]
 use crate::tools::execute_javascript::ExecuteJavascript;
-use crate::tools::skills::{self, use_skill::UseSkill};
+use crate::tools::skills::{self, SkillFilter, use_skill::UseSkill};
 #[cfg(feature = "image")]
 use crate::tools::view_image::ViewImage;
 use futures::StreamExt;
@@ -97,6 +97,8 @@ pub fn validate_tools(names: &[String]) -> Result<(), String> {
 #[derive(Clone, Default)]
 pub struct Toolset {
     names: Option<Arc<Vec<String>>>,
+    /// The skills these agents may use.
+    skills: SkillFilter,
     #[cfg(feature = "javascript")]
     js: Option<Arc<crate::tools::execute_javascript::Settings>>,
 }
@@ -104,13 +106,16 @@ pub struct Toolset {
 // Not derived: the JavaScript settings hold secrets.
 impl std::fmt::Debug for Toolset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Toolset").field(&self.names).finish()
+        f.debug_tuple("Toolset")
+            .field(&self.names)
+            .field(&self.skills)
+            .finish()
     }
 }
 
 impl PartialEq for Toolset {
     fn eq(&self, other: &Self) -> bool {
-        self.names == other.names
+        self.names == other.names && self.skills == other.skills
     }
 }
 
@@ -121,6 +126,16 @@ impl Toolset {
             names: names.map(Arc::new),
             ..Self::default()
         }
+    }
+
+    /// Lets the agents use only the skills `filter` allows.
+    pub fn with_skills(mut self, filter: SkillFilter) -> Self {
+        self.skills = filter;
+        self
+    }
+
+    pub fn skills(&self) -> &SkillFilter {
+        &self.skills
     }
 
     /// Runs `execute_javascript` under `settings` and refuses hosts they don't allow.
@@ -173,6 +188,11 @@ pub trait ToolPolicy: Tool + 'static {
     fn prompt(_context: &Context) -> String {
         String::new()
     }
+    /// Like [`ToolPolicy::prompt`], for a tool that depends on how this instance was set up
+    /// (which skills it may load).
+    fn instance_prompt(&self, context: &Context) -> String {
+        Self::prompt(context)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -207,7 +227,7 @@ impl Tools {
             decide: decide::<T>,
         };
         self.policies.insert(T::NAME, policy);
-        let prompt = T::prompt(&self.context);
+        let prompt = tool.instance_prompt(&self.context);
         if !prompt.trim().is_empty() {
             self.preamble = format!("{}\n\n{}", self.preamble, prompt.trim());
         }
@@ -244,9 +264,9 @@ fn tools(
         policies: HashMap::new(),
     }
     .add(Execute)
-    .add(UseSkill);
+    .add(UseSkill::new(enabled.skills.clone()));
     #[cfg(feature = "javascript")]
-    let tools = tools.add(ExecuteJavascript::new(frontend.clone(), enabled.js.clone()));
+    let tools = tools.add(ExecuteJavascript::new(frontend.clone(), enabled.js.clone(), enabled.skills.clone()));
     #[cfg(feature = "image")]
     let tools = tools.add(ViewImage);
     tools
@@ -518,6 +538,8 @@ pub struct Session {
     /// The tools the configuration enables, and the ones this conversation uses instead.
     default_tools: Toolset,
     tools_override: Option<Toolset>,
+    /// The skills this conversation may not use, instead of the configured ones.
+    skills_override: Option<SkillFilter>,
     history: Vec<Message>,
     frontend: Arc<dyn Frontend>,
     /// The window set in the configuration; it wins over the model catalog's.
@@ -539,6 +561,7 @@ impl Session {
             preamble: preamble.to_owned(),
             default_tools: enabled,
             tools_override: None,
+            skills_override: None,
             window_override: None,
             history: Vec::new(),
             frontend,
@@ -567,11 +590,30 @@ impl Session {
         self
     }
 
-    /// The tools this conversation has: its own choice, else the configured ones.
+    /// The skills in `names` are switched off, unless a conversation chooses otherwise.
+    pub fn with_disabled_skills(mut self, names: Vec<String>) -> Self {
+        self.default_tools = self.default_tools.with_skills(SkillFilter::disabled(names));
+        self.rebuild();
+        self
+    }
+
+    /// The tools and skills this conversation has: its own choice, else the configured ones.
     pub fn enabled_tools(&self) -> Toolset {
-        self.tools_override
+        let tools = self
+            .tools_override
             .clone()
-            .unwrap_or_else(|| self.default_tools.clone())
+            .unwrap_or_else(|| self.default_tools.clone());
+        let skills = self
+            .skills_override
+            .clone()
+            .unwrap_or_else(|| self.default_tools.skills().clone());
+        tools.with_skills(skills)
+    }
+
+    /// Switches skills off for this conversation only; `None` goes back to the configured ones.
+    pub fn set_skills(&mut self, disabled: Option<Vec<String>>) {
+        self.skills_override = disabled.map(SkillFilter::disabled);
+        self.rebuild();
     }
 
     /// Gives this conversation its own set of tools; `None` goes back to the configured ones.
@@ -587,11 +629,12 @@ impl Session {
         model: DynModel<Completion>,
         window: Option<u64>,
         tools: Option<Vec<String>>,
+        disabled_skills: Vec<String>,
     ) {
         self.context_window = window.or(catalog_context_window(&model));
         self.window_override = window;
         self.model = model;
-        self.default_tools = Toolset::only(tools);
+        self.default_tools = Toolset::only(tools).with_skills(SkillFilter::disabled(disabled_skills));
         self.rebuild();
     }
 
@@ -605,6 +648,7 @@ impl Session {
             preamble,
             default_tools: tools,
             tools_override: None,
+            skills_override: None,
             history: Vec::new(),
             frontend,
             window_override: self.window_override,
@@ -776,6 +820,40 @@ mod tests {
         assert!(!tools.preamble.contains("Use the `execute` tool"), "{}", tools.preamble);
         assert!(tools.policies.contains_key("use_skill"));
         assert!(!tools.policies.contains_key("execute"));
+    }
+
+    #[test]
+    fn skills_are_chosen_per_conversation_and_by_default() {
+        let model = MockCompletionModel::from_stream_turns(Vec::<Vec<MockStreamEvent>>::new());
+        let mut session = Session::new(model.into(), "", Arc::new(Silent))
+            .with_disabled_skills(vec!["a".into()]);
+        let allows = |s: &Session, name: &str| s.enabled_tools().skills().allows(name);
+        assert!(!allows(&session, "a") && allows(&session, "b"));
+        session.set_skills(Some(vec!["b".into()])); // its own choice replaces the default
+        assert!(allows(&session, "a") && !allows(&session, "b") && allows(&session, "new"));
+        session.set_skills(None);
+        assert!(!allows(&session, "a") && allows(&session, "b"));
+        // The tools stay as they are, whichever way skills are changed.
+        session.set_tools(Some(vec!["execute".into()]));
+        assert_eq!(session.enabled_tools().names(), ["execute"]);
+        assert!(!allows(&session, "a"));
+    }
+
+    #[test]
+    fn disabled_skills_leave_the_system_prompt() {
+        use std::fs;
+        let name = format!("zz-prompt-test-{}", std::process::id());
+        let dir = std::path::Path::new(skills::DIR).join(&name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), format!("---\nname: {name}\ndescription: Only for the test.\n---\n")).unwrap();
+        let model = MockCompletionModel::from_stream_turns(Vec::<Vec<MockStreamEvent>>::new());
+        let frontend = &(Arc::new(Silent) as Arc<dyn Frontend>);
+        let on = tools(&model.clone().into(), "B", &Toolset::default(), frontend).preamble;
+        let off = Toolset::default().with_skills(SkillFilter::disabled([name.clone()]));
+        let off = tools(&model.into(), "B", &off, frontend).preamble;
+        let _ = fs::remove_dir_all(&dir);
+        assert!(on.contains(&name), "{on}");
+        assert!(!off.contains(&name), "{off}");
     }
 
     #[test]

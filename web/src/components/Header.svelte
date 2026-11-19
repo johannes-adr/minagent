@@ -2,6 +2,7 @@
   import { chat, loadSessions, setThinking } from "../lib/chat.svelte.js";
   import { go } from "../lib/route.svelte.js";
   import ToolsMenu from "./ToolsMenu.svelte";
+  import SkillsMenu from "./SkillsMenu.svelte";
 
   // While dragging only the label follows; the level is sent on release. Each level sent
   // while dragging came back from the server and moved the slider under the finger.
@@ -53,6 +54,7 @@
     </div>
   {/if}
   <ToolsMenu />
+  <SkillsMenu />
   <button class="btn settings" title="Files: skills and working directory" onclick={() => go("/files")}>🗂</button>
   <button class="btn settings" title="Webhooks" onclick={() => go("/hooks")}>⚡</button>
   <button class="btn settings" title="Settings" onclick={() => go("/settings")}>⚙</button>

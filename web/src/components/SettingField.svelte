@@ -2,7 +2,7 @@
   // One setting. `entry` is what the server lists, `value` the draft (a string) and `tools`
   // the names of all tools; `onchange(value)` reports an edit, `onreset()` drops the value
   // from the settings file (the environment's, if any, applies again).
-  let { entry, value, tools, onchange, onreset, ondelete } = $props();
+  let { entry, value, tools, skills = [], onchange, onreset, ondelete } = $props();
 
   const kind = $derived(entry.kind);
   const choices = $derived(kind.startsWith("choice:") ? kind.slice(7).split(",") : []);
@@ -11,6 +11,12 @@
   const selected = $derived(
     value.trim() ? value.split(",").map((t) => t.trim()) : tools, // empty means all tools
   );
+
+  // For `skills` the value is the list of skills switched off.
+  const disabled = $derived(value.split(",").map((s) => s.trim()).filter(Boolean));
+  function toggleSkill(name, on) {
+    onchange(skills.filter((s) => (s === name ? !on : disabled.includes(s))).join(","));
+  }
 
   function toggleTool(name, on) {
     const next = tools.filter((t) => (t === name ? on : selected.includes(t)));
@@ -47,6 +53,17 @@
           <input type="checkbox" checked={selected.includes(name)} onchange={(e) => toggleTool(name, e.target.checked)} />
           <code>{name}</code>
         </label>
+      {/each}
+    </div>
+  {:else if kind === "skills"}
+    <div class="tools">
+      {#each skills as name}
+        <label class="check">
+          <input type="checkbox" checked={!disabled.includes(name)} onchange={(e) => toggleSkill(name, e.target.checked)} />
+          <code>{name}</code>
+        </label>
+      {:else}
+        <span class="doc">No skills yet.</span>
       {/each}
     </div>
   {:else if secret}

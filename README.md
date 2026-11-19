@@ -55,7 +55,7 @@ If the working directory contains an [`AGENTS.md`](https://agents.md), its conte
 
 The gear button opens a settings page with every option of `.env.example` (the list in `src/config.rs` drives both). Saving writes `config.json` in the workspace (`AGENT_CONFIG` names another file; mode 0600, git-ignored) and applies it to the next message without a restart: model, API keys, context window, tools and the `execute_javascript` hosts and secrets. The order of priority is `config.json`, then the environment, then `.env`; "Reset" removes a value from the file so the environment's applies again. Secrets (API keys, `AGENT_SECRET_*`) are never sent back to the page, which only shows whether they are set (and a secret's host); new secrets can be added under "Secrets". Without an API key the web UI still starts, so the key can be entered there. Settings can only be saved while the agent is not working.
 
-The "Tools" menu in the chat header turns tools on and off for the current chat only (it overrides `AGENT_TOOLS` / the default from the settings page, is saved with the session, and "Reset" goes back to the default). Subagents get the same tools as their parent, except `agent`.
+The "Tools" menu in the chat header turns tools on and off for the current chat only (it overrides `AGENT_TOOLS` / the default from the settings page, is saved with the session, and "Reset" goes back to the default). Subagents get the same tools as their parent, except `agent`. Skills work the same way: the "Skills" menu switches skills off for the current chat (default: all on, including skills you add later; the default can be changed with `AGENT_DISABLED_SKILLS` on the settings page). A skill that is off is not listed in the system prompt, `use_skill` doesn't know it and scripts can't import or read it (`skill:<name>/…`). It is still a file, so with `execute` the agent can read it anyway: this keeps the prompt short and the agent focused, it is not a lock. The choice is saved with the session.
 
 ### Files (web UI)
 
@@ -65,6 +65,22 @@ The 🗂 button opens a file browser on two areas: `skills/` and the agent's wor
 After each model call of the main agent the UIs show how full its context is, e.g. `42k / 200k tokens (21%)`: the terminal UI at the right of the status line (yellow from 80 %, red from 95 %), the browser UI in the header, and ACP clients get a `usage_update` session update (`used`, `size`). The tokens are the input and output of the latest call as the provider reports them, i.e. what the next request sends again. Subagents have their own context and are not counted.
 
 The context window comes from rig's built-in model catalog (where the provider caps input below the window, that lower limit). Models it doesn't know, which includes most Ollama models, show only the tokens, and ACP clients get no update; set `AGENT_CONTEXT_WINDOW=32768` in `.env` to give the size. For Ollama, use the context length the daemon runs the model with (`num_ctx`, `OLLAMA_CONTEXT_LENGTH`), not the model's maximum.
+
+### Webhooks
+
+The ⚡ button manages webhooks: an outside service starts the agent with `POST /hooks/<name>`. A hook has its own token (shown once when it is created or renewed; only a hash is stored in `hooks.json`, next to `config.json`, mode 0600, git-ignored), a prompt template, the tools, skills and hosts its runs may use, an optional callback URL and a time limit. The token goes in `Authorization: Bearer <token>`, `X-Hook-Token` or `?token=`; it is valid only for that hook, and the page's token is not needed (and does not work there).
+
+```sh
+curl -X POST http://localhost:8080/hooks/github-issues \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"issue": {"title": "Crash on start"}}'      # 202 {"session": "…", "queued": 1}
+```
+
+- **Prompt template:** `{{payload}}` (the raw body, cut at 50,000 characters), `{{body.issue.title}}` (a field of a JSON body; arrays by index, e.g. `{{body.items.0.name}}`), `{{headers.x-github-event}}` (not `authorization`, `x-hook-token` or `cookie`), `{{hook}}`. Missing values are empty. Whatever the request contains is untrusted text that reaches the model.
+- **Queue:** every call is a run in a FIFO queue and answers `202` at once with the id of its session; `429` once 50 runs wait. Runs go one after the other, after what you do in the chat (a running prompt is not interrupted). Each run is a session of its own, titled `hook: <name>`, in the sessions list; the chat you have open is not touched. A run that is still waiting when the agent restarts stays "queued" and is not run.
+- **Tools and skills:** a run has only the tools listed for the hook (never `ask_user`) and no skills unless the hook lists them (the default is none, and skills added later stay off).
+- **Nobody to ask:** everything that would ask for approval is declined (the model is told and can try another way). The exceptions are the hook's own allowances: scripts (`execute_javascript`) may reach the listed hosts, which replace `AGENT_JS_ALLOWED_HOSTS` for this run, and may change data (POST, PUT, PATCH, DELETE) there only if "Scripts may change data" is on. The configured secrets stay usable, but only for the hosts they are bound to. `view_image` outside `work/` is declined. `execute` (a shell) can only be allowed for a hook when `AGENT_ISOLATED=1` (the container); elsewhere it is not available to hooks.
+- **Result:** read it in the session, or set a callback URL: it gets a `POST` with `{"hook", "session", "status": "done"|"failed"|"timeout", "result"}` (the agent's last answer). The callback is not retried.
 
 ## Skills
 

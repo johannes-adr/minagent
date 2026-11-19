@@ -12,6 +12,7 @@ mod runtime;
 use crate::frontend::Frontend;
 use crate::harness::{Approval, Context, ToolPolicy};
 use crate::tools::process::format_output;
+use crate::tools::skills::SkillFilter;
 use rig_core::tool::{Tool, ToolContext};
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -174,13 +175,20 @@ pub(crate) struct ExecuteJavascript {
     /// Settings of this run instead of the configured ones; scripts may then only declare
     /// the hosts they allow.
     own_settings: Option<Arc<Settings>>,
+    /// The skills scripts may import and read.
+    skills: SkillFilter,
 }
 
 impl ExecuteJavascript {
-    pub(crate) fn new(frontend: Arc<dyn Frontend>, own_settings: Option<Arc<Settings>>) -> Self {
+    pub(crate) fn new(
+        frontend: Arc<dyn Frontend>,
+        own_settings: Option<Arc<Settings>>,
+        skills: SkillFilter,
+    ) -> Self {
         Self {
             frontend,
             own_settings,
+            skills,
         }
     }
 }
@@ -220,7 +228,7 @@ impl Tool for ExecuteJavascript {
         // questions; on allowed hosts, writes ask unless the configuration waves them through.
         let all_allowed = hosts.iter().all(|h| settings.allowed_hosts.contains(h));
         let confirm_writes = (all_allowed && !settings.allow_writes).then(|| self.frontend.clone());
-        Ok(run(args.code, hosts, confirm_writes, timeout, settings)
+        Ok(run(args.code, hosts, confirm_writes, timeout, settings, self.skills.clone())
             .await
             .unwrap_or_else(|e| format!("error\nstderr:\n{e}")))
     }
@@ -233,10 +241,11 @@ async fn run(
     confirm_writes: Option<Arc<dyn Frontend>>,
     timeout: Duration,
     settings: Arc<Settings>,
+    skills: SkillFilter,
 ) -> Result<String, tokio::task::JoinError> {
     let handle = Handle::current();
     let outcome = tokio::task::spawn_blocking(move || {
-        runtime::run(&code, hosts, confirm_writes, timeout, settings, handle)
+        runtime::run(&code, hosts, confirm_writes, timeout, settings, skills, handle)
     })
     .await?;
     Ok(format_output(
@@ -316,6 +325,7 @@ mod tests {
             None,
             Duration::from_secs(secs),
             Arc::new(settings),
+            SkillFilter::All,
         )
         .await
         .unwrap()
@@ -336,6 +346,7 @@ mod tests {
             Some(frontend),
             Duration::from_secs(10),
             Arc::new(Settings::default()),
+            SkillFilter::All,
         )
         .await
         .unwrap();

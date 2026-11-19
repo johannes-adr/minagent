@@ -16,7 +16,7 @@
   const GROUPS = [
     ["Model", (n) => n.startsWith("LLM_") || n === "AGENT_CONTEXT_WINDOW"],
     ["Providers", (n) => /^(OPENAI|ANTHROPIC|OLLAMA)_/.test(n)],
-    ["Tools", (n) => n === "AGENT_TOOLS"],
+    ["Tools and skills", (n) => n === "AGENT_TOOLS" || n === "AGENT_DISABLED_SKILLS"],
     ["execute_javascript", (n) => n.startsWith("AGENT_JS_")],
     ["Secrets", (n) => n.startsWith("AGENT_SECRET_")],
   ];
@@ -96,7 +96,7 @@
         <h2>{title}</h2>
         {#each entries as entry (entry.name)}
           <SettingField
-            {entry} value={shown(entry)} tools={config.tools}
+            {entry} value={shown(entry)} tools={config.tools} skills={config.skills}
             onchange={(v) => edit(entry.name, v)} onreset={() => reset(entry.name)} ondelete={() => deleteSecret(entry)}
           />
         {/each}

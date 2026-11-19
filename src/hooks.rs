@@ -9,6 +9,7 @@
 
 use crate::config::write_private;
 use crate::harness::{self, Toolset};
+use crate::tools::skills::SkillFilter;
 use rig_core::serde_json::{self, Value, json};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -36,6 +37,8 @@ pub struct Hook {
     pub template: String,
     /// The tools a run has.
     pub tools: Vec<String>,
+    /// The skills a run may use; none by default (skills added later stay off).
+    pub skills: Vec<String>,
     /// The hosts scripts may reach without asking (instead of `AGENT_JS_ALLOWED_HOSTS`).
     pub hosts: Vec<String>,
     /// Whether scripts may change data (POST, PUT, ...) on those hosts.
@@ -67,6 +70,7 @@ impl Hook {
             "name": self.name,
             "template": self.template,
             "tools": self.tools,
+            "skills": self.skills,
             "hosts": self.hosts,
             "allow_writes": self.allow_writes,
             "callback_url": self.callback_url,
@@ -93,6 +97,7 @@ impl Hook {
             token_hash: value["token_hash"].as_str()?.to_owned(),
             template: value["template"].as_str()?.to_owned(),
             tools: strings("tools"),
+            skills: strings("skills"),
             hosts: strings("hosts"),
             allow_writes: value["allow_writes"].as_bool().unwrap_or(false),
             callback_url: value["callback_url"].as_str().map(str::to_owned),
@@ -110,7 +115,7 @@ impl Hook {
             .filter(|t| t.as_str() != "ask_user" && (isolated || t.as_str() != "execute"))
             .cloned()
             .collect();
-        let toolset = Toolset::only(Some(names));
+        let toolset = Toolset::only(Some(names)).with_skills(SkillFilter::only(self.skills.clone()));
         #[cfg(feature = "javascript")]
         let toolset = toolset.with_js(crate::tools::execute_javascript::settings_with(
             self.hosts.clone(),
@@ -137,6 +142,7 @@ pub struct Fields {
     pub name: Option<String>,
     pub template: String,
     pub tools: Vec<String>,
+    pub skills: Vec<String>,
     pub hosts: Vec<String>,
     pub allow_writes: bool,
     pub callback_url: Option<String>,
@@ -189,6 +195,9 @@ impl Fields {
                 return Err("execute (a shell) is only available to webhooks inside an isolated container (AGENT_ISOLATED=1)".into());
             }
         }
+        let mut skills: Vec<String> = strings("skills")?.into_iter().filter(|s| !s.is_empty()).collect();
+        skills.sort();
+        skills.dedup();
         let mut hosts: Vec<String> = strings("hosts")?
             .into_iter()
             .map(|h| h.to_ascii_lowercase())
@@ -209,6 +218,7 @@ impl Fields {
             name,
             template,
             tools,
+            skills,
             hosts,
             allow_writes: body["allow_writes"].as_bool().unwrap_or(false),
             callback_url,
@@ -271,6 +281,7 @@ impl Hooks {
             token_hash,
             template: fields.template,
             tools: fields.tools,
+            skills: fields.skills,
             hosts: fields.hosts,
             allow_writes: fields.allow_writes,
             callback_url: fields.callback_url,
@@ -480,5 +491,18 @@ mod tests {
         hook.tools = vec!["execute".into(), "ask_user".into(), "use_skill".into()];
         assert_eq!(hook.toolset(false).names(), ["use_skill"]);
         assert_eq!(hook.toolset(true).names(), ["execute", "use_skill"]);
+    }
+
+    #[test]
+    fn a_run_has_no_skills_unless_the_hook_lists_them() {
+        let mut hook = Hooks::load(temp("skills")).unwrap()
+            .upsert(fields(json!({})).unwrap(), || "t".into()).unwrap().0;
+        assert!(!hook.toolset(false).skills().allows("paperless")); // the default: none
+        hook.skills = vec!["paperless".into()];
+        let toolset = hook.toolset(false);
+        assert!(toolset.skills().allows("paperless") && !toolset.skills().allows("other"));
+        let parsed = fields(json!({"skills": [" b ", "a", "b", ""]})).unwrap();
+        assert_eq!(parsed.skills, ["a", "b"]);
+        assert!(fields(json!({"skills": "a"})).is_err());
     }
 }

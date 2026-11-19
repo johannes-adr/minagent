@@ -18,6 +18,7 @@ export const chat = $state({
   context: null,
   thinking: null,
   tools: null, // {available, enabled, default, custom}
+  skills: null, // {available: [{name, description}], disabled, default, custom}
   sessions: [],
   current: null,
   drawer: false,
@@ -145,6 +146,9 @@ function handle(event) {
     case "tools":
       chat.tools = event;
       break;
+    case "skills":
+      chat.skills = event;
+      break;
     case "session":
       // Another session is shown: start its transcript over.
       resetTranscript();
@@ -217,6 +221,8 @@ export const answer = (id, text) => post("/answer", { id, answer: text });
 export const setThinking = (level) => post("/thinking", { level });
 /** Gives this chat its own tools; `null` goes back to the configured ones. */
 export const setTools = (tools) => busyAware(post("/tools", { tools }));
+/** Switches skills off for this chat; `null` goes back to the configured ones. */
+export const setSkills = (disabled) => busyAware(post("/skills", { disabled }));
 
 // ---- Connection: every (re)connect replays the whole transcript ----
 export function connect() {

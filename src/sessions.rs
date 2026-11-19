@@ -13,13 +13,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const DIR: &str = "sessions";
 const TITLE_CHARS: usize = 60;
 
+/// What a conversation uses instead of the configured defaults; `None` means the default.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Choices {
+    /// The tools it has.
+    pub tools: Option<Vec<String>>,
+    /// The skills it may not use (skills added later are allowed).
+    pub skills_disabled: Option<Vec<String>>,
+}
+
 /// A stored conversation.
 pub struct Saved {
     pub history: Vec<Message>,
     pub log: Vec<Value>,
     pub context: Option<Value>,
-    /// The tools this conversation uses instead of the configured ones, if it has its own.
-    pub tools: Option<Vec<String>>,
+    pub choices: Choices,
 }
 
 /// The sessions directory.
@@ -91,7 +99,7 @@ impl Store {
         history: &[Message],
         log: &[Value],
         context: Option<&Value>,
-        tools: Option<&[String]>,
+        choices: &Choices,
     ) -> io::Result<()> {
         if !valid_id(id) {
             return Err(io::Error::new(
@@ -112,7 +120,8 @@ impl Store {
             "history": history,
             "log": log,
             "context": context,
-            "tools": tools,
+            "tools": choices.tools,
+            "skills_disabled": choices.skills_disabled,
         });
         let tmp = self.dir.join(format!(".{id}.json.tmp"));
         fs::write(&tmp, serde_json::to_vec_pretty(&file)?)?;
@@ -138,12 +147,15 @@ impl Store {
             _ => Vec::new(),
         };
         let context = Some(file["context"].take()).filter(|c| !c.is_null());
-        let tools = serde_json::from_value(file["tools"].take()).ok();
+        let choices = Choices {
+            tools: serde_json::from_value(file["tools"].take()).ok(),
+            skills_disabled: serde_json::from_value(file["skills_disabled"].take()).ok(),
+        };
         Ok(Saved {
             history,
             log,
             context,
-            tools,
+            choices,
         })
     }
 
@@ -211,7 +223,16 @@ mod tests {
         let log = vec![json!({"type": "user", "text": "hello\nthere"})];
         let history = vec![Message::user("hello there")];
         store
-            .save(&id, &history, &log, Some(&json!({"tokens": 3})), Some(&["execute".to_owned()]))
+            .save(
+                &id,
+                &history,
+                &log,
+                Some(&json!({"tokens": 3})),
+                &Choices {
+                    tools: Some(vec!["execute".to_owned()]),
+                    skills_disabled: Some(vec!["paperless".to_owned()]),
+                },
+            )
             .unwrap();
         assert_ne!(store.new_id(), id);
 
@@ -226,7 +247,8 @@ mod tests {
         assert_eq!(saved.history, history);
         assert_eq!(saved.log, log);
         assert_eq!(saved.context, Some(json!({"tokens": 3})));
-        assert_eq!(saved.tools, Some(vec!["execute".to_owned()]));
+        assert_eq!(saved.choices.tools, Some(vec!["execute".to_owned()]));
+        assert_eq!(saved.choices.skills_disabled, Some(vec!["paperless".to_owned()]));
 
         store.delete(&id).unwrap();
         assert!(store.list().is_empty());
@@ -239,7 +261,7 @@ mod tests {
         for bad in ["", "../x", "a/b", "a.b", "x\0"] {
             assert!(!valid_id(bad), "{bad:?}");
             assert!(store.load(bad).is_err());
-            assert!(store.save(bad, &[], &[], None, None).is_err());
+            assert!(store.save(bad, &[], &[], None, &Choices::default()).is_err());
         }
     }
 }

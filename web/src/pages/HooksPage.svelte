@@ -52,6 +52,11 @@
   function toggleTool(name, on) {
     form.tools = on ? [...form.tools, name] : form.tools.filter((t) => t !== name);
   }
+  function toggleSkill(name, on) {
+    form.skills = on ? [...form.skills, name] : form.skills.filter((t) => t !== name);
+  }
+  // Skills the hook lists that no longer exist stay visible, so they can be removed.
+  const skillNames = $derived([...new Set([...(info?.skills ?? []).map((s) => s.name), ...(form?.skills ?? [])])].sort());
 
   async function copy(text) {
     await navigator.clipboard?.writeText(text);
@@ -129,6 +134,21 @@
                 <input type="checkbox" disabled={blocked} checked={form.tools.includes(name)} onchange={(e) => toggleTool(name, e.target.checked)} />
                 <code>{name}</code>{#if blocked}<small>(container only)</small>{/if}
               </label>
+            {/each}
+          </div>
+        </div>
+
+        <div class="col">
+          <span>Skills of a run (none by default)</span>
+          <div class="tools">
+            {#each skillNames as name}
+              {@const known = (info?.skills ?? []).find((s) => s.name === name)}
+              <label class="check" title={known?.description ?? "this skill no longer exists"}>
+                <input type="checkbox" checked={form.skills.includes(name)} onchange={(e) => toggleSkill(name, e.target.checked)} />
+                <code>{name}</code>
+              </label>
+            {:else}
+              <small>No skills yet.</small>
             {/each}
           </div>
         </div>

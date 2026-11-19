@@ -6,6 +6,7 @@
 //! either done or waits for a promise that can never settle.
 
 use super::modules::{SkillLoader, SkillResolver, skills_root};
+use crate::tools::skills::SkillFilter;
 use super::{Settings, fetch::Fetch, fs};
 use crate::frontend::Frontend;
 use rquickjs::{
@@ -61,6 +62,7 @@ pub(super) fn run(
     confirm_writes: Option<Arc<dyn Frontend>>,
     timeout: Duration,
     settings: Arc<Settings>,
+    skills: SkillFilter,
     handle: Handle,
 ) -> Outcome {
     let deadline = Instant::now() + timeout;
@@ -72,7 +74,7 @@ pub(super) fn run(
         deadline,
         handle,
     };
-    let result = evaluate(code, deadline, fetch, &output);
+    let result = super::modules::with_filter(skills, || evaluate(code, deadline, fetch, &output));
     let mut output = output.take();
     let exit = match result {
         Ok(()) => "ok".to_owned(),

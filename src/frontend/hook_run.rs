@@ -6,7 +6,8 @@ use super::web::{append, context_event, event_json};
 use super::{Event, Frontend, Question, ToolCall};
 use crate::harness::Session;
 use crate::hooks::Hook;
-use crate::sessions::Store;
+use crate::sessions::{Choices, Store};
+use crate::tools::skills;
 use futures::future::BoxFuture;
 use rig_core::serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
@@ -97,12 +98,24 @@ pub async fn execute(main: &Session, store: &Store, job: Job, isolated: bool) ->
         context: Mutex::new(None),
     });
     let tools = job.hook.toolset(isolated);
-    let names = tools.names();
+    // What the session shows when it is opened in the page: the hook's tools, and every
+    // skill that exists but is not in the hook's list as switched off.
+    let choices = Choices {
+        tools: Some(tools.names()),
+        skills_disabled: Some(
+            skills::discover(std::path::Path::new(skills::DIR))
+                .skills
+                .into_iter()
+                .map(|s| s.name)
+                .filter(|name| !tools.skills().allows(name))
+                .collect(),
+        ),
+    };
     let mut session = main.fork(run.clone(), tools, &job.hook.note());
     let save = |session: &Session, run: &Run| {
         let log = run.log.lock().unwrap().clone();
         let context = run.context.lock().unwrap().clone();
-        if let Err(e) = store.save(&job.session_id, session.history(), &log, context.as_ref(), Some(&names)) {
+        if let Err(e) = store.save(&job.session_id, session.history(), &log, context.as_ref(), &choices) {
             eprintln!("hook {}: could not save session {}: {e}", job.hook.name, job.session_id);
         }
     };
@@ -183,6 +196,7 @@ mod tests {
                 token_hash: String::new(),
                 template: "t".into(),
                 tools: vec![],
+                skills: vec![],
                 hosts: hosts.iter().map(|h| h.to_string()).collect(),
                 allow_writes: false,
                 callback_url: None,
