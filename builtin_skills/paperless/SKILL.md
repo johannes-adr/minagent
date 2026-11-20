@@ -96,7 +96,7 @@ await pl.update(42, { title: "Stromrechnung März 2025", correspondent: "Stadtwe
   itself asks the user (or parks the run until they decide). The same goes for any other
   change: make the call, do not describe it.
 - **Only use functions that exist.** Use what `scripts/paperless.js` exports (read the file
-  if unsure, do not guess names) and the endpoints in `references/rest-api.md`. If a name is
+  if unsure, do not guess names) and the endpoints in the REST reference below. If a name is
   not there, it does not exist. Objects are created by `update(..., { create: true })` or
   `createObject(kind, data)`.
 - **Ask before destructive or wide changes.** Before deleting documents or objects, merging,
