@@ -23,6 +23,8 @@ export const chat = $state({
   sessions: [],
   approvals: [], // webhook runs waiting for the user: {session, hook, time, message, title, hosts, code}
   current: null,
+  running: null, // the webhook run that works right now (session id)
+  view: null, // {id, running}: another session shown read-only while the agent works
   drawer: false,
 });
 
@@ -174,6 +176,11 @@ function setBusy(busy) {
 let queue = [];
 let scheduled = false;
 function enqueue(event) {
+  // A session is only looked at: what the agent does meanwhile is replayed when it is left.
+  if (chat.view) {
+    if (event.type === "status") setBusy(event.busy);
+    return;
+  }
   queue.push(event);
   if (scheduled) return;
   scheduled = true;
@@ -189,7 +196,9 @@ function enqueue(event) {
 export async function loadSessions() {
   const response = await get("/sessions");
   if (!response.ok) return;
-  chat.sessions = (await response.json()).sessions;
+  const data = await response.json();
+  chat.sessions = data.sessions;
+  chat.running = data.running;
 }
 
 export async function loadApprovals() {
@@ -201,15 +210,71 @@ export async function loadApprovals() {
 /** Runs a request that is refused while the agent works; returns whether it was accepted. */
 async function busyAware(promise) {
   const response = await promise;
-  if (response.status === 409) add(chat.main, "note", { text: "Wait for the agent to finish before switching sessions." });
+  if (response.status === 409) add(chat.main, "note", { text: "The agent is working: try again when it has finished." });
   else if (!response.ok && response.status !== 202) add(chat.main, "error", { text: `Request failed (HTTP ${response.status})` });
   return response.status === 202;
 }
 
+// ---- Looking at a session without opening it ----
+// Opening a session waits for the agent. Looking at one does not: it is read-only, shows a
+// webhook run that works right now as it goes, and the open session comes back on leaving.
+const SKIPPED = ["status", "context", "thinking", "tools", "skills", "session", "sessions"];
+let watching = null; // timer that refreshes a running session
+let shown = ""; // the transcript last shown, to repaint only when it changed
+
+function show(log) {
+  resetTranscript();
+  for (const event of log) if (!SKIPPED.includes(event.type)) handle(event);
+  settleSubagents();
+}
+
+async function view(id) {
+  const response = await post("/session/view", { id });
+  if (!response.ok) return false;
+  const data = await response.json();
+  if (data.live) {
+    leaveView();
+    return true;
+  }
+  clearInterval(watching);
+  watching = null;
+  chat.view = { id, running: data.running };
+  const text = JSON.stringify(data.log);
+  if (text !== shown) {
+    shown = text;
+    show(data.log);
+  }
+  if (data.running) watching = setInterval(() => chat.view?.id === id && view(id), 2000);
+  return true;
+}
+
+/** Goes back to the open session: the stream replays its transcript. */
+export function leaveView() {
+  if (!chat.view) return;
+  clearInterval(watching);
+  watching = null;
+  shown = "";
+  chat.view = null;
+  connect();
+}
+
 export async function openSession(id) {
-  if (id !== chat.current && (await busyAware(post("/session", { id })))) chat.drawer = false;
+  if (id === chat.current) {
+    leaveView();
+    chat.drawer = false;
+  } else if (chat.busy || id === chat.running) {
+    if (await view(id)) chat.drawer = false;
+  } else {
+    // Not looked at any more: the stream's events count again.
+    const wasViewing = chat.view !== null;
+    chat.view = null;
+    clearInterval(watching);
+    if (await busyAware(post("/session", { id }))) chat.drawer = false;
+    else if (wasViewing) connect();
+  }
 }
 export async function newSession() {
+  if (chat.view) leaveView();
   if (await busyAware(post("/session", {}))) chat.drawer = false;
 }
 export async function deleteSession(id) {
@@ -234,19 +299,22 @@ export const setTools = (tools) => busyAware(post("/tools", { tools }));
 export const setSkills = (disabled) => busyAware(post("/skills", { disabled }));
 
 // ---- Connection: every (re)connect replays the whole transcript ----
+let source = null;
 export function connect() {
-  const source = new EventSource(eventsUrl());
-  source.onopen = () => {
+  source?.close();
+  const own = (source = new EventSource(eventsUrl()));
+  own.onopen = () => {
     chat.offline = false;
     loadApprovals();
     queue = [];
     resetTranscript();
     setBusy(false);
   };
-  source.onmessage = (message) => enqueue(JSON.parse(message.data));
-  source.onerror = async () => {
+  own.onmessage = (message) => enqueue(JSON.parse(message.data));
+  own.onerror = async () => {
+    if (own !== source) return; // replaced by a newer connection
     chat.offline = true;
-    const closed = source.readyState === EventSource.CLOSED;
+    const closed = own.readyState === EventSource.CLOSED;
     chat.stateText = closed ? "Not connected" : "Reconnecting…";
     if (!closed) return;
     // Refused: most likely the login is gone (the agent restarted), which shows the login page.

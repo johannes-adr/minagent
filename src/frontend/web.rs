@@ -121,6 +121,8 @@ pub struct Web {
     hooks: Mutex<Hooks>,
     jobs: Mutex<VecDeque<Job>>,
     jobs_ready: Notify,
+    /// The webhook run the worker is busy with, if any.
+    running: hook_run::Running,
     /// The newest release, asked for at most once per hour.
     latest: update::Latest,
 }
@@ -151,6 +153,7 @@ impl Web {
             hooks: Mutex::new(Hooks::load(hooks::path_for(&config_path)).map_err(io::Error::other)?),
             jobs: Mutex::default(),
             jobs_ready: Notify::new(),
+            running: Mutex::default(),
             latest: update::Latest::default(),
         };
         Ok((Arc::new(web), inbox))
@@ -248,6 +251,7 @@ impl Web {
         events.push(Self::skills_event(&inner));
         events.extend(inner.log.clone());
         events.extend(inner.context.clone());
+        events.push(json!({"type": "status", "busy": self.busy.load(Ordering::SeqCst)}));
         (events, self.live.subscribe())
     }
 
@@ -1057,7 +1061,39 @@ async fn put_config(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> Res
 
 async fn list_sessions(State(web): State<Arc<Web>>) -> Json<Value> {
     let current = web.inner.lock().unwrap().session_id.clone();
-    Json(json!({"current": current, "sessions": web.store.list()}))
+    let running = web.running.lock().unwrap().as_ref().map(|(id, _)| id.clone());
+    Json(json!({"current": current, "running": running, "sessions": web.store.list()}))
+}
+
+/// `{"id": "..."}`: a session's transcript for looking at it, whatever the agent is doing.
+/// It does not open the session: that waits for the worker. A webhook run that is working
+/// right now answers with its transcript so far (`"running": true`), and the session
+/// that is open already with `{"live": true}`.
+async fn view_session(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> Response {
+    let Some(id) = body["id"].as_str().filter(|id| sessions::valid_id(id)) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if web.inner.lock().unwrap().session_id.as_deref() == Some(id) {
+        return Json(json!({"id": id, "live": true})).into_response();
+    }
+    let run = web
+        .running
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|(running, _)| running == id)
+        .map(|(_, run)| run.clone());
+    if let Some(run) = run {
+        return Json(json!({"id": id, "running": true, "log": run.snapshot()})).into_response();
+    }
+    match web.store.load(id) {
+        Ok(saved) => {
+            let mut log = saved.log;
+            settle(&mut log);
+            Json(json!({"id": id, "running": false, "log": log})).into_response()
+        }
+        Err(error) => self::error(StatusCode::NOT_FOUND, error),
+    }
 }
 
 /// Takes the one-at-a-time slot and queues `command`.
@@ -1124,6 +1160,7 @@ fn router(web: Arc<Web>) -> Router {
         .route("/files/rename", post(files_rename))
         .route("/sessions", get(list_sessions))
         .route("/session", post(open_session))
+        .route("/session/view", post(view_session))
         .route("/session/delete", post(delete_session))
         .layer(middleware::from_fn_with_state(web.clone(), authorize))
         // Added after the layer: the login must be reachable without a token.
@@ -1150,7 +1187,7 @@ async fn worker(web: Arc<Web>, mut session: Session, mut inbox: Inbox) {
             Err(TryRecvError::Empty) => {
                 let job = web.jobs.lock().unwrap().pop_front();
                 if let Some(job) = job {
-                    hook_run::execute(&session, &web.store, job, Context::from_env().isolated).await;
+                    hook_run::execute(&session, &web.store, job, Context::from_env().isolated, &web.running).await;
                     web.sessions_changed();
                     continue;
                 }
@@ -1486,15 +1523,15 @@ mod tests {
         );
         let (replayed, _) = web.subscribe();
         let types: Vec<&str> = replayed.iter().filter_map(|e| e["type"].as_str()).collect();
-        assert_eq!(types, ["session", "tools", "skills", "text", "context"]);
-        assert_eq!(replayed.last(), Some(&latest));
+        assert_eq!(types, ["session", "tools", "skills", "text", "context", "status"]);
+        assert_eq!(replayed[replayed.len() - 2], latest);
         // Without a window the page shows only the tokens.
         web.emit(Event::Context(ContextUsage {
             tokens: 5,
             window: None,
         }));
         let (replayed, _) = web.subscribe();
-        let last = replayed.last().unwrap();
+        let last = &replayed[replayed.len() - 2];
         assert_eq!(
             (&last["window"], &last["percent"]),
             (&Value::Null, &Value::Null)
@@ -2376,6 +2413,29 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(web.store.list().len(), 1);
+        let _ = std::fs::remove_dir_all(web.store.dir());
+    }
+
+    #[tokio::test]
+    async fn a_session_can_be_looked_at_while_the_agent_works() {
+        let (web, addr) = start(vec![turn(MockStreamEvent::text("live"))]).await;
+        let token = Some(web.token.as_str());
+        let other = web.store.new_id();
+        let log = vec![json!({"type": "user", "text": "old question"})];
+        web.store.save(&other, &[], &log, None, &Choices::default(), None).unwrap();
+        // The agent is busy: opening is refused, looking is not.
+        web.busy.store(true, Ordering::SeqCst);
+        let open = request(addr, "POST /api/session", token, &format!(r#"{{"id":"{other}"}}"#)).await;
+        assert!(open.starts_with("HTTP/1.1 409"), "{open}");
+        let seen = request(addr, "POST /api/session/view", token, &format!(r#"{{"id":"{other}"}}"#)).await;
+        assert!(seen.starts_with("HTTP/1.1 200") && seen.contains("old question"), "{seen}");
+        assert!(seen.contains(r#""running":false"#), "{seen}");
+        // Nothing changed for the open session.
+        assert!(web.inner.lock().unwrap().session_id.is_none());
+        let bad = request(addr, "POST /api/session/view", token, r#"{"id":"../x"}"#).await;
+        assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+        let none = request(addr, "POST /api/session/view", token, r#"{"id":"1"}"#).await;
+        assert!(none.starts_with("HTTP/1.1 404"), "{none}");
         let _ = std::fs::remove_dir_all(web.store.dir());
     }
 }

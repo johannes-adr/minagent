@@ -53,8 +53,20 @@ pub fn queued_log(hook: &Hook, prompt: &str, note: &str) -> Vec<Value> {
     ]
 }
 
+/// The run that is working right now (its session id), so that the page can show it while it runs.
+pub type Running = Mutex<Option<(String, Arc<Run>)>>;
+
+/// Takes the run off [`Running`] when the job is over, however it ends.
+struct Watch<'a>(&'a Running);
+
+impl Drop for Watch<'_> {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap() = None;
+    }
+}
+
 /// What a run reports to: records the transcript, answers every approval itself.
-struct Run {
+pub struct Run {
     hook: Hook,
     log: Mutex<Vec<Value>>,
     context: Mutex<Option<Value>>,
@@ -92,6 +104,11 @@ impl Run {
 
     fn push(&self, event: Value) {
         append(&mut self.log.lock().unwrap(), &event);
+    }
+
+    /// The transcript so far.
+    pub fn snapshot(&self) -> Vec<Value> {
+        self.log.lock().unwrap().clone()
     }
 
     /// The agent's last answer of its own (not a subagent's): the result of the run.
@@ -152,7 +169,7 @@ impl Frontend for Run {
 /// Runs `job` on a conversation forked from `main` (same model and system prompt, the
 /// hook's tools) and saves it. Returns how it ended: `done`, `failed`, `timeout` or
 /// `waiting` (paused at a call that needs the user's approval).
-pub async fn execute(main: &Session, store: &Store, job: Job, isolated: bool) -> &'static str {
+pub async fn execute(main: &Session, store: &Store, job: Job, isolated: bool, running: &Running) -> &'static str {
     let (log, context, history) = match &job.task {
         Task::Start(prompt) => (queued_log(&job.hook, prompt, "running"), None, Vec::new()),
         Task::Resume { .. } => match store.load(&job.session_id) {
@@ -164,6 +181,8 @@ pub async fn execute(main: &Session, store: &Store, job: Job, isolated: bool) ->
         },
     };
     let run = Arc::new(Run::new(job.hook.clone(), log, context));
+    *running.lock().unwrap() = Some((job.session_id.clone(), run.clone()));
+    let _watch = Watch(running);
     let tools = job.hook.toolset(isolated);
     // What the session shows when it is opened in the page: the hook's tools, and every
     // skill that exists but is not in the hook's list as switched off.

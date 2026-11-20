@@ -9,9 +9,10 @@
   <div class="head"><span>Sessions</span><button class="btn primary" onclick={newSession}>+ New</button></div>
   <div class="list">
     {#each chat.sessions as s (s.id)}
-      <div class="session" class:current={s.id === chat.current} onclick={() => openSession(s.id)} role="presentation">
+      <div class="session" class:current={s.id === (chat.view?.id ?? chat.current)} onclick={() => openSession(s.id)} role="presentation">
         <div class="name">
           {s.title || "(empty)"}
+          {#if s.id === chat.running}<span class="running" title="A webhook run is working on this">running</span>{/if}
           {#if s.waiting}<span class="waiting" title="A webhook run is paused until you approve its write">waiting</span>{/if}
           <span class="when">{new Date(s.updated * 1000).toLocaleString()}</span>
         </div>
@@ -33,6 +34,7 @@
   .session:hover { background: var(--code); }
   .session.current { background: var(--user); }
   .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .running { margin-left: 6px; padding: 0 6px; border: 1px solid var(--accent); border-radius: 9px; color: var(--accent); font-size: 11px; }
   .waiting { margin-left: 6px; padding: 0 6px; border: 1px solid var(--warn); border-radius: 9px; color: var(--warn); font-size: 11px; }
   .when { display: block; color: var(--muted); font-size: 11px; }
   .del { border: 0; background: none; color: var(--muted); padding: 2px 6px; border-radius: 6px; opacity: 0; }
