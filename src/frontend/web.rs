@@ -20,6 +20,7 @@ use crate::frontend::files::{Area, FileError};
 use crate::frontend::hook_run::{self, Job, Task};
 use crate::hooks::{self, Fields, Hooks};
 use crate::tools::skills;
+use crate::update;
 use crate::harness::{self, Context, Session, Toolset};
 use crate::sessions::{self, Choices, Store};
 use crate::thinking::{self, Thinking};
@@ -96,6 +97,8 @@ pub enum Command {
     SetSkills(Option<Vec<String>>),
     /// Applies a changed configuration (already saved to the settings file).
     Reload(Box<Config>),
+    /// Replaces the program with this release and starts it again.
+    Update(String),
 }
 
 /// The web frontend's state, shared by the harness side ([`Frontend`]) and the HTTP handlers.
@@ -118,6 +121,8 @@ pub struct Web {
     hooks: Mutex<Hooks>,
     jobs: Mutex<VecDeque<Job>>,
     jobs_ready: Notify,
+    /// The newest release, asked for at most once per hour.
+    latest: update::Latest,
 }
 
 impl Web {
@@ -146,6 +151,7 @@ impl Web {
             hooks: Mutex::new(Hooks::load(hooks::path_for(&config_path)).map_err(io::Error::other)?),
             jobs: Mutex::default(),
             jobs_ready: Notify::new(),
+            latest: update::Latest::default(),
         };
         Ok((Arc::new(web), inbox))
     }
@@ -1106,6 +1112,8 @@ fn router(web: Arc<Web>) -> Router {
         .route("/hooks/save", post(hooks_save))
         .route("/hooks/token", post(hooks_token))
         .route("/hooks/delete", post(hooks_delete))
+        .route("/version", get(version))
+        .route("/update", post(start_update))
         .route("/approvals", get(approvals_list))
         .route("/approvals/decide", post(approvals_decide))
         .route("/files/list", post(files_list))
@@ -1211,6 +1219,7 @@ async fn run_command(web: &Arc<Web>, session: &mut Session, command: Command) {
             }
         }
         Command::Reload(config) => reload(web, session, &config).await,
+        Command::Update(version) => update(web, &version).await,
         Command::Delete(id) => {
             let current = web.inner.lock().unwrap().session_id.clone();
             match web.store.delete(&id) {
@@ -1226,6 +1235,75 @@ async fn run_command(web: &Arc<Web>, session: &mut Session, command: Command) {
         }
     }
     web.set_busy(false);
+}
+
+/// `GET /api/version`: the running version, the newest release and whether this process can
+/// install it.
+async fn version(State(web): State<Arc<Web>>) -> Json<Value> {
+    let (latest, error) = if update::is_dev_build() {
+        (None, None)
+    } else {
+        match web.latest.get().await {
+            Ok(latest) => (Some(latest), None),
+            Err(error) => (None, Some(error)),
+        }
+    };
+    let newer = latest.as_deref().is_some_and(|l| update::is_newer(l, update::VERSION));
+    let blocker = update::blocker(Context::from_env().isolated);
+    Json(json!({
+        "version": update::VERSION,
+        "dev": update::is_dev_build(),
+        "latest": latest,
+        "newer": newer,
+        "can_update": newer && blocker.is_none(),
+        "blocker": if newer { blocker } else { None },
+        "error": error,
+    }))
+}
+
+/// `POST /api/update`: installs the newest release and restarts. Answers `202` at once; the
+/// page waits for the new process to answer. `409` when it cannot be done now.
+async fn start_update(State(web): State<Arc<Web>>) -> Response {
+    if update::is_dev_build() {
+        return error(StatusCode::CONFLICT, "this is a build from source, not a release");
+    }
+    if let Some(blocker) = update::blocker(Context::from_env().isolated) {
+        return error(StatusCode::CONFLICT, blocker);
+    }
+    let latest = match web.latest.get().await {
+        Ok(latest) if update::is_newer(&latest, update::VERSION) => latest,
+        Ok(_) => return error(StatusCode::CONFLICT, "this is the newest version"),
+        Err(e) => return error(StatusCode::BAD_GATEWAY, e),
+    };
+    if !web.jobs.lock().unwrap().is_empty() {
+        return error(StatusCode::CONFLICT, "webhook runs are waiting; update when they are done");
+    }
+    match queue(&web, Command::Update(latest)) {
+        StatusCode::ACCEPTED => StatusCode::ACCEPTED.into_response(),
+        other => error(other, "the agent is busy; update when it is done"),
+    }
+}
+
+/// Installs `version` and starts it in place of this process. The worker is idle while this
+/// runs, so nothing is lost, except webhook runs still waiting for it: those are not started
+/// again after a restart, so the update is refused while there are any.
+async fn update(web: &Web, version: &str) {
+    if !web.jobs.lock().unwrap().is_empty() {
+        let text = "webhook runs are waiting; update when they are done";
+        web.push(json!({"type": "error", "text": text}));
+        return;
+    }
+    web.push(json!({"type": "note", "text": format!("updating to {version}")}));
+    match update::install(version).await {
+        Ok(exe) => {
+            web.push(json!({"type": "note", "text": "restarting"}));
+            // Lets the page receive the note before the connection goes away.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let text = update::restart(&exe);
+            web.push(json!({"type": "error", "text": text}));
+        }
+        Err(e) => web.push(json!({"type": "error", "text": format!("update failed: {e}")})),
+    }
 }
 
 /// Applies a changed configuration: JavaScript settings, model, tools, thinking levels.
@@ -1808,6 +1886,18 @@ mod tests {
         let again = decide(addr, &web, &format!(r#"{{"session":"{id}","approve":true}}"#)).await;
         assert!(again.starts_with("HTTP/1.1 409"), "{again}");
         assert!(request(addr, "GET /api/approvals", Some(&web.token), "").await.contains(r#""approvals":[]"#));
+    }
+
+    #[tokio::test]
+    async fn a_build_from_source_shows_its_version_and_refuses_to_update() {
+        let (web, addr) = start(vec![]).await;
+        assert!(request(addr, "GET /api/version", None, "").await.starts_with("HTTP/1.1 401"));
+        let shown = request(addr, "GET /api/version", Some(&web.token), "").await;
+        assert!(shown.contains(&format!(r#""version":"{}""#, update::VERSION)), "{shown}");
+        assert!(shown.contains(r#""can_update":false"#) && shown.contains(r#""dev":true"#), "{shown}");
+        let refused = request(addr, "POST /api/update", Some(&web.token), "{}").await;
+        assert!(refused.starts_with("HTTP/1.1 409"), "{refused}");
+        assert!(request(addr, "POST /api/update", None, "{}").await.starts_with("HTTP/1.1 401"));
     }
 
     #[cfg(feature = "javascript")]

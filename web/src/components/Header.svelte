@@ -4,6 +4,14 @@
   import { logout } from "../lib/auth.svelte.js";
   import ToolsMenu from "./ToolsMenu.svelte";
   import SkillsMenu from "./SkillsMenu.svelte";
+  import { update, loadVersion, install } from "../lib/update.svelte.js";
+  import { onMount } from "svelte";
+
+  onMount(loadVersion);
+
+  function updateNow() {
+    if (confirm(`Install v${update.latest} and restart the agent? Open chats are kept; you have to log in again.`)) install();
+  }
 
   // While dragging only the label follows; the level is sent on release. Each level sent
   // while dragging came back from the server and moved the slider under the finger.
@@ -37,6 +45,18 @@
 <header>
   <button class="btn sessions" onclick={() => { loadSessions(); chat.drawer = true; }}>☰ Sessions</button>
   <h1>agent</h1>
+  {#if update.version}
+    <span class="version" title={update.blocker ?? ""}>v{update.version}</span>
+    {#if update.working}
+      <span class="version">updating…</span>
+    {:else if update.can}
+      <button class="btn update" onclick={updateNow} title="Install v{update.latest} and restart">Update to v{update.latest}</button>
+    {:else if update.latest}
+      <span class="version new" title={update.blocker ?? ""}>v{update.latest} is available</span>
+    {/if}
+    {#if update.error}<span class="version err" title={update.error}>update failed</span>{/if}
+  {/if}
+  <span class="spacer"></span>
   {#if chat.thinking}
     <div class="thinking" title="How much the model thinks before it answers">
       <span>Thinking</span>
@@ -74,7 +94,12 @@
   .settings { padding: 3px 9px; font-size: 14px; }
   .approvals { font-size: 13px; display: flex; align-items: center; gap: 6px; }
   .badge { min-width: 18px; padding: 0 5px; border-radius: 9px; background: var(--warn); color: var(--bg); font-size: 11px; font-weight: 600; text-align: center; }
-  h1 { margin: 0 auto 0 0; font-size: 15px; font-weight: 600; }
+  h1 { margin: 0; font-size: 15px; font-weight: 600; }
+  .spacer { flex: 1; }
+  .version { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  .version.new { color: var(--warn); }
+  .version.err { color: var(--bad); }
+  .update { padding: 2px 10px; font-size: 12px; }
   .context { display: flex; align-items: center; gap: 8px; margin-right: 8px; color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .meter { width: 64px; height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
   .meter > span { display: block; height: 100%; background: var(--muted); transition: width .3s; }

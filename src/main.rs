@@ -5,6 +5,7 @@ mod hooks;
 mod sessions;
 mod thinking;
 mod tools;
+mod update;
 
 use frontend::{acp, tui, web};
 use harness::Session;
@@ -55,6 +56,13 @@ fn date_from_unix(secs: u64) -> String {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
+    // `--version` prints the version; an update checks the downloaded program with it.
+    if let [_, flag] = args.as_slice()
+        && flag == "--version"
+    {
+        println!("agent {}", update::VERSION);
+        return Ok(());
+    }
     // `--env-example` (re)generates `.env.example` from the config.
     if let [_, flag] = args.as_slice()
         && flag == "--env-example"
