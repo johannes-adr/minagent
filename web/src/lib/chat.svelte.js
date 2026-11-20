@@ -1,6 +1,7 @@
 // The state of the chat: everything the server tells us over the event stream, plus the
 // transcript it builds. Components only read `chat` and call the functions exported here.
-import { eventsUrl, get, post, token } from "./api.js";
+import { eventsUrl, get, post } from "./api.js";
+import { auth, checkAuth } from "./auth.svelte.js";
 
 let nextId = 1;
 
@@ -243,10 +244,13 @@ export function connect() {
     setBusy(false);
   };
   source.onmessage = (message) => enqueue(JSON.parse(message.data));
-  source.onerror = () => {
+  source.onerror = async () => {
     chat.offline = true;
-    chat.stateText =
-      source.readyState === EventSource.CLOSED ? "Not connected: open the URL the agent printed" : "Reconnecting…";
-    if (source.readyState === EventSource.CLOSED && token) setTimeout(connect, 3000);
+    const closed = source.readyState === EventSource.CLOSED;
+    chat.stateText = closed ? "Not connected" : "Reconnecting…";
+    if (!closed) return;
+    // Refused: most likely the login is gone (the agent restarted), which shows the login page.
+    await checkAuth();
+    if (auth.phase === "ok") setTimeout(connect, 3000);
   };
 }

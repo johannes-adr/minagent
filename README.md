@@ -3,6 +3,18 @@
 LLM agent harness with a terminal UI, a browser UI and an [ACP](https://agentclientprotocol.com) server.
 Commands run inside a container; the workspace is the only host directory it sees.
 
+## Install
+
+Latest release (macOS arm64 or Linux x86_64) into the current directory:
+
+```sh
+p=$([ "$(uname)" = Darwin ] && echo macos-arm64 || echo linux-x86_64)
+t=$(curl -fsSL https://api.github.com/repos/johannes-adr/minagent/releases/latest | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
+curl -fsSL "https://github.com/johannes-adr/minagent/releases/download/$t/agent-$t-$p.tar.gz" | tar -xz
+```
+
+Or use [`install.sh`](install.sh), which also verifies the checksum.
+
 ## Run in a container
 
 ```sh
@@ -47,7 +59,7 @@ If the working directory contains an [`AGENTS.md`](https://agents.md), its conte
 `agent.sh --web` prints a URL like `http://localhost:8080/#token=...`; open it. The page streams the answer as markdown, shows each tool call as a card with all of its arguments (e.g. the full script of an `execute_javascript` call) and its output (open while pending, running or failed, folded once done) and asks for approval with Allow/Deny buttons where the terminal UI would ask `y/N`. Markdown is rendered in full (tables, nested and task lists, code blocks with copy button, links limited to http(s)/mailto; images are shown as links so the model can't make the page load URLs). A subagent gets its own tab in a side panel where its answer and tool calls (with approvals) stream like the main agent's. The model's reasoning streams into a "Thinking" block that folds away once the answer starts. Stop cancels the running prompt. Reloading the page or opening a second tab shows the same session. With the Ollama backend a "Thinking" slider appears in the header if the model lists thinking levels in `/api/show` (e.g. `qwen3.8`: off, low, medium, xhigh; on/off models get a two-step switch); until you move it the model's default applies, and the choice is kept until the server restarts.
 - Sessions are saved after every prompt as `sessions/<id>.json` (history plus transcript; git-ignored). The ☰ Sessions button lists them to open, delete or start a new one (not while the agent is working). The agent starts with a new session.
 
-- The agent can run commands, so the API requires the random token printed at startup (the page keeps it in `sessionStorage` and removes it from the address bar). The script publishes the port on `127.0.0.1` only; `AGENT_WEB_PORT=9000` changes it.
+- The agent can run commands, so the API needs a login. There is one user and one password: the first time the page is opened it asks you to choose the password (any, just not empty), after that it asks for it. Only an Argon2id hash is stored, in `auth.json` next to `config.json` (mode 0600, git-ignored); delete the file to set a new password. Wrong passwords are answered after a second, one at a time; with more than 5 attempts at once the rest are refused (`429`). Whoever reaches the page first sets the password, so do that before exposing the port. Logins are kept in memory: a restart logs you out. The random token printed at startup (`#token=…` in the URL) is still accepted. The script publishes the port on `127.0.0.1` only; `AGENT_WEB_PORT=9000` changes it.
 - Without the script: `agent --web [addr]` (default `127.0.0.1:8080`). In a container use `agent --web 0.0.0.0:8080` with `-p 127.0.0.1:8080:8080`.
 - The page is a [Svelte](https://svelte.dev) app in [`web/`](web/) without external resources, so it works offline. Vite builds it to static files (`web/dist`) that are embedded in the binary and served by the agent; Node is only needed to build. `cargo build` works without it but then serves a placeholder page: run `npm install && npm run build` in `web/` first (`agent.sh` and the Dockerfile do this for you). For UI development run `npm run dev` in `web/` (hot reload, forwards `/api` to a running `agent --web`; `AGENT_URL` changes the target). Debug builds of the agent read `web/dist` from disk, so rebuilt UI files show up without recompiling.
 

@@ -14,6 +14,8 @@ rust-embed = { version = "8", features = ["mime-guess"] }
 dotenvy = "0.15"
 # Webhook tokens are stored as hashes.
 sha2 = "0.10"
+# The web UI's password is stored as an Argon2id hash (`auth.json`).
+argon2 = { version = "0.5", default-features = false, features = ["alloc", "password-hash"] }
 futures = "0.3"
 ratatui = "0.30.2"
 crossterm = { version = "0.29.0", features = ["event-stream"] }

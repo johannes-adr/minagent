@@ -1,6 +1,7 @@
 <script>
   import { chat, loadSessions, setThinking } from "../lib/chat.svelte.js";
   import { go } from "../lib/route.svelte.js";
+  import { logout } from "../lib/auth.svelte.js";
   import ToolsMenu from "./ToolsMenu.svelte";
   import SkillsMenu from "./SkillsMenu.svelte";
 
@@ -61,6 +62,7 @@
   </button>
   <button class="btn settings" title="Webhooks" onclick={() => go("/hooks")}>⚡</button>
   <button class="btn settings" title="Settings" onclick={() => go("/settings")}>⚙</button>
+  <button class="btn settings" title="Log out" onclick={logout}>⎋</button>
   <div class="state" class:busy={chat.busy} class:offline={chat.offline}>
     <span class="dot"></span><span>{chat.stateText}</span>
   </div>

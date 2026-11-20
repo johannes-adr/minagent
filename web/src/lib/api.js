@@ -1,29 +1,20 @@
-// The token comes in the URL fragment (never sent to a server); keep it for reloads.
-export const token = (() => {
-  const found = location.hash.match(/token=([0-9a-f]+)/);
-  if (found) {
-    sessionStorage.setItem("token", found[1]);
-    history.replaceState(null, "", location.pathname);
-  }
-  return sessionStorage.getItem("token") || "";
-})();
+import { auth, expired } from "./auth.svelte.js";
 
-const headers = { "x-token": token };
-
-export const get = (path) => fetch("/api" + path, { headers });
-
-export const post = (path, body) =>
-  fetch("/api" + path, {
-    method: "POST",
-    headers: { ...headers, "content-type": "application/json" },
-    body: JSON.stringify(body || {}),
+const request = async (path, method, body) => {
+  const res = await fetch("/api" + path, {
+    method,
+    headers: {
+      "x-token": auth.token,
+      ...(body === undefined ? {} : { "content-type": "application/json" }),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
   });
+  if (res.status === 401) expired();
+  return res;
+};
 
-export const eventsUrl = () => `/api/events?token=${encodeURIComponent(token)}`;
+export const get = (path) => request(path, "GET");
+export const post = (path, body) => request(path, "POST", body || {});
+export const put = (path, body) => request(path, "PUT", body || {});
 
-export const put = (path, body) =>
-  fetch("/api" + path, {
-    method: "PUT",
-    headers: { ...headers, "content-type": "application/json" },
-    body: JSON.stringify(body || {}),
-  });
+export const eventsUrl = () => `/api/events?token=${encodeURIComponent(auth.token)}`;

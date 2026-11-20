@@ -7,6 +7,7 @@
 //! and `execute_javascript` get one to ask the user or report mid-run.
 
 pub mod acp;
+mod auth;
 mod files;
 mod hook_run;
 pub mod tui;

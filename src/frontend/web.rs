@@ -8,12 +8,14 @@
 //! `POST /api/approvals/decide`. Like the terminal UI there is one
 //! session; every browser tab shows it, and a reloaded tab gets the whole transcript replayed.
 //!
-//! Whoever can call the API can make the agent run commands, so all of it needs the random
-//! token printed at startup (header `x-token`, or `?token=` for the event stream). Only the
-//! static page is served without it.
+//! Whoever can call the API can make the agent run commands, so all of it needs a token
+//! (header `x-token`, or `?token=` for the event stream): the one a login returns (see
+//! `auth`: one password, set on the page the first time) or the random one printed at
+//! startup. Only the static page and the login endpoints are served without it.
 
 use crate::frontend::{ContextUsage, Event, Frontend, Question, ToolCall};
 use crate::config::Config;
+use crate::frontend::auth::{self, Auth, LoginError, SetupError};
 use crate::frontend::files::{Area, FileError};
 use crate::frontend::hook_run::{self, Job, Task};
 use crate::hooks::{self, Fields, Hooks};
@@ -98,7 +100,9 @@ pub enum Command {
 
 /// The web frontend's state, shared by the harness side ([`Frontend`]) and the HTTP handlers.
 pub struct Web {
+    /// The token printed at startup; valid like a session token of the login.
     token: String,
+    auth: Auth,
     inner: Mutex<Inner>,
     live: broadcast::Sender<Value>,
     busy: AtomicBool,
@@ -127,6 +131,7 @@ impl Web {
         let (commands, inbox) = mpsc::unbounded_channel();
         let web = Self {
             token: random_token()?,
+            auth: Auth::load(auth::path_for(&config_path))?,
             inner: Mutex::new(Inner {
                 thinking,
                 ..Inner::default()
@@ -522,24 +527,68 @@ fn token_matches(given: &str, token: &str) -> bool {
             == 0
 }
 
-async fn authorize(State(web): State<Arc<Web>>, request: Request, next: Next) -> Response {
-    let from_header = request
-        .headers()
+/// The token a request carries: header `x-token`, or `?token=` for the event stream.
+fn request_token<'a>(headers: &'a HeaderMap, uri: &'a Uri) -> Option<&'a str> {
+    headers
         .get("x-token")
-        .and_then(|value| value.to_str().ok());
-    let from_query = request.uri().query().and_then(|query| {
-        query
-            .split('&')
-            .find_map(|pair| pair.strip_prefix("token="))
-    });
-    if from_header
-        .or(from_query)
-        .is_some_and(|given| token_matches(given, &web.token))
-    {
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            uri.query()?
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("token="))
+        })
+}
+
+impl Web {
+    /// Is `given` the startup token or the token of a login?
+    fn token_valid(&self, given: &str) -> bool {
+        token_matches(given, &self.token) || self.auth.valid(given)
+    }
+}
+
+async fn authorize(State(web): State<Arc<Web>>, request: Request, next: Next) -> Response {
+    if request_token(request.headers(), request.uri()).is_some_and(|given| web.token_valid(given)) {
         next.run(request).await
     } else {
         StatusCode::UNAUTHORIZED.into_response()
     }
+}
+
+/// `GET /api/auth`: whether there is a password yet and whether the request's token is good.
+async fn auth_status(State(web): State<Arc<Web>>, headers: HeaderMap, uri: Uri) -> Json<Value> {
+    let authenticated = request_token(&headers, &uri).is_some_and(|given| web.token_valid(given));
+    Json(json!({"configured": web.auth.is_set(), "authenticated": authenticated}))
+}
+
+/// `POST /api/auth/setup`: sets the first password (`409` once there is one) and logs in.
+async fn auth_setup(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> Response {
+    match web.auth.setup(body["password"].as_str().unwrap_or_default()).await {
+        Ok(token) => Json(json!({"token": token})).into_response(),
+        Err(SetupError::Exists) => error(StatusCode::CONFLICT, "a password is set already"),
+        Err(SetupError::Busy) => too_many_attempts(),
+        Err(SetupError::Empty) => error(StatusCode::BAD_REQUEST, "the password can't be empty"),
+        Err(SetupError::Failed(e)) => error(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+/// `POST /api/auth/login`: `{"password"}` for a session token, `401` if it is wrong.
+async fn auth_login(State(web): State<Arc<Web>>, Json(body): Json<Value>) -> Response {
+    match web.auth.login(body["password"].as_str().unwrap_or_default()).await {
+        Ok(token) => Json(json!({"token": token})).into_response(),
+        Err(LoginError::Wrong) => error(StatusCode::UNAUTHORIZED, "wrong password"),
+        Err(LoginError::Busy) => too_many_attempts(),
+    }
+}
+
+fn too_many_attempts() -> Response {
+    error(StatusCode::TOO_MANY_REQUESTS, "too many attempts at once: wait a moment")
+}
+
+async fn auth_logout(State(web): State<Arc<Web>>, headers: HeaderMap, uri: Uri) -> StatusCode {
+    if let Some(given) = request_token(&headers, &uri) {
+        web.auth.logout(given);
+    }
+    StatusCode::NO_CONTENT
 }
 
 /// Serves the built UI. Paths without a file extension fall back to `index.html`, so the
@@ -1069,6 +1118,11 @@ fn router(web: Arc<Web>) -> Router {
         .route("/session", post(open_session))
         .route("/session/delete", post(delete_session))
         .layer(middleware::from_fn_with_state(web.clone(), authorize))
+        // Added after the layer: the login must be reachable without a token.
+        .route("/auth", get(auth_status))
+        .route("/auth/setup", post(auth_setup))
+        .route("/auth/login", post(auth_login))
+        .route("/auth/logout", post(auth_logout))
         .with_state(web.clone());
     Router::new()
         .nest("/api", api)
@@ -1448,6 +1502,40 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(axum::serve(listener, router(web.clone())).into_future());
         (web, addr)
+    }
+
+    #[tokio::test]
+    async fn one_password_is_set_up_first_and_then_logs_in() {
+        let dir = std::env::temp_dir().join(format!("agent_web_auth_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (_web, addr) = start_with_config(dir.join("config.json")).await;
+
+        let status = request(addr, "GET /api/auth", None, "").await;
+        assert!(status.contains(r#""configured":false"#) && status.contains(r#""authenticated":false"#), "{status}");
+        assert!(request(addr, "GET /api/config", None, "").await.starts_with("HTTP/1.1 401"));
+        let short = request(addr, "POST /api/auth/setup", None, r#"{"password":""}"#).await;
+        assert!(short.starts_with("HTTP/1.1 400"), "{short}");
+
+        let created = request(addr, "POST /api/auth/setup", None, r#"{"password":"a"}"#).await;
+        assert!(created.starts_with("HTTP/1.1 200"), "{created}");
+        let token = created.split(r#""token":""#).nth(1).unwrap().split('"').next().unwrap().to_owned();
+        let listed = request(addr, "GET /api/config", Some(&token), "").await;
+        assert!(listed.starts_with("HTTP/1.1 200"), "{listed}");
+        let status = request(addr, "GET /api/auth", Some(&token), "").await;
+        assert!(status.contains(r#""configured":true"#) && status.contains(r#""authenticated":true"#), "{status}");
+
+        // A password can't be set a second time, and a wrong one doesn't log in.
+        let again = request(addr, "POST /api/auth/setup", None, r#"{"password":"something else"}"#).await;
+        assert!(again.starts_with("HTTP/1.1 409"), "{again}");
+        let wrong = request(addr, "POST /api/auth/login", None, r#"{"password":"nope nope nope"}"#).await;
+        assert!(wrong.starts_with("HTTP/1.1 401"), "{wrong}");
+        let right = request(addr, "POST /api/auth/login", None, r#"{"password":"a"}"#).await;
+        assert!(right.starts_with("HTTP/1.1 200") && right.contains(r#""token""#), "{right}");
+
+        let out = request(addr, "POST /api/auth/logout", Some(&token), "").await;
+        assert!(out.starts_with("HTTP/1.1 204"), "{out}");
+        assert!(request(addr, "GET /api/config", Some(&token), "").await.starts_with("HTTP/1.1 401"));
     }
 
     #[tokio::test]
