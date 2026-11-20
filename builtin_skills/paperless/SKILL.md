@@ -91,6 +91,14 @@ await pl.update(42, { title: "Stromrechnung März 2025", correspondent: "Stadtwe
   exactly the list of changes the user sees, and it does the same thing however long the
   approval takes. For many documents, list their ids literally (`addTags([12, 15, 31], ...)`).
   Its output ends with every request it sent that changed data; check it.
+- **Never ask for approval in text.** Do not write the script into your answer and ask the user
+  to approve it: that does nothing. Call `execute_javascript` with `writes: true`; the harness
+  itself asks the user (or parks the run until they decide). The same goes for any other
+  change: make the call, do not describe it.
+- **Only use functions that exist.** Use what `scripts/paperless.js` exports (read the file
+  if unsure, do not guess names) and the endpoints in `references/rest-api.md`. If a name is
+  not there, it does not exist. Objects are created by `update(..., { create: true })` or
+  `createObject(kind, data)`.
 - **Ask before destructive or wide changes.** Before deleting documents or objects, merging,
   reprocessing, or changing more than about 10 documents, show the user what will change (a
   count and a few examples) and wait for a yes. Deleted documents go to the trash.

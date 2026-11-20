@@ -58,7 +58,10 @@ Write it in your message as a compact table, so the user sees it with the approv
 | Betrag | none → EUR84.20 |
 | Related | none → note: #40 |
 
-Then, directly, the writing call. One or two sentences on anything uncertain.
+Then, directly, the writing call (step 4): make it with `execute_javascript` and
+`writes: true`. Do not paste the script into your message and do not ask the user to approve
+it in text; the harness asks for the approval itself when you make the call. One or two
+sentences on anything uncertain.
 
 ## 4. Write everything in ONE call with `writes: true`
 
