@@ -127,6 +127,10 @@ Load one with the `use_skill` tool: `name: "paperless"`, `file: "references/<fil
 - `references/consume.md`: what to do for a newly consumed document (usually started by a
   webhook with the document id): gather context, decide all fields, show the proposal as a
   table, write everything in one approved call.
+- `references/backfill.md`: sorting many documents that are already in Paperless, asked in
+  the chat ("sort all old documents"): one subagent proposes each document, you keep names
+  consistent, the user approves one write per wave of about 10; progress is kept in
+  `work/paperless-backfill.json`.
 - `references/recipes.md`: step-by-step playbooks: inbox triage, extracting data into custom
   fields, answering questions and reports, CSV export, cleanup of duplicates and unused objects,
   uploading, sharing.

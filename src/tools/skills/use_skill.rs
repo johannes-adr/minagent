@@ -364,7 +364,7 @@ mod tests {
             .split('`')
             .filter(|s| s.starts_with("references/") && s.ends_with(".md"))
             .collect();
-        assert_eq!(named.len(), 6, "{named:?}");
+        assert_eq!(named.len(), 7, "{named:?}");
         for file in named {
             let out = load(&dir, "paperless", Some(file));
             assert!(

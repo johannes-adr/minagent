@@ -36,6 +36,7 @@ const BUILTIN: &[(&str, &str)] = &[
     builtin!("paperless/references/search.md"),
     builtin!("paperless/references/editing.md"),
     builtin!("paperless/references/consume.md"),
+    builtin!("paperless/references/backfill.md"),
     builtin!("paperless/references/recipes.md"),
     builtin!("paperless/references/automation.md"),
     builtin!("paperless/references/rest-api.md"),
