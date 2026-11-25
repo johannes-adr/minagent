@@ -65,8 +65,9 @@ with similar names. Documents come back compact: names instead of ids, custom fi
 | `history(id)`, `stats()` | audit log of a document, archive statistics |
 | `get/post/patch/put/delete(path, ...)`, `all(path, params, {limit})` | raw API (JSON, all pages) |
 
-Also exported: `csv(rows, columns?)` (CSV text for `fs.writeText`) and `MATCHING` (matching
-algorithm numbers).
+Also exported: `csv(rows, columns?)` (CSV text for `fs.writeText`), `MATCHING` (matching
+algorithm numbers) and `similarGroups(names)` (groups of names that look alike, such as
+"Versicherung" and "Versicherungen": to merge the new names of several proposals).
 
 ```js
 // Find, then read the best hit
@@ -128,9 +129,9 @@ Load one with the `use_skill` tool: `name: "paperless"`, `file: "references/<fil
   webhook with the document id): gather context, decide all fields, show the proposal as a
   table, write everything in one approved call.
 - `references/backfill.md`: sorting many documents that are already in Paperless, asked in
-  the chat ("sort all old documents"): one subagent proposes each document, you keep names
-  consistent, the user approves one write per wave of about 10; progress is kept in
-  `work/paperless-backfill.json`.
+  the chat ("sort all old documents"): a script proposes each document in a subagent
+  (`agent()`), you keep names consistent, the user approves one write per wave of about 10;
+  progress is kept in `work/paperless-backfill.json`.
 - `references/recipes.md`: step-by-step playbooks: inbox triage, extracting data into custom
   fields, answering questions and reports, CSV export, cleanup of duplicates and unused objects,
   uploading, sharing.

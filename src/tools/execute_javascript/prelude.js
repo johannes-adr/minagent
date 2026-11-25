@@ -1,5 +1,6 @@
 // Evaluated once per run; returns a function that receives the native host functions
-// and installs the script-facing globals (`console`, `fetch`, `fs`, `runScript`). The
+// and installs the script-facing globals (`console`, `fetch`, `fs`, `runScript`, and `agent`
+// where the caller may start subagents). The
 // natives are not reachable from the script afterwards.
 (function (native) {
   const show = (value) => {
@@ -26,6 +27,13 @@
   // `args`, may `await` and `return` a value. The script cannot start processes itself.
   const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
   globalThis.runScript = (path, args = []) => new AsyncFunction("args", fs.readText(path))(args);
+
+  // Starts a subagent that sees only `prompt` and resolves to its final report (a string).
+  if (native.agent) {
+    globalThis.agent = async function agent(prompt, options = {}) {
+      return native.agent(String(options.description ?? "subagent of a script"), String(prompt));
+    };
+  }
 
   // `form` values: string, number, boolean, { file, filename?, type? } (a file in `work`)
   // or an array of those. `saveTo` writes a successful response body to a file in `work`.

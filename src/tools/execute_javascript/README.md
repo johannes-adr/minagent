@@ -22,6 +22,7 @@ give them. A fresh runtime per call has exactly these globals:
 | `fs.readText/writeText/list/exists(path)` | Files inside `work/` (a subdirectory of the harness's directory) only, never `.env*`. `readText`/`list`/`exists` also accept `skill:<name>/<path>` (files of a skill, read-only) |
 | `import ... from "skill:<name>/<path>.js"` | ES modules shipped by skills, read-only (see below) |
 | `runScript(path, args)` | Runs a script saved in `work/` in-process (an async function body that sees `args`); no process is started |
+| `agent(prompt, { description })` | Only where the caller has the `agent` tool: starts a subagent that sees only `prompt` and resolves to its final report (see below) |
 
 There is no `require`, no other `import`, no timers, and no access to processes or environment
 variables. Top-level `await` works because the script runs as an ES module.
@@ -40,6 +41,31 @@ arguments, with `runScript(path, args)`:
 fs.writeText("greet.js", "console.log('hello', args.join(' ')); return args.length;");
 await runScript("greet.js", ["a", "b"]); // prints "hello a b", resolves to 2
 ```
+
+## Subagents from scripts: `agent()`
+
+A script can loop over many items and hand each one to a subagent, so the loop is code and
+only what the script prints reaches the caller's context:
+
+```js
+for (const id of [12, 15, 31]) {
+  const report = await agent(`Propose fields for Paperless document #${id} ... one line of JSON`, { description: `#${id}` });
+  console.log(report);
+}
+```
+
+- **Who has it:** scripts of an agent that has the `agent` tool (the main agent, or a webhook
+  run that lists `agent`). A subagent's scripts don't, so subagents can't nest.
+- **Read-only:** the subagent has the caller's tools except `agent`, `ask_user` and `execute`
+  (`Toolset::for_script_agents`), and its own `execute_javascript` calls with `writes: true`
+  are refused without asking. All writes stay in the caller's one approved call.
+- **Limits:** at most 20 subagents per call, one after another (the runtime blocks in host
+  calls). Time inside `agent()` doesn't count against `timeout_seconds`; each call has its own
+  limit of 30 minutes.
+- **Stop:** dropping the tool call (stop in the UI, or a webhook run's time limit) closes a
+  channel that the interrupt handler and a running `agent()` watch, so the script and its
+  subagent end too.
+- The report is untrusted text: parse it with `try`.
 
 ## Skill modules
 
@@ -118,7 +144,7 @@ const template = fs.readText("skill:github/assets/template.md");
 - **Limits:**
   - 256 MB heap.
   - Timeout of 30 s by default, at most 300 s. It is enforced by an interrupt handler, so it
-    also stops `while (true) {}`.
+    also stops `while (true) {}`. Time spent waiting in `agent()` is not counted.
   - Each `fetch` gets only the time that remains.
   - Console output is capped at 1 MiB per stream.
 

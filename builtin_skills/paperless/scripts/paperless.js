@@ -93,6 +93,36 @@ function similarNames(name, objects, n = 5) {
     .map(([, name]) => name);
 }
 
+/**
+ * Groups `names` that may mean the same thing: equal apart from case, accents and
+ * punctuation, one containing the other ("Telekom", "Telekom Deutschland GmbH"), or a few
+ * letters apart ("Versicherung", "Versicherungen"). Returns only groups with more than one
+ * spelling, as arrays of the given names; whether they really are the same is your decision
+ * (synonyms such as "Auto" and "KFZ" are not found).
+ */
+export function similarGroups(names) {
+  const unique = [...new Set(names.map((n) => String(n).trim()).filter(Boolean))];
+  const folded = unique.map(fold);
+  const parent = unique.map((_, i) => i);
+  const root = (i) => (parent[i] === i ? i : (parent[i] = root(parent[i])));
+  const numbers = (s) => (s.match(/\d+/g) ?? []).join(" ");
+  const alike = (a, b) => {
+    if (a === b) return true;
+    if (numbers(a) !== numbers(b)) return false; // "Steuer 2024", "Steuer 2025"
+    const shorter = Math.min(a.length, b.length);
+    if (shorter >= 4 && (a.includes(b) || b.includes(a))) return true;
+    return distance(a, b) <= Math.max(1, Math.floor(shorter / 4));
+  };
+  for (let i = 0; i < unique.length; i++) {
+    for (let j = i + 1; j < unique.length; j++) {
+      if (alike(folded[i], folded[j])) parent[root(j)] = root(i);
+    }
+  }
+  const groups = new Map();
+  unique.forEach((name, i) => groups.set(root(i), [...(groups.get(root(i)) ?? []), name]));
+  return [...groups.values()].filter((g) => g.length > 1);
+}
+
 function stripHighlights(html) {
   if (!html) return undefined;
   return html
