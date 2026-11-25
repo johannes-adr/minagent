@@ -10,6 +10,7 @@
   let saved = $state(false);
   let secret = $state(null); // {name, token}: shown once
   let copied = $state(false);
+  let note = $state(""); // a hint above the form, for a built-in workflow
 
   const hooks = $derived(info?.hooks ?? []);
 
@@ -19,10 +20,18 @@
   onMount(load);
 
   function pick(hook) {
-    selected = hook.name; form = api.toForm(hook); error = ""; saved = false; secret = null;
+    selected = hook.name; form = api.toForm(hook); error = ""; saved = false; secret = null; note = "";
+  }
+  const builtin = $derived(info?.builtin ?? []);
+  // The hook made from a built-in workflow, or the form to make it.
+  function pickBuiltin(workflow) {
+    const hook = hooks.find((h) => h.name === workflow.name);
+    if (hook) return pick(hook);
+    selected = null; form = api.fromBuiltin(workflow); error = ""; saved = false; secret = null;
+    note = workflow.hosts?.length ? "" : "No host yet: set AGENT_SECRET_" + workflow.hosts_from_secret.toUpperCase() + " on the settings page, or enter the host below.";
   }
   function create() {
-    selected = null; form = api.blank(); error = ""; saved = false; secret = null;
+    selected = null; form = api.blank(); error = ""; saved = false; secret = null; note = "";
   }
 
   async function save() {
@@ -46,7 +55,7 @@
 
   async function remove() {
     if (!confirm(`Delete the hook ${form.name}?`)) return;
-    try { await api.remove(form.name); form = null; selected = null; secret = null; await load(); } catch (e) { error = e.message; }
+    try { await api.remove(form.name); form = null; selected = null; secret = null; note = ""; await load(); } catch (e) { error = e.message; }
   }
 
   function toggleTool(name, on) {
@@ -86,6 +95,19 @@
         <li class="empty">No hooks yet.</li>
       {/each}
     </ul>
+    {#if builtin.length}
+      <h2>Built in</h2>
+      <ul class="builtin">
+        {#each builtin as workflow (workflow.id)}
+          <li class:current={form && form.name === workflow.name}>
+            <button onclick={() => pickBuiltin(workflow)} title={workflow.description}>
+              <span class="name">{workflow.title}</span>
+              {#if hooks.some((h) => h.name === workflow.name)}<span class="have">added</span>{/if}
+            </button>
+          </li>
+        {/each}
+      </ul>
+    {/if}
     <p class="help">
       A hook lets an outside service start the agent with <code>POST /hooks/&lt;name&gt;</code>. Each run is a
       session of its own, one after the other. Nobody can answer questions during a run, so whatever would ask
@@ -105,6 +127,7 @@
         </div>
       {/if}
       {#if error}<div class="error">{error}</div>{/if}
+      {#if note}<div class="note">{note}</div>{/if}
 
       <div class="form">
         <label class="row">
@@ -201,6 +224,10 @@
   .queue { color: var(--muted); font-size: 12px; }
   .body { flex: 1; min-height: 0; display: flex; }
   aside { width: min(300px, 38vw); display: flex; flex-direction: column; border-right: 1px solid var(--border); background: var(--surface); min-height: 0; }
+  h2 { margin: 8px 14px 0; font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .builtin { flex: none; }
+  .have { margin-left: auto; color: var(--muted); font-size: 12px; }
+  .note { margin-bottom: 12px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; color: var(--muted); font-size: 13px; }
   .bar { padding: 10px 12px; border-bottom: 1px solid var(--border); }
   ul { list-style: none; margin: 0; padding: 4px; flex: 1; overflow-y: auto; }
   li button { width: 100%; display: flex; align-items: center; gap: 8px; padding: 6px 10px; border: 0; border-radius: 8px; background: none; color: var(--text); text-align: left; }

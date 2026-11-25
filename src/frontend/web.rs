@@ -889,6 +889,7 @@ async fn hooks_list(State(web): State<Arc<Web>>) -> Json<Value> {
         "skills": Web::skills_event(&web.inner.lock().unwrap())["available"].clone(),
         "queued": web.jobs.lock().unwrap().len(),
         "max_queue": hooks::MAX_QUEUE,
+        "builtin": hooks::builtin(),
     }))
 }
 
