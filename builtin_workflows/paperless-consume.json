@@ -1,0 +1,12 @@
+{
+  "id": "paperless-consume",
+  "title": "Paperless: sort a new document",
+  "description": "Paperless-ngx calls this when it has consumed a document. The agent proposes title, correspondent, type, tags, date and fields, and writes them after you approved the one writing call on the approvals page.",
+  "name": "paperless-consume",
+  "template": "A document was added to Paperless-ngx. The webhook sent: {{payload}}\n\nLoad the skill paperless (use_skill) and follow its references/consume.md for this document.",
+  "tools": ["execute_javascript", "use_skill", "view_image"],
+  "skills": ["paperless"],
+  "writes": "approve",
+  "timeout_minutes": 15,
+  "hosts_from_secret": "paperless"
+}

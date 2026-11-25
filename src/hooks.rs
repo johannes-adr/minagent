@@ -23,6 +23,43 @@ const MAX_PAYLOAD: usize = 50_000;
 const MAX_TEMPLATE: usize = 20_000;
 const DEFAULT_TIMEOUT_MINUTES: u64 = 10;
 
+/// Workflows that ship with the program: hooks the page offers to create (`builtin_workflows/`).
+const BUILTIN: &[&str] = &[include_str!("../builtin_workflows/paperless-consume.json")];
+
+/// The built-in workflows as the hooks page fills its form with them: the fields of a hook
+/// plus `id`, `title` and `description`. Tools this build does not have are left out, and
+/// `hosts_from_secret` becomes the host the named secret is bound to (if one is configured).
+pub fn builtin() -> Vec<Value> {
+    let known = harness::tool_names();
+    BUILTIN
+        .iter()
+        .filter_map(|text| serde_json::from_str::<Value>(text).ok())
+        .map(|mut workflow| {
+            let tools: Vec<Value> = workflow["tools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|t| t.as_str().is_some_and(|t| known.contains(&t)))
+                .cloned()
+                .collect();
+            workflow["tools"] = Value::Array(tools);
+            let host = workflow["hosts_from_secret"].as_str().and_then(secret_host);
+            workflow["hosts"] = json!(host.into_iter().collect::<Vec<_>>());
+            workflow
+        })
+        .collect()
+}
+
+#[cfg(feature = "javascript")]
+fn secret_host(name: &str) -> Option<String> {
+    crate::tools::execute_javascript::secret_host(name)
+}
+
+#[cfg(not(feature = "javascript"))]
+fn secret_host(_: &str) -> Option<String> {
+    None
+}
+
 /// The hooks file next to the settings file.
 pub fn path_for(config: &Path) -> PathBuf {
     config.with_file_name(FILE)
@@ -448,6 +485,21 @@ pub fn render(template: &str, request: &Request) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_builtin_workflow_is_a_valid_hook() {
+        let all = builtin();
+        assert!(!all.is_empty());
+        for workflow in all {
+            let name = workflow["name"].as_str().unwrap();
+            let fields = Fields::parse(&workflow, false)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(fields.name.as_deref(), Some(name));
+            assert!(workflow["title"].is_string() && workflow["description"].is_string());
+            // Nothing runs without the user's approval unless the definition says so.
+            assert_eq!(fields.writes, Writes::Approve);
+        }
+    }
 
     fn temp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("agent_hooks_{}_{name}", std::process::id()));

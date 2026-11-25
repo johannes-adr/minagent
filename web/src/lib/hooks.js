@@ -48,3 +48,15 @@ export const toBody = (form) => ({
   ...form,
   hosts: form.hosts.split(/[\n,]/).map((h) => h.trim()).filter(Boolean),
 });
+
+/** The form for a built-in workflow that has no hook yet: review it, then save. */
+export const fromBuiltin = (workflow) => ({
+  ...blank(),
+  name: workflow.name,
+  template: workflow.template,
+  tools: [...workflow.tools],
+  skills: [...workflow.skills],
+  hosts: (workflow.hosts ?? []).join("\n"),
+  writes: workflow.writes,
+  timeout_minutes: workflow.timeout_minutes,
+});

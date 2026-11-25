@@ -55,6 +55,13 @@ fn settings() -> Arc<Settings> {
     SETTINGS.read().unwrap().clone().unwrap_or_default()
 }
 
+/// The host the configured secret `name` (case does not matter) is bound to.
+pub fn secret_host(name: &str) -> Option<String> {
+    let settings = settings();
+    let secret = settings.secrets.iter().find(|(key, _)| key.eq_ignore_ascii_case(name))?;
+    Some(secret.1.host.clone())
+}
+
 /// The output for a call that declares a host the run doesn't allow (a webhook run's own
 /// settings; the configured ones ask the user instead).
 fn refuse_hosts(hosts: &[String], settings: &Settings) -> Option<String> {
