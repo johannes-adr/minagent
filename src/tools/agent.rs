@@ -13,6 +13,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Added to the system prompt of every subagent.
 const SUBAGENT_NOTE: &str = "\n\n# Subagent\n\nYou are a subagent. Complete the task autonomously and end with a concise final report of what you found or did; the report is all the caller sees. You cannot start further subagents (there is no `agent` tool for you) and you cannot ask the caller questions.";
 
+/// Added for the subagents a script starts with `agent()`.
+#[cfg(feature = "javascript")]
+const SCRIPT_NOTE: &str = "\n\nA script started you with `agent()`: your final report is returned to that script as a string, so write it exactly in the format the task asks for (nothing before or after it). You can't change data: calls of `execute_javascript` with `writes: true` are refused, and there is no shell.";
+
 const DESCRIPTION: &str = "Delegate a self-contained task to a subagent that works in its own fresh context and returns only its final report. The subagent has the same tools as you (`execute`, `use_skill`) but does not see this conversation; the call blocks until it is done.
 
 Use it for large searches or exploration, reading many files or long logs, and independent sub-tasks whose details you do not need afterwards. This keeps your own context small.
@@ -62,6 +66,43 @@ impl Subagent {
             preamble: format!("{preamble}{SUBAGENT_NOTE}"),
             frontend,
             enabled,
+        }
+    }
+
+    /// The subagents of `agent()` in scripts: read-only and without a shell (see
+    /// [`Toolset::for_script_agents`]).
+    #[cfg(feature = "javascript")]
+    pub(crate) fn for_scripts(
+        model: DynModel<Completion>,
+        preamble: &str,
+        frontend: Arc<dyn Frontend>,
+        enabled: &Toolset,
+    ) -> Self {
+        let mut agent = Self::new(model, preamble, frontend, enabled.for_script_agents());
+        agent.preamble.push_str(SCRIPT_NOTE);
+        agent
+    }
+
+    /// Runs a subagent and returns its report, or a sentence saying why there is none. The
+    /// frontend sees it start and finish.
+    async fn report(&self, description: String, prompt: String) -> String {
+        let id = new_id();
+        self.frontend.emit(Event::SubagentStarted {
+            agent: id.clone(),
+            description,
+            prompt: prompt.clone(),
+        });
+        let result = self.run(&id, &prompt).await;
+        self.frontend.emit(Event::SubagentFinished {
+            agent: id,
+            failed: result.is_err(),
+        });
+        match result {
+            Ok(text) if text.trim().is_empty() => {
+                "The subagent finished without writing a report.".to_string()
+            }
+            Ok(text) => text,
+            Err(error) => format!("The subagent failed: {error}"),
         }
     }
 
@@ -121,24 +162,18 @@ impl Tool for Subagent {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<String, Infallible> {
-        let id = new_id();
-        self.frontend.emit(Event::SubagentStarted {
-            agent: id.clone(),
-            description: args.description.clone(),
-            prompt: args.prompt.clone(),
-        });
-        let result = self.run(&id, &args.prompt).await;
-        self.frontend.emit(Event::SubagentFinished {
-            agent: id,
-            failed: result.is_err(),
-        });
-        Ok(match result {
-            Ok(text) if text.trim().is_empty() => {
-                "The subagent finished without writing a report.".to_string()
-            }
-            Ok(text) => text,
-            Err(error) => format!("The subagent failed: {error}"),
-        })
+        Ok(self.report(args.description, args.prompt).await)
+    }
+}
+
+#[cfg(feature = "javascript")]
+impl crate::tools::execute_javascript::ScriptAgent for Subagent {
+    fn report<'a>(
+        &'a self,
+        description: String,
+        prompt: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + 'a>> {
+        Box::pin(Subagent::report(self, description, prompt))
     }
 }
 
@@ -219,6 +254,48 @@ mod tests {
         // No scripted turn: the subagent's model call fails.
         let out = call_with(vec![]).await;
         assert!(out.starts_with("The subagent failed:"), "{out}");
+    }
+
+    /// A script of the main agent loops over items with `agent()`: each item gets a fresh,
+    /// read-only subagent (no `agent`, no shell, its writing call is refused without asking),
+    /// and only what the script prints reaches the main agent.
+    #[cfg(feature = "javascript")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_script_loops_over_read_only_subagents() {
+        use rig_core::serde_json::json;
+        let code = r#"for (const p of ["first item", "second item"]) console.log("got", await agent(p))"#;
+        let write = json!({"code": "console.log(1)", "hosts": ["paperless.example"], "writes": true});
+        let model = MockCompletionModel::from_stream_turns([
+            turn(MockStreamEvent::tool_call("t1", "execute_javascript", json!({"code": code}))),
+            turn(MockStreamEvent::tool_call("s1", "execute_javascript", write)),
+            turn(MockStreamEvent::text("report one")),
+            turn(MockStreamEvent::text("report two")),
+            turn(MockStreamEvent::text("done")),
+        ]);
+        let recorded = model.clone();
+        let mut session = Session::new(model.into(), "BASE", Arc::new(Silent));
+        session.prompt("sort them".into()).await.expect("run must succeed");
+
+        let requests = recorded.requests();
+        assert_eq!(requests.len(), 5);
+        let sub_tools = tool_names(&requests[1]);
+        assert!(sub_tools.contains(&"execute_javascript".to_string()), "{sub_tools:?}");
+        for name in ["agent", "execute", "ask_user"] {
+            assert!(!sub_tools.contains(&name.to_string()), "{sub_tools:?}");
+        }
+        let first = format!("{:?}", requests[1].chat_history);
+        assert!(first.contains("first item") && !first.contains("sort them"), "{first}");
+        assert!(first.contains("A script started you"), "{first}");
+        // The subagent's writing call was refused, and it went on.
+        let refused = format!("{:?}", requests[2].chat_history);
+        assert!(refused.contains("this agent may not change data"), "{refused}");
+        // The second item starts fresh, too.
+        let second = format!("{:?}", requests[3].chat_history);
+        assert!(second.contains("second item") && !second.contains("first item"), "{second}");
+        // The main agent sees the script's output, not the subagents' conversations.
+        let main = format!("{:?}", requests[4].chat_history);
+        assert!(main.contains("got report one") && main.contains("got report two"), "{main}");
+        assert!(!main.contains("may not change data"), "{main}");
     }
 
     fn serde_args(description: &str, prompt: &str) -> rig_core::serde_json::Value {

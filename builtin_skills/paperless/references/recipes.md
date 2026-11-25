@@ -7,6 +7,8 @@ Calls that only read run as they are; every step that changes data goes into one
 
 ## Inbox triage (classify new documents)
 
+For more than about 20 documents, follow `references/backfill.md` instead.
+
 1. Overview: `const v = await pl.vocabulary();` and `await pl.find({ inbox: true }, { limit: 50 })`.
    Keep the vocabulary in mind (or save it to `work/paperless-vocabulary.json`).
 2. For each document (or a batch of 5-10 per call): `await pl.doc(id, { content: 3000 })`,

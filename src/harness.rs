@@ -101,6 +101,9 @@ pub struct Toolset {
     skills: SkillFilter,
     #[cfg(feature = "javascript")]
     js: Option<Arc<crate::tools::execute_javascript::Settings>>,
+    /// `execute_javascript` refuses calls that change data (the subagents of `agent()`).
+    #[cfg(feature = "javascript")]
+    js_read_only: bool,
 }
 
 // Not derived: the JavaScript settings hold secrets.
@@ -143,6 +146,22 @@ impl Toolset {
     pub fn with_js(mut self, settings: crate::tools::execute_javascript::Settings) -> Self {
         self.js = Some(Arc::new(settings));
         self
+    }
+
+    /// The tools of a subagent that a script starts with `agent()`: the same, but without
+    /// `agent`, `ask_user` and the shell, and scripts that can't change data.
+    #[cfg(feature = "javascript")]
+    pub fn for_script_agents(&self) -> Self {
+        let names = self
+            .names()
+            .into_iter()
+            .filter(|n| ![Subagent::NAME, AskUser::NAME, Execute::NAME].contains(&n.as_str()))
+            .collect();
+        Self {
+            names: Some(Arc::new(names)),
+            js_read_only: true,
+            ..self.clone()
+        }
     }
 
     pub fn allows(&self, name: &str) -> bool {
@@ -258,10 +277,23 @@ impl Tools {
 }
 
 /// The tools every agent (main agent and subagents) has. Add new tools here.
-fn tools(
+fn tools(model: &DynModel<Completion>, preamble: &str, enabled: &Toolset) -> Tools {
+    tools_for(model, preamble, enabled, None)
+}
+
+/// What starts the subagents of `agent()` in scripts.
+#[cfg(feature = "javascript")]
+type ScriptAgent = Arc<dyn crate::tools::execute_javascript::ScriptAgent>;
+#[cfg(not(feature = "javascript"))]
+type ScriptAgent = std::convert::Infallible;
+
+/// Like [`tools`]; `script_agent` gives `execute_javascript` scripts `agent()` (only the main
+/// agent's scripts have it).
+fn tools_for(
     model: &DynModel<Completion>,
     preamble: &str,
     enabled: &Toolset,
+    script_agent: Option<ScriptAgent>,
 ) -> Tools {
     let tools = Tools {
         builder: AgentBuilder::new(model.clone()),
@@ -273,7 +305,13 @@ fn tools(
     .add(Execute)
     .add(UseSkill::new(enabled.skills.clone()));
     #[cfg(feature = "javascript")]
-    let tools = tools.add(ExecuteJavascript::new(enabled.js.clone(), enabled.skills.clone()));
+    let tools = tools.add(
+        ExecuteJavascript::new(enabled.js.clone(), enabled.skills.clone())
+            .with_agent(script_agent)
+            .read_only(enabled.js_read_only),
+    );
+    #[cfg(not(feature = "javascript"))]
+    let _ = script_agent;
     #[cfg(feature = "image")]
     let tools = tools.add(ViewImage);
     tools
@@ -286,15 +324,22 @@ pub fn main_agent(
     frontend: Arc<dyn Frontend>,
     enabled: &Toolset,
 ) -> Agent {
-    tools(&model, preamble, enabled)
-        .add(Subagent::new(
-            model.clone(),
-            preamble,
-            frontend.clone(),
-            enabled.clone(),
-        ))
-        .add(AskUser::new(frontend.clone()))
-        .build(frontend, MAX_TURNS)
+    // Scripts get `agent()` where the agent may start subagents anyway.
+    #[cfg(feature = "javascript")]
+    let script_agent = enabled.allows(Subagent::NAME).then(|| {
+        Arc::new(Subagent::for_scripts(model.clone(), preamble, frontend.clone(), enabled)) as ScriptAgent
+    });
+    #[cfg(not(feature = "javascript"))]
+    let script_agent = None;
+    tools_for(&model, preamble, enabled, script_agent)
+    .add(Subagent::new(
+        model.clone(),
+        preamble,
+        frontend.clone(),
+        enabled.clone(),
+    ))
+    .add(AskUser::new(frontend.clone()))
+    .build(frontend, MAX_TURNS)
 }
 
 /// A subagent: the same tools without `agent`, so subagents can't nest.

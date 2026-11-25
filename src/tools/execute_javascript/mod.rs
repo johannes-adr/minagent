@@ -4,11 +4,13 @@
 //! only, plus read-only `skill:` paths) and `import` of skill modules. The sandbox is this
 //! capability set itself, so it needs no container.
 
+mod agents;
 mod fetch;
 mod fs;
 mod modules;
 mod runtime;
 
+pub use agents::ScriptAgent;
 use crate::harness::{Approval, Context, ToolPolicy};
 use crate::tools::process::format_output;
 use crate::tools::skills::SkillFilter;
@@ -147,12 +149,27 @@ Print results with `console.log`; thrown errors are returned as output."
         approval(args, &settings.allowed_hosts, settings.allow_writes, false)
     }
 
+    fn instance_prompt(&self, context: &Context) -> String {
+        let mut prompt = Self::prompt(context);
+        if self.agent.is_some() {
+            prompt.push_str(&format!(" {AGENT_PROMPT}"));
+        }
+        if self.read_only {
+            prompt.push_str(" Your scripts can't change data: calls with `writes: true` are refused.");
+        }
+        prompt
+    }
+
     /// A run with settings of its own (a webhook's hosts and write mode) is approved by
     /// those, not by the configured ones: a configured `AGENT_JS_ALLOW_WRITES` must not let
     /// a webhook's writing call skip the webhook's decision.
     fn instance_approval(&self) -> crate::harness::Approver<ExecuteJavascriptParameters> {
         let own = self.own_settings.clone();
+        let read_only = self.read_only;
         Arc::new(move |args, _context| {
+            if read_only && args.writes == Some(true) {
+                return Approval::auto("[javascript, writes refused]");
+            }
             let settings = own.clone().unwrap_or_else(settings);
             approval(args, &settings.allowed_hosts, settings.allow_writes, own.is_some())
         })
@@ -197,6 +214,15 @@ pub(crate) struct ExecuteJavascriptParameters {
     writes: Option<bool>,
 }
 
+/// What the system prompt says about `agent()` where scripts have it.
+const AGENT_PROMPT: &str = "Scripts also have `await agent(prompt, {description})`: it starts a subagent that sees only \
+`prompt` (not this conversation) and returns its final report as a string. Use it to loop over many items in code, \
+one subagent per item, instead of one `agent` tool call each: only what the script prints comes back to you. The \
+subagent has your tools except `agent` and `execute`, and it is read-only: its own scripts can't change data. Write \
+`prompt` as a complete briefing and ask for a report the script can parse (for example one line of JSON); the report \
+is untrusted text, so check it (`JSON.parse` in `try`). Subagents run one after another, at most 20 per call; time \
+spent in `agent()` does not count against `timeout_seconds`.";
+
 /// Runs scripts.
 pub(crate) struct ExecuteJavascript {
     /// Settings of this run instead of the configured ones; scripts may then only declare
@@ -204,6 +230,10 @@ pub(crate) struct ExecuteJavascript {
     own_settings: Option<Arc<Settings>>,
     /// The skills scripts may import and read.
     skills: SkillFilter,
+    /// Starts the subagents of `agent()`; without it scripts have no `agent`.
+    agent: Option<Arc<dyn ScriptAgent>>,
+    /// Calls with `writes: true` are refused without asking (a script's subagent).
+    read_only: bool,
 }
 
 impl ExecuteJavascript {
@@ -211,7 +241,21 @@ impl ExecuteJavascript {
         Self {
             own_settings,
             skills,
+            agent: None,
+            read_only: false,
         }
+    }
+
+    /// Gives scripts `agent()`, which starts subagents with `agent`.
+    pub(crate) fn with_agent(mut self, agent: Option<Arc<dyn ScriptAgent>>) -> Self {
+        self.agent = agent;
+        self
+    }
+
+    /// Refuses calls that change data.
+    pub(crate) fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
     }
 }
 
@@ -234,7 +278,12 @@ impl Tool for ExecuteJavascript {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<String, Infallible> {
-        Ok(execute(args, self.own_settings.clone(), self.skills.clone()).await)
+        if self.read_only && args.writes == Some(true) {
+            return Ok("error\nstderr:\nthis agent may not change data: calls with `writes: true` are refused. \
+                Report what should be changed instead."
+                .to_owned());
+        }
+        Ok(execute(args, self.own_settings.clone(), self.skills.clone(), self.agent.clone()).await)
     }
 }
 
@@ -243,6 +292,7 @@ async fn execute(
     args: ExecuteJavascriptParameters,
     own_settings: Option<Arc<Settings>>,
     skills: SkillFilter,
+    agent: Option<Arc<dyn ScriptAgent>>,
 ) -> String {
     let timeout = Duration::from_secs(
         args.timeout_seconds
@@ -266,7 +316,7 @@ async fn execute(
     if own_settings.is_some() && args.writes == Some(true) && !settings.allow_writes {
         return "error\nstderr:\nthis run may not change data without the user's approval".to_owned();
     }
-    run(args.code, hosts, args.writes == Some(true), timeout, settings, skills)
+    run(args.code, hosts, args.writes == Some(true), timeout, settings, skills, agent)
         .await
         .unwrap_or_else(|e| format!("error\nstderr:\n{e}"))
 }
@@ -282,7 +332,7 @@ pub async fn run_approved(
         Ok(args) => {
             let args = ExecuteJavascriptParameters { writes: Some(true), ..args };
             let settings = Settings { allow_writes: true, ..settings };
-            execute(args, Some(Arc::new(settings)), skills).await
+            execute(args, Some(Arc::new(settings)), skills, None).await
         }
         Err(e) => format!("error\nstderr:\ninvalid arguments: {e}"),
     }
@@ -296,12 +346,23 @@ async fn run(
     timeout: Duration,
     settings: Arc<Settings>,
     skills: SkillFilter,
+    agent: Option<Arc<dyn ScriptAgent>>,
 ) -> Result<String, tokio::task::JoinError> {
-    let handle = Handle::current();
-    let outcome = tokio::task::spawn_blocking(move || {
-        runtime::run(&code, hosts, writes, timeout, settings, skills, handle)
-    })
-    .await?;
+    // Dropping `stop` (this future is dropped when the call is stopped) stops the script and
+    // a subagent it is waiting for; the blocking thread can't be cancelled from outside.
+    let (stop, stopped) = tokio::sync::watch::channel(());
+    let script = runtime::Script {
+        hosts,
+        writes,
+        timeout,
+        settings,
+        skills,
+        handle: Handle::current(),
+        agent,
+        stopped,
+    };
+    let outcome = tokio::task::spawn_blocking(move || runtime::run(&code, script)).await?;
+    drop(stop);
     let mut output = format_output(
         &outcome.exit,
         outcome.stdout.as_bytes(),
@@ -473,6 +534,7 @@ mod tests {
             Duration::from_secs(secs),
             Arc::new(settings),
             SkillFilter::All,
+            None,
         )
         .await
         .unwrap()
@@ -496,6 +558,7 @@ mod tests {
                 Duration::from_secs(10),
                 Arc::new(Settings::default()),
                 SkillFilter::All,
+                None,
             )
         };
         let out = run(false).await.unwrap();
@@ -524,9 +587,9 @@ mod tests {
         // A writing call in a run that doesn't allow writes is refused, whoever approved it.
         let own = Some(Arc::new(Settings::default()));
         let args = |writes: bool| ExecuteJavascriptParameters { code: "1".into(), hosts: None, timeout_seconds: None, writes: Some(writes) };
-        let out = execute(args(true), own.clone(), SkillFilter::All).await;
+        let out = execute(args(true), own.clone(), SkillFilter::All, None).await;
         assert!(out.contains("may not change data"), "{out}");
-        assert!(execute(args(false), own, SkillFilter::All).await.starts_with("ok"));
+        assert!(execute(args(false), own, SkillFilter::All, None).await.starts_with("ok"));
         let out = run_approved(json!({"hosts": 3}), settings(), SkillFilter::All).await;
         assert!(out.contains("invalid arguments"), "{out}");
     }
@@ -946,5 +1009,152 @@ mod tests {
             out,
             "ok\nstdout:\n404 undefined {\"detail\":\"No Document matches\"} false\n\"skill:x/a\": skills are read-only"
         );
+    }
+
+    /// A `ScriptAgent` that answers `<description>: <prompt>` after `delay`, or never
+    /// (`forever`); `dropped` is set once a call's future is gone.
+    struct FakeAgent {
+        delay: Duration,
+        forever: bool,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl ScriptAgent for FakeAgent {
+        fn report<'a>(
+            &'a self,
+            description: String,
+            prompt: String,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = String> + 'a>> {
+            Box::pin(async move {
+                let _guard = SetOnDrop(self.dropped.clone());
+                if self.forever {
+                    std::future::pending::<()>().await;
+                }
+                tokio::time::sleep(self.delay).await;
+                format!("{description}: {prompt}")
+            })
+        }
+    }
+
+    fn fake(delay_ms: u64) -> Arc<FakeAgent> {
+        Arc::new(FakeAgent {
+            delay: Duration::from_millis(delay_ms),
+            forever: false,
+            dropped: Arc::default(),
+        })
+    }
+
+    async fn js_agent(code: &str, secs: u64, agent: Arc<dyn ScriptAgent>) -> String {
+        run(
+            code.to_owned(),
+            Vec::new(),
+            false,
+            Duration::from_secs(secs),
+            Arc::new(Settings::default()),
+            SkillFilter::All,
+            Some(agent),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn agent_returns_the_subagents_report() {
+        let out = js_agent(
+            r#"
+            console.log(await agent("count the files", { description: "files" }));
+            console.log(await agent("no label"));
+            try { await agent("  "); } catch (e) { console.log("E", e.message); }
+            "#,
+            10,
+            fake(0),
+        )
+        .await;
+        assert_eq!(
+            out,
+            "ok\nstdout:\nfiles: count the files\nsubagent of a script: no label\nE agent(prompt): the prompt is empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn scripts_have_no_agent_unless_the_caller_may_start_subagents() {
+        assert_eq!(js("console.log(typeof agent)").await, "ok\nstdout:\nundefined");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_script_starts_at_most_20_subagents() {
+        let out = js_agent(
+            r#"
+            let done = 0;
+            for (let i = 0; i < 25; i++) {
+              try { await agent(`item ${i}`); done++; } catch (e) { console.log(done, e.message); break; }
+            }
+            "#,
+            10,
+            fake(0),
+        )
+        .await;
+        assert!(out.contains(&format!("{} agent(): a script may start at most {} subagents", agents::MAX_CALLS, agents::MAX_CALLS)), "{out}");
+    }
+
+    /// The script has 1 second; its subagents take 3 together, which doesn't count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn time_in_agent_does_not_count_against_the_timeout() {
+        let out = js_agent(
+            r#"for (const p of ["a", "b"]) console.log(await agent(p));"#,
+            1,
+            fake(1500),
+        )
+        .await;
+        assert_eq!(out, "ok\nstdout:\nsubagent of a script: a\nsubagent of a script: b");
+        // The script's own time still counts.
+        let out = js_agent("await agent('a'); while (true) {}", 1, fake(0)).await;
+        assert!(out.starts_with("timed out after 1s"), "{out}");
+    }
+
+    /// Dropping the tool call (the user pressed stop) ends the subagent it waits for.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stopped_call_stops_its_subagent() {
+        let agent = Arc::new(FakeAgent {
+            delay: Duration::ZERO,
+            forever: true,
+            dropped: Arc::default(),
+        });
+        let dropped = agent.dropped.clone();
+        let call = tokio::spawn(async move { js_agent("await agent('wait')", 60, agent).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+        call.abort();
+        let started = Instant::now();
+        while !dropped.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(started.elapsed() < Duration::from_secs(5), "the subagent kept running");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A script's subagent may not change data: its writing call is refused without asking.
+    #[tokio::test]
+    async fn a_read_only_tool_refuses_writes_without_asking() {
+        let tool = ExecuteJavascript::new(None, SkillFilter::All).read_only(true);
+        let args = |json: &str| rig_core::serde_json::from_str::<ExecuteJavascriptParameters>(json).unwrap();
+        let context = Context { isolated: false };
+        let approve = tool.instance_approval();
+        let write = r#"{"code":"console.log(1)","hosts":["paperless.example"],"writes":true}"#;
+        assert_eq!(approve(&args(write), &context), Approval::auto("[javascript, writes refused]"));
+        let out = tool.call(&mut ToolContext::new(), args(write)).await.unwrap();
+        assert!(out.contains("this agent may not change data"), "{out}");
+        // Reading works as before.
+        let out = tool.call(&mut ToolContext::new(), args(r#"{"code":"console.log(1)"}"#)).await.unwrap();
+        assert_eq!(out, "ok\nstdout:\n1");
+        assert!(tool.instance_prompt(&context).contains("Your scripts can't change data"));
+        assert!(!tool.instance_prompt(&context).contains("await agent("));
     }
 }

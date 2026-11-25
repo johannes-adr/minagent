@@ -7,6 +7,7 @@
 
 use super::modules::{SkillLoader, SkillResolver, skills_root};
 use crate::tools::skills::SkillFilter;
+use super::agents::{Agents, Deadline, ScriptAgent, Stopped, is_stopped};
 use super::{Settings, fetch::Fetch, fs};
 use rquickjs::{
     CatchResultExt, CaughtError, Context, Ctx, Error, Exception, Function, Module, Object, Result,
@@ -15,7 +16,7 @@ use rquickjs::{
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::runtime::Handle;
 
 /// Heap limit of the script; allocating more fails with an out-of-memory error.
@@ -54,37 +55,54 @@ impl Output {
     }
 }
 
-/// Runs `code` as an ES module (so top-level `await` works) in a fresh runtime. `hosts`
-/// are the hostnames `fetch` may contact, and `writes` whether it may change data there. Blocks until the script is done or `timeout`
-/// has passed; call it from a blocking thread inside a tokio runtime (`handle`).
-pub(super) fn run(
-    code: &str,
-    hosts: Vec<String>,
-    writes: bool,
-    timeout: Duration,
-    settings: Arc<Settings>,
-    skills: SkillFilter,
-    handle: Handle,
-) -> Outcome {
-    let deadline = Instant::now() + timeout;
+/// What a script may do besides computing: `hosts` are the hostnames `fetch` may contact,
+/// `writes` whether it may change data there, and `agent` starts subagents for `agent()`.
+pub(super) struct Script {
+    pub hosts: Vec<String>,
+    pub writes: bool,
+    pub timeout: Duration,
+    pub settings: Arc<Settings>,
+    pub skills: SkillFilter,
+    pub handle: Handle,
+    pub agent: Option<Arc<dyn ScriptAgent>>,
+    /// Closed when the tool call is gone: the script and its subagent stop.
+    pub stopped: Stopped,
+}
+
+/// Runs `code` as an ES module (so top-level `await` works) in a fresh runtime. Blocks until
+/// the script is done or its time has passed (time in `agent()` does not count); call it
+/// from a blocking thread inside a tokio runtime (`script.handle`).
+pub(super) fn run(code: &str, script: Script) -> Outcome {
+    let deadline = Deadline::after(script.timeout);
     let output = Rc::new(RefCell::new(Output::default()));
     let sent = Rc::new(RefCell::new(Vec::new()));
+    let agents = script.agent.map(|agent| Agents {
+        agent,
+        handle: script.handle.clone(),
+        deadline: deadline.clone(),
+        stopped: script.stopped.clone(),
+        calls: Default::default(),
+    });
     let fetch = Fetch {
-        hosts,
-        writes,
-        settings,
-        deadline,
-        handle,
+        hosts: script.hosts,
+        writes: script.writes,
+        settings: script.settings,
+        deadline: deadline.clone(),
+        handle: script.handle,
         sent: sent.clone(),
     };
-    let result = super::modules::with_filter(skills, || evaluate(code, deadline, fetch, &output));
+    let stopped = script.stopped;
+    let result = super::modules::with_filter(script.skills, || {
+        evaluate(code, &deadline, &stopped, fetch, agents, &output)
+    });
     let mut output = output.take();
     let exit = match result {
         Ok(()) => "ok".to_owned(),
-        Err(_) if Instant::now() >= deadline => format!(
+        Err(_) if deadline.passed() => format!(
             "timed out after {}s (raise timeout_seconds if it needs more time). Output so far:",
-            timeout.as_secs()
+            script.timeout.as_secs()
         ),
+        Err(_) if is_stopped(&stopped) => "stopped".to_owned(),
         Err(message) => {
             output.push("error", &format!("Uncaught {message}"));
             "error".to_owned()
@@ -101,8 +119,10 @@ pub(super) fn run(
 /// Runs the script; the error is the exception's message and stack.
 fn evaluate(
     code: &str,
-    deadline: Instant,
+    deadline: &Deadline,
+    stopped: &Stopped,
     fetch: Fetch,
+    agents: Option<Agents>,
     output: &Rc<RefCell<Output>>,
 ) -> std::result::Result<(), String> {
     let runtime = Runtime::new().map_err(|e| e.to_string())?;
@@ -113,10 +133,11 @@ fn evaluate(
         },
     );
     runtime.set_memory_limit(MEMORY_LIMIT);
-    runtime.set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)));
+    let (deadline, stopped) = (deadline.clone(), stopped.clone());
+    runtime.set_interrupt_handler(Some(Box::new(move || deadline.passed() || is_stopped(&stopped))));
     let context = Context::full(&runtime).map_err(|e| e.to_string())?;
     context.with(|ctx| {
-        install(&ctx, fetch, output).catch(&ctx).map_err(describe)?;
+        install(&ctx, fetch, agents, output).catch(&ctx).map_err(describe)?;
         let promise = Module::evaluate(ctx.clone(), "script", code)
             .catch(&ctx)
             .map_err(describe)?;
@@ -154,7 +175,12 @@ fn throw<'js>(ctx: &Ctx<'js>, message: String) -> Error {
 
 /// Installs the globals: the native host functions go into `prelude.js`, which builds
 /// `console`, `fetch` and `fs` from them.
-fn install<'js>(ctx: &Ctx<'js>, fetch: Fetch, output: &Rc<RefCell<Output>>) -> Result<()> {
+fn install<'js>(
+    ctx: &Ctx<'js>,
+    fetch: Fetch,
+    agents: Option<Agents>,
+    output: &Rc<RefCell<Output>>,
+) -> Result<()> {
     let native = Object::new(ctx.clone())?;
     let output = output.clone();
     native.set(
@@ -196,6 +222,17 @@ fn install<'js>(ctx: &Ctx<'js>, fetch: Fetch, output: &Rc<RefCell<Output>>) -> R
             fs::exists(&path).map_err(|e| throw(&ctx, e))
         }),
     )?;
+    if let Some(agents) = agents {
+        native.set(
+            "agent",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, description: String, prompt: String| -> Result<String> {
+                    agents.call(description, prompt).map_err(|e| throw(&ctx, e))
+                },
+            ),
+        )?;
+    }
     let setup: Function = ctx.eval(PRELUDE)?;
     setup.call::<_, ()>((native,))
 }

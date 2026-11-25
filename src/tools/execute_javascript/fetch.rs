@@ -1,5 +1,6 @@
 //! `fetch` of `execute_javascript`: HTTP requests to the hosts the call declared.
 
+use super::agents::Deadline;
 use super::{Secret, Settings, fs};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use reqwest::multipart::{Form, Part};
@@ -25,7 +26,7 @@ pub(super) struct Fetch {
     pub writes: bool,
     pub settings: Arc<Settings>,
     /// The end of the run; requests don't outlive it.
-    pub deadline: Instant,
+    pub deadline: Deadline,
     pub handle: Handle,
     /// Every request that changed data, as `METHOD url -> status`, for the call's output:
     /// what an approved call really did, beyond the code that was approved.
@@ -228,7 +229,7 @@ impl Fetch {
             (None, Some(form)) => Payload::Form(build_form(form)?),
             (None, None) => Payload::None,
         };
-        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        let remaining = self.deadline.get().saturating_duration_since(Instant::now());
         let request = format!("{method} {url}");
         let result = self
             .handle
@@ -349,7 +350,7 @@ mod tests {
                 secrets,
                 ..Settings::default()
             }),
-            deadline: Instant::now() + Duration::from_secs(10),
+            deadline: Deadline::after(Duration::from_secs(10)),
             handle: tokio::runtime::Builder::new_current_thread()
                 .build()
                 .unwrap()
