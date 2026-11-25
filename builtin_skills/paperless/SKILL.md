@@ -46,6 +46,8 @@ with similar names. Documents come back compact: names instead of ids, custom fi
 | `count(filters)`, `ids(filters)` | number of matches / all matching ids |
 | `doc(id, {content = true})` | one document with text (up to 20000 characters by default) and notes |
 | `vocabulary()` | all tags (with `inbox`, `parent`), correspondents, document types, storage paths, custom fields (type, options), with document counts and matching rules |
+| `vocabularyText()` | the same as short lines (`id:name (documents)`), to read it in a script's output without much text |
+| `check({ tags, correspondent, documentType, ... })` | whether the names you want exist: one line per name, `exists as "<name>"` or `NEW` with similar names. Names match regardless of case, accents and punctuation |
 | `update(id, changes, {create, unchangedSince})` | changes one document, returns it (the compact document has `modified`; with `unchangedSince: <modified>` it throws if the document changed since you read it); `changes`: `title`, `created` (`YYYY-MM-DD`), `asn`, `correspondent`, `documentType`, `storagePath` (null clears), `tags` (replaces), `addTags`, `removeTags`, `customFields` (`{name: value}`, null removes), `removeInboxTags: true`; `create: true` creates missing tags, correspondents, document types |
 | `addTags(ids, tags)`, `removeTags(ids, tags)`, `modifyTags(ids, {add, remove})` | bulk edit, `{task_id}` |
 | `setCorrespondent(ids, x)`, `setDocumentType(ids, x)`, `setStoragePath(ids, x)`, `setCustomFields(ids, {name: value})` | bulk edit, `{task_id}` |
@@ -102,8 +104,9 @@ await pl.update(42, { title: "Stromrechnung März 2025", correspondent: "Stadtwe
 - **Ask before destructive or wide changes.** Before deleting documents or objects, merging,
   reprocessing, or changing more than about 10 documents, show the user what will change (a
   count and a few examples) and wait for a yes. Deleted documents go to the trash.
-- **Prefer existing vocabulary.** Load `vocabulary()` before classifying, reuse existing
+- **Prefer existing vocabulary.** Look at `vocabularyText()` before classifying, reuse existing
   names, and create new tags, correspondents or types only when the user agrees (`create: true`).
+  Whether a name exists is decided by `check(...)`, not by reading the list yourself.
 - **Bulk edits run in the background.** `addTags`, `set...`, `deleteDocuments`, `upload` and
   `mergeInto` return a task id; the change shows up seconds later. Check `task(id)` in a later
   call before relying on it.

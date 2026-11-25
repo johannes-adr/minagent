@@ -10,8 +10,9 @@
 //!
 //! Whoever can call the API can make the agent run commands, so all of it needs a token
 //! (header `x-token`, or `?token=` for the event stream): the one a login returns (see
-//! `auth`: one password, set on the page the first time) or the random one printed at
-//! startup. Only the static page and the login endpoints are served without it.
+//! `auth`: one password, set on the page the first time) or this process's own random one
+//! (not shown anywhere; the tests use it). Only the static page and the login endpoints are
+//! served without it.
 
 use crate::frontend::{ContextUsage, Event, Frontend, Question, ToolCall};
 use crate::config::Config;
@@ -103,7 +104,8 @@ pub enum Command {
 
 /// The web frontend's state, shared by the harness side ([`Frontend`]) and the HTTP handlers.
 pub struct Web {
-    /// The token printed at startup; valid like a session token of the login.
+    /// This process's own token, valid like a session token of the login. It is not shown to
+    /// anyone: the login is the way in.
     token: String,
     auth: Auth,
     inner: Mutex<Inner>,
@@ -1404,7 +1406,7 @@ fn switch(web: &Web, session: &mut Session, id: Option<String>) {
 pub async fn run(web: Arc<Web>, inbox: Inbox, session: Session, addr: &str) -> io::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     let port = listener.local_addr()?.port();
-    println!("web UI: http://localhost:{port}/#token={}", web.token);
+    println!("web UI: http://localhost:{port}");
     tokio::spawn(worker(web.clone(), session, inbox));
     // Not a graceful shutdown: that would wait for the open event streams.
     tokio::select! {

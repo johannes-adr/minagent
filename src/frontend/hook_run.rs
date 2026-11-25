@@ -90,12 +90,17 @@ impl Run {
     /// Stores `call` as what the run waits for and signals the run to stop.
     fn park(&self, call: &ToolCall) {
         let message = self.answer();
+        // A writing call without hosts runs on the hook's (see `execute_javascript`): show those.
+        let mut args = call.args.clone();
+        if args["hosts"].as_array().is_none_or(|h| h.is_empty()) {
+            args["hosts"] = json!(self.hook.hosts);
+        }
         let mut pending = self.pending.lock().unwrap();
         if pending.is_none() {
             *pending = Some(json!({
                 "hook": self.hook.name,
                 "message": message,
-                "call": {"id": call.id, "name": call.name, "title": call.title, "args": call.args},
+                "call": {"id": call.id, "name": call.name, "title": call.title, "args": args},
             }));
             self.push(tool_event(call, "waiting"));
             self.parked.notify_one();

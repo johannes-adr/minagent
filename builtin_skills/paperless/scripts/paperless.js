@@ -67,6 +67,16 @@ function distance(a, b) {
   return row[b.length];
 }
 
+/** A name as it is compared: no case, accents, punctuation or repeated spaces. */
+function fold(name) {
+  return String(name)
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .trim();
+}
+
 /** Up to `n` names of `objects` that look like `name` (substring or few typos). */
 function similarNames(name, objects, n = 5) {
   const needle = name.toLowerCase();
@@ -364,12 +374,57 @@ export class Paperless {
     };
   }
 
-  /** The object of `kind` named (case-insensitively) or numbered `ref`, or undefined. */
+  /**
+   * The vocabulary as short lines (`id:name (documents)`, inbox tags marked `*`), for reading
+   * it in a script's output without much text. Same data as `vocabulary()`.
+   */
+  async vocabularyText() {
+    const line = (title, objects, label = (o) => o.name) =>
+      `${title}: ${objects.map((o) => `${o.id}:${label(o)} (${o.document_count ?? 0})`).join(", ") || "none"}`;
+    const tags = await this.objects("tag");
+    const byId = Object.fromEntries(tags.map((t) => [t.id, t.name]));
+    return [
+      line("tags", tags, (t) => (t.parent ? `${byId[t.parent] ?? t.parent}/` : "") + t.name + (t.is_inbox_tag ? "*" : "")),
+      line("correspondents", await this.objects("correspondent")),
+      line("document types", await this.objects("documentType")),
+      line("storage paths", await this.objects("storagePath")),
+      `custom fields: ${(await this.objects("customField")).map((f) => `${f.id}:${f.name} [${f.data_type}]`).join(", ") || "none"}`,
+    ].join("\n");
+  }
+
+  /**
+   * Whether the names you want to use exist, decided here and not by you reading a list.
+   * `await pl.check({ tags: ["Steuer 2026"], correspondent: "Stadtwerke", documentType: "Rechnung" })`
+   * (also `storagePath`, `customFields`) returns one line per name: `exists as "<name>"` (write
+   * exactly that name; it can differ from yours in case, accents or punctuation) or `NEW`,
+   * with the most similar existing names. Only call a thing NEW when this says so.
+   */
+  async check(proposal) {
+    const kinds = { tags: "tag", correspondent: "correspondent", documentType: "documentType", storagePath: "storagePath", customFields: "customField" };
+    const lines = [];
+    for (const [key, kind] of Object.entries(kinds)) {
+      for (const name of list(proposal[key])) {
+        const objects = await this.objects(kind);
+        const wanted = fold(name);
+        const found = objects.find((o) => fold(o.name) === wanted);
+        if (found) {
+          lines.push(`${kind} ${JSON.stringify(name)}: exists as ${JSON.stringify(found.name)} (id ${found.id})`);
+        } else {
+          const similar = similarNames(String(name), objects);
+          lines.push(`${kind} ${JSON.stringify(name)}: NEW` + (similar.length ? `; similar existing: ${similar.map((n) => JSON.stringify(n)).join(", ")}` : ""));
+        }
+      }
+    }
+    return lines.join("\n") || "(nothing to check)";
+  }
+
+  /** The object of `kind` named (ignoring case, accents and punctuation) or numbered `ref`, or undefined. */
   async findObject(kind, ref) {
     const objects = await this.objects(kind);
     if (typeof ref === "number") return objects.find((o) => o.id === ref);
     const name = String(ref).trim().toLowerCase();
-    return objects.find((o) => o.name.toLowerCase() === name);
+    // The exact name (any case) first, then the same name apart from accents and punctuation.
+    return objects.find((o) => o.name.toLowerCase() === name) ?? objects.find((o) => fold(o.name) === fold(ref));
   }
 
   /**
