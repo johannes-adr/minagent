@@ -144,7 +144,7 @@ Print results with `console.log`; thrown errors are returned as output."
 
     fn approval(args: &ExecuteJavascriptParameters, _context: &Context) -> Approval {
         let settings = settings();
-        approval(args, &settings.allowed_hosts, settings.allow_writes)
+        approval(args, &settings.allowed_hosts, settings.allow_writes, false)
     }
 
     /// A run with settings of its own (a webhook's hosts and write mode) is approved by
@@ -154,14 +154,18 @@ Print results with `console.log`; thrown errors are returned as output."
         let own = self.own_settings.clone();
         Arc::new(move |args, _context| {
             let settings = own.clone().unwrap_or_else(settings);
-            approval(args, &settings.allowed_hosts, settings.allow_writes)
+            approval(args, &settings.allowed_hosts, settings.allow_writes, own.is_some())
         })
     }
 }
 
-fn approval(args: &ExecuteJavascriptParameters, allowed: &[String], allow_writes: bool) -> Approval {
-    let hosts = normalize(args.hosts.as_deref());
+/// `own`: the settings are a run's own, where a writing call without hosts gets the run's.
+fn approval(args: &ExecuteJavascriptParameters, allowed: &[String], allow_writes: bool, own: bool) -> Approval {
+    let mut hosts = normalize(args.hosts.as_deref());
     let writes = args.writes == Some(true);
+    if own && writes && hosts.is_empty() {
+        hosts = allowed.to_vec();
+    }
     if hosts.iter().all(|h| allowed.contains(h)) && (!writes || allow_writes) {
         let mut lines = args.code.lines();
         let first = lines.next().unwrap_or_default();
@@ -245,8 +249,13 @@ async fn execute(
             .unwrap_or(DEFAULT_TIMEOUT_SECS)
             .clamp(1, MAX_TIMEOUT_SECS),
     );
-    let hosts = normalize(args.hosts.as_deref());
+    let mut hosts = normalize(args.hosts.as_deref());
     let settings = own_settings.clone().unwrap_or_else(settings);
+    // A run's writing call that names no host (it was written without thinking of it) gets
+    // the run's hosts, the only ones it could name anyway.
+    if own_settings.is_some() && args.writes == Some(true) && hosts.is_empty() {
+        hosts = settings.allowed_hosts.clone();
+    }
     if own_settings.is_some()
         && let Some(refusal) = refuse_hosts(&hosts, &settings)
     {
@@ -330,7 +339,7 @@ mod tests {
     fn approval_with(args: &str, allowed: &[&str], allow_writes: bool) -> Approval {
         let args = rig_core::serde_json::from_str(args).unwrap();
         let allowed: Vec<String> = allowed.iter().map(|h| h.to_string()).collect();
-        approval(&args, &allowed, allow_writes)
+        approval(&args, &allowed, allow_writes, false)
     }
 
     fn approval_of(args: &str, allowed: &[&str]) -> Approval {
@@ -406,6 +415,22 @@ mod tests {
         assert!(tool(false)(&write, &context).ask);
         assert!(!tool(true)(&write, &context).ask);
         assert!(tool(true)(&args(r#"{"code":"1","hosts":["other.example"],"writes":true}"#), &context).ask);
+        // A writing call that names no host is on the run's hosts, and says so.
+        let bare = args(r#"{"code":"1","writes":true}"#);
+        assert!(!tool(true)(&bare, &context).ask);
+        let asked = tool(false)(&bare, &context);
+        assert!(asked.ask && asked.title.contains("paperless.example"), "{asked:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_runs_writing_call_without_hosts_uses_the_runs_hosts() {
+        let (port, server) = serve_once().await;
+        let own = settings_with(vec!["127.0.0.1".into()], true);
+        let code = format!(r#"const r = await fetch("http://127.0.0.1:{port}/x", {{ method: "POST" }}); console.log(r.status);"#);
+        let args = rig_core::serde_json::json!({"code": code, "writes": true});
+        let out = run_approved(args, own, SkillFilter::All).await;
+        assert!(out.starts_with("ok\nstdout:\n201"), "{out}");
+        server.await.unwrap();
     }
 
     #[test]

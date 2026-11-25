@@ -14,9 +14,8 @@ import { connect } from "skill:paperless/scripts/paperless.js";
 const pl = connect();
 const id = 123; // from the webhook payload
 const doc = await pl.doc(id, { content: 6000 });
-const vocabulary = await pl.vocabulary();
 console.log(JSON.stringify({ doc, suggestions: await pl.suggestions(id), similar: (await pl.similar(id)).documents.slice(0, 5) }));
-console.log(JSON.stringify(vocabulary));
+console.log(await pl.vocabularyText());
 console.log(fs.exists("paperless-conventions.md") ? fs.readText("paperless-conventions.md") : "(no conventions file)");
 ```
 
@@ -43,6 +42,10 @@ number, due date, ...), and **related documents**.
   as a note ("Gehört zu #12, #40"), or, if a custom field of type `documentlink` exists, set
   it to their ids.
 - Do not guess values you cannot read in the text. Leave a field unchanged and say why.
+
+**Is it really new?** Ask the code, not the list: `console.log(await pl.check({ tags: ["Strom"],
+correspondent: "Stadtwerke", documentType: "Rechnung" }))` (read-only) answers `exists as "<name>"`
+(use that name) or `NEW` for each. Only mark what it calls NEW as NEW.
 
 ## 3. Show the proposal
 
